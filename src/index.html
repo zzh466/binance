@@ -1,0 +1,278 @@
+
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'none'; img-src 'self' data:"
+    />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Binance Spot Depth Electron Demo</title>
+    <style>
+      :root {
+        font-family:
+          Inter, "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+        color-scheme: light dark;
+      }
+
+      body {
+        margin: 0;
+        padding: 24px;
+        background: Canvas;
+        color: CanvasText;
+      }
+
+      main {
+        max-width: 1020px;
+        margin: 0 auto;
+      }
+
+      h1 {
+        margin-top: 0;
+        font-size: 24px;
+      }
+        #can {
+      background-color: #000;
+      position: relative;
+      width: 980px;
+      height: 300px;
+    }
+      h2,
+      h3 {
+        margin-top: 0;
+      }
+
+      .warning {
+        padding: 12px 14px;
+        border: 1px solid #a87800;
+        border-radius: 8px;
+        margin-bottom: 18px;
+      }
+
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 16px;
+      }
+
+      section {
+        border: 1px solid color-mix(in srgb, CanvasText 22%, transparent);
+        border-radius: 10px;
+        padding: 16px;
+      }
+
+      .full {
+        grid-column: 1 / -1;
+      }
+
+      label {
+        display: block;
+        margin: 10px 0 4px;
+        font-size: 13px;
+      }
+
+      input,
+      select,
+      button {
+        box-sizing: border-box;
+        width: 100%;
+        min-height: 38px;
+        padding: 8px 10px;
+        border-radius: 6px;
+        border: 1px solid color-mix(in srgb, CanvasText 28%, transparent);
+        background: Canvas;
+        color: CanvasText;
+      }
+
+      button {
+        margin-top: 12px;
+        cursor: pointer;
+      }
+
+      .buttons {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 8px;
+      }
+
+      dl {
+        display: grid;
+        grid-template-columns: 110px 1fr;
+        gap: 8px;
+        margin: 0;
+      }
+
+      dt {
+        opacity: 0.7;
+      }
+
+      dd {
+        margin: 0;
+        font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+        overflow-wrap: anywhere;
+      }
+
+      .depth-grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 16px;
+        margin-top: 16px;
+      }
+
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+        font-size: 13px;
+      }
+
+      th,
+      td {
+        padding: 5px 8px;
+        text-align: right;
+        border-bottom: 1px solid color-mix(in srgb, CanvasText 12%, transparent);
+      }
+
+      th {
+        opacity: 0.7;
+      }
+
+      pre {
+        min-height: 120px;
+        max-height: 280px;
+        overflow: auto;
+        white-space: pre-wrap;
+        word-break: break-word;
+        padding: 12px;
+        border-radius: 8px;
+        background: color-mix(in srgb, CanvasText 8%, transparent);
+      }
+
+      @media (max-width: 760px) {
+        .grid,
+        .depth-grid {
+          grid-template-columns: 1fr;
+        }
+
+        .full {
+          grid-column: auto;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Electron Binance Spot 深度行情示例</h1>
+
+      <div class="warning">
+        默认连接 Binance Spot Testnet。后台使用 REST 快照与 WebSocket 增量事件维护本地订单簿。
+      </div>
+      <canvas  id="can" width="980px"  height="300px"></canvas>
+      <div class="grid">
+        <section>
+          <h2>运行状态</h2>
+          <dl>
+            <dt>环境</dt>
+            <dd id="environment">读取中</dd>
+            <dt>交易密钥</dt>
+            <dd id="credentials">读取中</dd>
+            <dt>行情状态</dt>
+            <dd id="marketStatus">未连接</dd>
+            <dt>时间偏移</dt>
+            <dd id="timeOffset">读取中</dd>
+            <dt>深度配置</dt>
+            <dd id="depthConfig">读取中</dd>
+          </dl>
+          <button id="syncTimeButton">重新同步服务器时间</button>
+        </section>
+
+        <section>
+          <h2>增量深度连接</h2>
+          <label for="marketSymbol">交易对</label>
+          <input id="marketSymbol" value="BTCUSDT" />
+          <div class="buttons">
+            <button id="connectMarketButton">连接深度行情</button>
+            <button id="disconnectMarketButton">断开行情</button>
+          </div>
+          <dl style="margin-top: 14px">
+            <dt>lastUpdateId</dt>
+            <dd id="lastUpdateId">-</dd>
+            <dt>价差</dt>
+            <dd id="spread">-</dd>
+            <dt>本地接收</dt>
+            <dd id="receivedAt">-</dd>
+          </dl>
+        </section>
+
+        <section class="full">
+          <h2>本地订单簿</h2>
+          <div class="depth-grid">
+            <div>
+              <h3>买盘 Bids</h3>
+              <table>
+                <thead>
+                  <tr><th>Price</th><th>Quantity</th></tr>
+                </thead>
+                <tbody id="bidRows"></tbody>
+              </table>
+            </div>
+            <div>
+              <h3>卖盘 Asks</h3>
+              <table>
+                <thead>
+                  <tr><th>Price</th><th>Quantity</th></tr>
+                </thead>
+                <tbody id="askRows"></tbody>
+              </table>
+            </div>
+          </div>
+        </section>
+
+        <section>
+          <h2>下单</h2>
+          <label for="orderSymbol">交易对</label>
+          <input id="orderSymbol" value="BTCUSDT" />
+
+          <label for="side">方向</label>
+          <select id="side">
+            <option value="BUY">BUY</option>
+            <option value="SELL">SELL</option>
+          </select>
+
+          <label for="orderType">委托类型</label>
+          <select id="orderType">
+            <option value="LIMIT">LIMIT</option>
+            <option value="MARKET">MARKET</option>
+          </select>
+
+          <label for="quantity">数量 quantity</label>
+          <input id="quantity" value="0.001" />
+
+          <label for="price">价格 price（LIMIT 必填）</label>
+          <input id="price" value="10000" />
+
+          <button id="placeOrderButton">提交委托</button>
+        </section>
+
+        <section>
+          <h2>撤单</h2>
+          <label for="cancelSymbol">交易对</label>
+          <input id="cancelSymbol" value="BTCUSDT" />
+
+          <label for="orderId">orderId</label>
+          <input id="orderId" placeholder="下单成功后自动填入" />
+
+          <button id="cancelOrderButton">撤销委托</button>
+        </section>
+
+        <section class="full">
+          <h2>执行结果与错误</h2>
+          <pre id="output">等待操作</pre>
+        </section>
+      </div>
+    </main>
+
+    <script src="./renderer.js"></script>
+  </body>
+</html>
