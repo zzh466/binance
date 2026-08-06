@@ -786,6 +786,7 @@ const elements = {
   environment: document.querySelector("#environment"),
   tradingEnvironment: document.querySelector("#tradingEnvironment"),
   proxyStatus: document.querySelector("#proxyStatus"),
+  tradingProxyStatus: document.querySelector("#tradingProxyStatus"),
   credentials: document.querySelector("#credentials"),
   marketStatus: document.querySelector("#marketStatus"),
   timeOffset: document.querySelector("#timeOffset"),
@@ -860,6 +861,8 @@ async function loadStatus() {
     ? "Spot Testnet（下单/撤单）"
     : "Spot Production（下单/撤单）";
   elements.proxyStatus.textContent = status.socks5Proxy || "未配置";
+  elements.tradingProxyStatus.textContent =
+    status.tradingSocks5Proxy || "未配置";
   elements.credentials.textContent =
     status.hasApiKey && status.hasApiSecret ? "已配置" : "未配置";
   elements.timeOffset.textContent = `${status.serverTimeOffsetMs} ms`;

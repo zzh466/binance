@@ -6,6 +6,7 @@ const { LocalOrderBook } = require("./localOrderBook");
 const { SocksProxyAgent } = require("socks-proxy-agent");
 
 const DEFAULT_SOCKS5_PROXY = "socks5h://139.224.34.110:1080";
+const DEFAULT_TRADING_SOCKS5_PROXY = "socks5h://127.0.0.1:1081";
 const REST_BASE = {
   testnet: "https://testnet.binance.vision/api",
   production: "https://api.binance.com/api",
@@ -69,6 +70,7 @@ class BinanceSpotClient extends EventEmitter {
     apiSecret = "",
     testnet = true,
     socks5Proxy = DEFAULT_SOCKS5_PROXY,
+    tradingSocks5Proxy = DEFAULT_TRADING_SOCKS5_PROXY,
     depthSpeed = "100ms",
     depthSnapshotLimit = 1000,
     depthDisplayLevels = 10,
@@ -79,7 +81,11 @@ class BinanceSpotClient extends EventEmitter {
     this.apiSecret = apiSecret.trim();
     this.testnet = Boolean(testnet);
     this.socks5Proxy = String(socks5Proxy || DEFAULT_SOCKS5_PROXY).trim();
+    this.tradingSocks5Proxy = String(
+      tradingSocks5Proxy || DEFAULT_TRADING_SOCKS5_PROXY
+    ).trim();
     this.proxyAgent = new SocksProxyAgent(this.socks5Proxy);
+    this.tradingProxyAgent = new SocksProxyAgent(this.tradingSocks5Proxy);
 
     this.restBase = this.testnet ? REST_BASE.testnet : REST_BASE.production;
     this.tradingRestBase = TRADING_REST_BASE;
@@ -209,10 +215,14 @@ class BinanceSpotClient extends EventEmitter {
 
     let response;
     try {
+      const agent =
+        baseUrl === this.tradingRestBase
+          ? this.tradingProxyAgent
+          : this.proxyAgent;
       response = await requestHttpsThroughProxy(url, {
         method,
         headers,
-        agent: this.proxyAgent,
+        agent,
         timeout: 10_000,
       });
     } catch (error) {
@@ -361,7 +371,8 @@ class BinanceSpotClient extends EventEmitter {
     const symbol = this.marketSymbol;
     const streamName = `${symbol.toLowerCase()}@depth@${this.depthSpeed}`;
     const url = `${this.wsBase}/${streamName}`;
-    const socket = new WebSocket(url, { agent: this.proxyAgent });
+    const agent = this.testnet ? this.tradingProxyAgent : this.proxyAgent;
+    const socket = new WebSocket(url, { agent });
 
     this.marketSocket = socket;
     this.resetDepthState();
