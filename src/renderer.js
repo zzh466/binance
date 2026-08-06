@@ -784,6 +784,7 @@ class Chart {
 
 const elements = {
   environment: document.querySelector("#environment"),
+  proxyStatus: document.querySelector("#proxyStatus"),
   credentials: document.querySelector("#credentials"),
   marketStatus: document.querySelector("#marketStatus"),
   timeOffset: document.querySelector("#timeOffset"),
@@ -852,6 +853,7 @@ async function loadStatus() {
   elements.environment.textContent = status.testnet
     ? "Spot Testnet"
     : "Spot Production";
+  elements.proxyStatus.textContent = status.socks5Proxy || "未配置";
   elements.credentials.textContent =
     status.hasApiKey && status.hasApiSecret ? "已配置" : "未配置";
   elements.timeOffset.textContent = `${status.serverTimeOffsetMs} ms`;

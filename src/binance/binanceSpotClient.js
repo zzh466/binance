@@ -1,12 +1,11 @@
 const crypto = require("node:crypto");
 const { EventEmitter } = require("node:events");
+const https = require("node:https");
 const WebSocket = require("ws");
 const { LocalOrderBook } = require("./localOrderBook");
-const {SocksProxyAgent} =require('socks-proxy-agent')
+const { SocksProxyAgent } = require("socks-proxy-agent");
 
-const agent = new SocksProxyAgent(
-    "socks5h://139.224.34.110:1080"
-);
+const DEFAULT_SOCKS5_PROXY = "socks5h://139.224.34.110:1080";
 const REST_BASE = {
   testnet: "https://testnet.binance.vision/api",
   production: "https://api.binance.com/api",
@@ -19,6 +18,39 @@ const WS_BASE = {
 
 const DEPTH_SPEEDS = new Set(["100ms", "1000ms"]);
 const DEPTH_SNAPSHOT_LIMITS = new Set([100, 500, 1000, 5000]);
+
+function requestHttpsThroughProxy(url, options = {}) {
+  return new Promise((resolve, reject) => {
+    const timeoutMs = options.timeout || 10_000;
+    let request;
+    const timeoutId = setTimeout(() => {
+      request?.destroy(new Error("请求 Binance 超时"));
+    }, timeoutMs);
+
+    request = https.request(url, options, (response) => {
+      const chunks = [];
+
+      response.setEncoding("utf8");
+      response.on("data", (chunk) => chunks.push(chunk));
+      response.on("end", () => {
+        clearTimeout(timeoutId);
+        resolve({
+          statusCode: response.statusCode || 0,
+          rawText: chunks.join(""),
+        });
+      });
+    });
+
+    request.setTimeout(timeoutMs, () => {
+      request.destroy(new Error("请求 Binance 超时"));
+    });
+    request.on("error", (error) => {
+      clearTimeout(timeoutId);
+      reject(error);
+    });
+    request.end();
+  });
+}
 
 class BinanceApiError extends Error {
   constructor(message, details = {}) {
@@ -35,6 +67,7 @@ class BinanceSpotClient extends EventEmitter {
     apiKey = "",
     apiSecret = "",
     testnet = true,
+    socks5Proxy = DEFAULT_SOCKS5_PROXY,
     depthSpeed = "100ms",
     depthSnapshotLimit = 1000,
     depthDisplayLevels = 10,
@@ -44,6 +77,8 @@ class BinanceSpotClient extends EventEmitter {
     this.apiKey = apiKey.trim();
     this.apiSecret = apiSecret.trim();
     this.testnet = Boolean(testnet);
+    this.socks5Proxy = String(socks5Proxy || DEFAULT_SOCKS5_PROXY).trim();
+    this.proxyAgent = new SocksProxyAgent(this.socks5Proxy);
 
     this.restBase = this.testnet ? REST_BASE.testnet : REST_BASE.production;
     this.wsBase = this.testnet ? WS_BASE.testnet : WS_BASE.production;
@@ -149,10 +184,11 @@ class BinanceSpotClient extends EventEmitter {
 
     let response;
     try {
-      response = await fetch(url, {
+      response = await requestHttpsThroughProxy(url, {
         method,
         headers,
-        signal: AbortSignal.timeout(10_000),
+        agent: this.proxyAgent,
+        timeout: 10_000,
       });
     } catch (error) {
       throw new BinanceApiError(`请求 Binance 失败：${error.message}`, {
@@ -160,7 +196,7 @@ class BinanceSpotClient extends EventEmitter {
       });
     }
 
-    const rawText = await response.text();
+    const rawText = response.rawText;
     let data;
 
     try {
@@ -169,11 +205,11 @@ class BinanceSpotClient extends EventEmitter {
       data = { rawText };
     }
 
-    if (!response.ok) {
+    if (response.statusCode < 200 || response.statusCode >= 300) {
       throw new BinanceApiError(
-        data.msg || `Binance HTTP ${response.status}`,
+        data.msg || `Binance HTTP ${response.statusCode}`,
         {
-          status: response.status,
+          status: response.statusCode,
           code: data.code,
           data,
         }
@@ -288,7 +324,7 @@ class BinanceSpotClient extends EventEmitter {
     const symbol = this.marketSymbol;
     const streamName = `${symbol.toLowerCase()}@depth@${this.depthSpeed}`;
     const url = `${this.wsBase}/${streamName}`;
-    const socket = new WebSocket(url, {agent});
+    const socket = new WebSocket(url, { agent: this.proxyAgent });
 
     this.marketSocket = socket;
     this.resetDepthState();
