@@ -78,11 +78,13 @@ function registerIpcHandlers() {
     return safeCall(async () => ({
       testnet: client.testnet,
       restBase: client.restBase,
+      tradingRestBase: client.tradingRestBase,
       wsBase: client.wsBase,
       socks5Proxy: client.socks5Proxy,
       hasApiKey: Boolean(client.apiKey),
       hasApiSecret: Boolean(client.apiSecret),
       serverTimeOffsetMs: client.serverTimeOffsetMs,
+      tradingServerTimeOffsetMs: client.tradingServerTimeOffsetMs,
       depthSpeed: client.depthSpeed,
       depthSnapshotLimit: client.depthSnapshotLimit,
       depthDisplayLevels: client.depthDisplayLevels,
@@ -114,7 +116,6 @@ function registerIpcHandlers() {
 }
 
 client.on("depth-update", (data) => {
-  console.log(data)
   sendToRenderer("binance:depth-update", data);
 });
 

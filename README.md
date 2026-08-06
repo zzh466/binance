@@ -40,7 +40,7 @@ BINANCE_API_KEY=你的_Testnet_API_Key
 BINANCE_API_SECRET=你的_Testnet_API_Secret
 ```
 
-程序中的 Binance REST 请求（时间同步、深度快照、下单、撤单）和 WebSocket 行情连接都会使用同一个 SOCKS5 隧道。`socks5h` 会让域名由代理端解析；如果你的隧道地址不同，只需修改 `BINANCE_SOCKS5_PROXY`。
+程序中的 Binance REST 请求和 WebSocket 行情连接都会使用同一个 SOCKS5 隧道。行情环境由 `BINANCE_TESTNET` 控制；下单、撤单及其签名时间同步固定使用 Spot Testnet 接口。`socks5h` 会让域名由代理端解析；如果你的隧道地址不同，只需修改 `BINANCE_SOCKS5_PROXY`。
 
 如果你的隧道只允许访问你给出的正式环境地址（`stream.binance.com`），请将 `BINANCE_TESTNET=false`；保持 `true` 时会访问 `testnet.binance.vision`，两套环境的连通性是分开的。
 

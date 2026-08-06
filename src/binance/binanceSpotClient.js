@@ -10,6 +10,7 @@ const REST_BASE = {
   testnet: "https://testnet.binance.vision/api",
   production: "https://api.binance.com/api",
 };
+const TRADING_REST_BASE = REST_BASE.testnet;
 
 const WS_BASE = {
   testnet: "wss://stream.testnet.binance.vision/ws",
@@ -81,6 +82,7 @@ class BinanceSpotClient extends EventEmitter {
     this.proxyAgent = new SocksProxyAgent(this.socks5Proxy);
 
     this.restBase = this.testnet ? REST_BASE.testnet : REST_BASE.production;
+    this.tradingRestBase = TRADING_REST_BASE;
     this.wsBase = this.testnet ? WS_BASE.testnet : WS_BASE.production;
 
     this.depthSpeed = DEPTH_SPEEDS.has(depthSpeed) ? depthSpeed : "100ms";
@@ -98,6 +100,7 @@ class BinanceSpotClient extends EventEmitter {
     );
 
     this.serverTimeOffsetMs = 0;
+    this.tradingServerTimeOffsetMs = 0;
 
     this.marketSocket = null;
     this.marketSymbol = null;
@@ -116,22 +119,38 @@ class BinanceSpotClient extends EventEmitter {
   }
 
   async syncServerTime() {
+    return this.syncServerTimeForBase(this.restBase);
+  }
+
+  async syncTradingServerTime() {
+    return this.syncServerTimeForBase(this.tradingRestBase);
+  }
+
+  async syncServerTimeForBase(baseUrl) {
     const before = Date.now();
-    const result = await this.request("GET", "/v3/time");
+    const result = await this.request("GET", "/v3/time", {}, false, baseUrl);
     const after = Date.now();
 
     const localMidpoint = Math.floor((before + after) / 2);
-    this.serverTimeOffsetMs = Number(result.serverTime) - localMidpoint;
+    const offsetMs = Number(result.serverTime) - localMidpoint;
+
+    if (baseUrl === this.tradingRestBase) {
+      this.tradingServerTimeOffsetMs = offsetMs;
+    }
+    if (baseUrl === this.restBase) {
+      this.serverTimeOffsetMs = offsetMs;
+    }
 
     return {
       serverTime: Number(result.serverTime),
       localMidpoint,
-      offsetMs: this.serverTimeOffsetMs,
+      offsetMs,
+      baseUrl,
     };
   }
 
   getTimestamp() {
-    return Date.now() + this.serverTimeOffsetMs;
+    return Date.now() + this.tradingServerTimeOffsetMs;
   }
 
   assertTradingCredentials() {
@@ -155,7 +174,13 @@ class BinanceSpotClient extends EventEmitter {
     return normalized;
   }
 
-  async request(method, path, params = {}, signed = false) {
+  async request(
+    method,
+    path,
+    params = {},
+    signed = false,
+    baseUrl = this.restBase
+  ) {
     const normalized = this.normalizeParams(params);
 
     if (signed) {
@@ -172,7 +197,7 @@ class BinanceSpotClient extends EventEmitter {
     }
 
     const query = new URLSearchParams(normalized).toString();
-    const url = `${this.restBase}${path}${query ? `?${query}` : ""}`;
+    const url = `${baseUrl}${path}${query ? `?${query}` : ""}`;
 
     const headers = {
       Accept: "application/json",
@@ -272,7 +297,10 @@ class BinanceSpotClient extends EventEmitter {
       }
     }
 
-    return this.request("POST", "/v3/order", params, true);
+    this.assertTradingCredentials();
+    await this.syncTradingServerTime();
+
+    return this.request("POST", "/v3/order", params, true, this.tradingRestBase);
   }
 
   async cancelOrder({ symbol, orderId, origClientOrderId }) {
@@ -288,7 +316,16 @@ class BinanceSpotClient extends EventEmitter {
       );
     }
 
-    return this.request("DELETE", "/v3/order", params, true);
+    this.assertTradingCredentials();
+    await this.syncTradingServerTime();
+
+    return this.request(
+      "DELETE",
+      "/v3/order",
+      params,
+      true,
+      this.tradingRestBase
+    );
   }
 
   connectDepth(symbol) {
@@ -436,7 +473,6 @@ class BinanceSpotClient extends EventEmitter {
       this.handleDepthSynchronizationFailure(socket, error);
       return;
     }
-    console.log(result)
     if (result.reason === "sequence-gap") {
       this.resynchronizeDepth(socket, event, result);
       return;

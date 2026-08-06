@@ -784,6 +784,7 @@ class Chart {
 
 const elements = {
   environment: document.querySelector("#environment"),
+  tradingEnvironment: document.querySelector("#tradingEnvironment"),
   proxyStatus: document.querySelector("#proxyStatus"),
   credentials: document.querySelector("#credentials"),
   marketStatus: document.querySelector("#marketStatus"),
@@ -853,6 +854,11 @@ async function loadStatus() {
   elements.environment.textContent = status.testnet
     ? "Spot Testnet"
     : "Spot Production";
+  elements.tradingEnvironment.textContent = status.tradingRestBase.includes(
+    "testnet"
+  )
+    ? "Spot Testnet（下单/撤单）"
+    : "Spot Production（下单/撤单）";
   elements.proxyStatus.textContent = status.socks5Proxy || "未配置";
   elements.credentials.textContent =
     status.hasApiKey && status.hasApiSecret ? "已配置" : "未配置";
