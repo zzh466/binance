@@ -1,4 +1,5 @@
 const path = require("node:path");
+const { performance } = require("node:perf_hooks");
 const { app, BrowserWindow, ipcMain } = require("electron");
 const dotenv = require("dotenv");
 const { BinanceSpotClient } = require("./binance/binanceSpotClient");
@@ -61,14 +62,20 @@ function serializeError(error) {
 }
 
 async function safeCall(action) {
+  const startedAt = performance.now();
+
   try {
+    const data = await action();
+
     return {
       ok: true,
-      data: await action(),
+      elapsedMs: Number((performance.now() - startedAt).toFixed(3)),
+      data,
     };
   } catch (error) {
     return {
       ok: false,
+      elapsedMs: Number((performance.now() - startedAt).toFixed(3)),
       error: serializeError(error),
     };
   }
@@ -81,6 +88,8 @@ function registerIpcHandlers() {
       restBase: client.restBase,
       tradingRestBase: client.tradingRestBase,
       wsBase: client.wsBase,
+      wsApiBase: client.wsApiBase,
+      tradingWsApiBase: client.tradingWsApiBase,
       socks5Proxy: client.socks5Proxy,
       tradingSocks5Proxy: client.tradingSocks5Proxy,
       hasApiKey: Boolean(client.apiKey),
@@ -114,6 +123,22 @@ function registerIpcHandlers() {
 
   ipcMain.handle("binance:cancel-order", async (_event, payload) => {
     return safeCall(() => client.cancelOrder(payload || {}));
+  });
+
+  ipcMain.handle("binance:all-order-lists", async (_event, payload) => {
+    return safeCall(() => client.allOrderLists(payload || {}));
+  });
+
+  ipcMain.handle("binance:all-orders", async (_event, payload) => {
+    return safeCall(() => client.allOrders(payload || {}));
+  });
+
+  ipcMain.handle("binance:my-trades", async (_event, payload) => {
+    return safeCall(() => client.myTrades(payload || {}));
+  });
+
+  ipcMain.handle("binance:account-status", async (_event, payload) => {
+    return safeCall(() => client.accountStatus(payload || {}));
   });
 }
 

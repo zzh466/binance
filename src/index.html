@@ -120,6 +120,69 @@
         margin-top: 16px;
       }
 
+      .order-history-toolbar,
+      .trade-history-toolbar,
+      .account-toolbar {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        margin-bottom: 12px;
+      }
+
+      .order-history-toolbar button,
+      .trade-history-toolbar button,
+      .account-toolbar button {
+        width: auto;
+        margin-top: 0;
+      }
+
+      .order-history-toolbar input,
+      .trade-history-toolbar input,
+      .account-toolbar input {
+        width: 180px;
+      }
+
+      .order-history-toolbar span,
+      .trade-history-toolbar span,
+      .account-toolbar span,
+      .muted {
+        opacity: 0.72;
+        font-size: 13px;
+      }
+
+      .table-scroll {
+        overflow-x: auto;
+      }
+
+      .order-history-table,
+      .trade-history-table {
+        min-width: 860px;
+      }
+
+      .order-history-table th,
+      .order-history-table td,
+      .trade-history-table th,
+      .trade-history-table td {
+        text-align: left;
+        vertical-align: top;
+      }
+
+      .order-history-table th.numeric,
+      .order-history-table td.numeric,
+      .trade-history-table th.numeric,
+      .trade-history-table td.numeric {
+        text-align: right;
+      }
+
+      .account-balance-table {
+        min-width: 480px;
+      }
+
+      .account-balance-table th,
+      .account-balance-table td {
+        text-align: left;
+      }
+
       table {
         width: 100%;
         border-collapse: collapse;
@@ -147,6 +210,13 @@
         padding: 12px;
         border-radius: 8px;
         background: color-mix(in srgb, CanvasText 8%, transparent);
+      }
+
+      .result-duration {
+        margin: 0;
+        font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+        font-size: 13px;
+        opacity: 0.78;
       }
 
       @media (max-width: 760px) {
@@ -177,6 +247,12 @@
             <dd id="environment">读取中</dd>
             <dt>交易接口</dt>
             <dd id="tradingEnvironment">读取中</dd>
+            <dt>订单历史接口</dt>
+            <dd id="orderHistoryEnvironment">读取中</dd>
+            <dt>成交历史接口</dt>
+            <dd id="tradeHistoryEnvironment">读取中</dd>
+            <dt>账户信息接口</dt>
+            <dd id="accountEnvironment">读取中</dd>
             <dt>行情 SOCKS5</dt>
             <dd id="proxyStatus">读取中</dd>
             <dt>交易 SOCKS5</dt>
@@ -191,6 +267,77 @@
             <dd id="depthConfig">读取中</dd>
           </dl>
           <button id="syncTimeButton">重新同步服务器时间</button>
+        </section>
+
+        <section class="full">
+          <h2>账户成交历史</h2>
+          <p class="muted">
+            通过 Binance WebSocket API 的 myTrades 查询当前交易环境指定交易对的成交明细；未成交的普通订单不会出现在这里。
+          </p>
+          <div class="trade-history-toolbar">
+            <label for="tradeHistorySymbol">交易对</label>
+            <input id="tradeHistorySymbol" value="BTCUSDT" />
+            <button id="refreshTradeHistoryButton">刷新成交历史</button>
+            <span id="tradeHistoryStatus">尚未加载</span>
+          </div>
+          <div class="table-scroll">
+            <table class="trade-history-table">
+              <thead>
+                <tr>
+                  <th class="numeric">成交 ID</th>
+                  <th class="numeric">订单 ID</th>
+                  <th>交易对</th>
+                  <th>成交价格</th>
+                  <th>成交数量</th>
+                  <th>成交额</th>
+                  <th>手续费</th>
+                  <th>手续费资产</th>
+                  <th>买卖方向</th>
+                  <th>Maker/Taker</th>
+                  <th>成交时间</th>
+                </tr>
+              </thead>
+              <tbody id="tradeHistoryBody">
+                <tr><td colspan="11">点击“刷新成交历史”加载数据</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="full">
+          <h2>账户信息</h2>
+          <p class="muted">
+            通过 Binance WebSocket API 的 account.status 查询当前交易环境的账户状态、交易权限和资产余额。
+          </p>
+          <div class="account-toolbar">
+            <button id="refreshAccountButton">刷新账户信息</button>
+            <span id="accountStatus">尚未加载</span>
+          </div>
+          <dl class="account-summary">
+            <dt>账户类型</dt>
+            <dd id="accountType">-</dd>
+            <dt>允许交易</dt>
+            <dd id="accountCanTrade">-</dd>
+            <dt>允许充值</dt>
+            <dd id="accountCanDeposit">-</dd>
+            <dt>允许提现</dt>
+            <dd id="accountCanWithdraw">-</dd>
+            <dt>账户权限</dt>
+            <dd id="accountPermissions">-</dd>
+            <dt>更新时间</dt>
+            <dd id="accountUpdateTime">-</dd>
+          </dl>
+          <h3>资产余额</h3>
+          <div class="table-scroll">
+            <table class="account-balance-table">
+              <thead>
+                <tr><th>资产</th><th>可用余额</th><th>锁定余额</th></tr>
+              </thead>
+              <tbody id="accountBalancesBody">
+                <tr><td colspan="3">点击“刷新账户信息”加载数据</td></tr>
+              </tbody>
+            </table>
+          </div>
         </section>
 
         <section>
@@ -235,6 +382,39 @@
           </div>
         </section>
 
+        <section class="full">
+          <h2>普通订单记录</h2>
+          <p class="muted">
+            通过 Binance WebSocket API 的 allOrders 查询当前交易环境账户的普通订单，包括挂单、已撤单和已成交订单。组合订单请使用 allOrderLists 接口。
+          </p>
+          <div class="order-history-toolbar">
+            <label for="orderHistorySymbol">交易对</label>
+            <input id="orderHistorySymbol" value="BTCUSDT" />
+            <button id="refreshOrderHistoryButton">刷新订单记录</button>
+            <span id="orderHistoryStatus">尚未加载</span>
+          </div>
+          <div class="table-scroll">
+            <table class="order-history-table">
+              <thead>
+                <tr>
+                  <th class="numeric">订单 ID</th>
+                  <th>交易对</th>
+                  <th>方向</th>
+                  <th>类型</th>
+                  <th>状态</th>
+                  <th>价格</th>
+                  <th>原始数量</th>
+                  <th>成交数量</th>
+                  <th>更新时间</th>
+                </tr>
+              </thead>
+              <tbody id="orderHistoryBody">
+                <tr><td colspan="9">点击“刷新订单记录”加载数据</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
         <section>
           <h2>下单</h2>
           <label for="orderSymbol">交易对</label>
@@ -274,6 +454,7 @@
 
         <section class="full">
           <h2>执行结果与错误</h2>
+          <p id="requestDuration" class="result-duration">接口耗时：- ms</p>
           <pre id="output">等待操作</pre>
         </section>
       </div>

@@ -26,6 +26,14 @@ contextBridge.exposeInMainWorld("binance", {
     ipcRenderer.invoke("binance:place-order", order),
   cancelOrder: (order) =>
     ipcRenderer.invoke("binance:cancel-order", order),
+  allOrderLists: (options) =>
+    ipcRenderer.invoke("binance:all-order-lists", options || {}),
+  allOrders: (options) =>
+    ipcRenderer.invoke("binance:all-orders", options || {}),
+  myTrades: (options) =>
+    ipcRenderer.invoke("binance:my-trades", options || {}),
+  accountStatus: (options) =>
+    ipcRenderer.invoke("binance:account-status", options || {}),
 
   onDepthUpdate: (callback) =>
     subscribe("binance:depth-update", callback),

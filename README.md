@@ -6,6 +6,7 @@
 - Binance Spot WebSocket 接收 `bookTicker` 最优买卖价。
 - Binance Spot REST API 执行限价/市价下单。
 - Binance Spot REST API 按 `orderId` 撤单。
+- Binance Spot WebSocket API 查询 `allOrders`、`myTrades` 和 `account.status`，页面独立展示普通订单历史、账户成交历史与账户信息；同时保留 `allOrderLists` 供 OCO/OTO/OTOCO 等组合订单使用。
 - 渲染进程只通过白名单 IPC 调用主进程。
 - 默认启用 Spot Testnet。
 
@@ -42,6 +43,8 @@ BINANCE_API_SECRET=你的_Testnet_API_Secret
 ```
 
 行情请求使用 `BINANCE_SOCKS5_PROXY`；Testnet 时间同步、下单、撤单使用 `BINANCE_TRADING_SOCKS5_PROXY`。行情环境由 `BINANCE_TESTNET` 控制；下单、撤单及其签名时间同步固定使用 Spot Testnet 接口。`socks5h` 会让域名由代理端解析；如果隧道地址不同，分别修改这两个变量。
+
+页面点击“刷新订单记录”“刷新成交历史”或“刷新账户信息”时，通过 WebSocket API 的 `allOrders`、`myTrades` 或 `account.status` 查询数据。`myTrades` 和 `account.status` 严格跟随 `BINANCE_TESTNET`：测试环境使用 Testnet WebSocket 和交易代理，正式环境使用正式 WebSocket 和行情代理。`allOrderLists` 只返回 OCO/OTO/OTOCO 等订单列表，不包含普通单笔订单。
 
 如果你的隧道只允许访问你给出的正式环境地址（`stream.binance.com`），请将 `BINANCE_TESTNET=false`；保持 `true` 时会访问 `testnet.binance.vision`，两套环境的连通性是分开的。
 

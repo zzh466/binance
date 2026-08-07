@@ -18,6 +18,11 @@ const WS_BASE = {
   production: "wss://stream.binance.com:9443/ws",
 };
 
+const WS_API_BASE = {
+  testnet: "wss://ws-api.testnet.binance.vision/ws-api/v3",
+  production: "wss://ws-api.binance.com:443/ws-api/v3",
+};
+
 const DEPTH_SPEEDS = new Set(["100ms", "1000ms"]);
 const DEPTH_SNAPSHOT_LIMITS = new Set([100, 500, 1000, 5000]);
 
@@ -90,6 +95,13 @@ class BinanceSpotClient extends EventEmitter {
     this.restBase = this.testnet ? REST_BASE.testnet : REST_BASE.production;
     this.tradingRestBase = TRADING_REST_BASE;
     this.wsBase = this.testnet ? WS_BASE.testnet : WS_BASE.production;
+    this.wsApiBase = this.testnet
+      ? WS_API_BASE.testnet
+      : WS_API_BASE.production;
+    this.tradingWsApiBase =
+      this.tradingRestBase === REST_BASE.production
+        ? WS_API_BASE.production
+        : WS_API_BASE.testnet;
 
     this.depthSpeed = DEPTH_SPEEDS.has(depthSpeed) ? depthSpeed : "100ms";
 
@@ -336,6 +348,246 @@ class BinanceSpotClient extends EventEmitter {
       true,
       this.tradingRestBase
     );
+  }
+
+  createWsApiSignature(params) {
+    const payload = Object.entries(params)
+      .filter(([key]) => key !== "signature")
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, value]) => `${key}=${value}`)
+      .join("&");
+
+    return crypto
+      .createHmac("sha256", this.apiSecret)
+      .update(payload)
+      .digest("hex");
+  }
+
+  requestWsApi(
+    method,
+    params,
+    {
+      url = this.wsApiBase,
+      agent = this.testnet ? this.tradingProxyAgent : this.proxyAgent,
+    } = {}
+  ) {
+
+    return new Promise((resolve, reject) => {
+      let socket;
+      let settled = false;
+      let timeoutId;
+
+      const finish = (callback, value) => {
+        if (settled) {
+          return;
+        }
+
+        settled = true;
+        clearTimeout(timeoutId);
+
+        if (socket) {
+          if (socket.readyState === WebSocket.OPEN) {
+            socket.close(1000, "request complete");
+          } else if (socket.readyState === WebSocket.CONNECTING) {
+            socket.terminate();
+          }
+        }
+
+        callback(value);
+      };
+
+      try {
+        socket = new WebSocket(url, { agent });
+      } catch (error) {
+        finish(
+          reject,
+          new BinanceApiError(`Binance WebSocket API 连接失败：${error.message}`, {
+            data: { cause: error.name, url },
+          })
+        );
+        return;
+      }
+
+      timeoutId = setTimeout(() => {
+        finish(
+          reject,
+          new BinanceApiError("Binance WebSocket API 请求超时。", {
+            data: { method, url },
+          })
+        );
+      }, 15_000);
+
+      socket.on("open", () => {
+        try {
+          socket.send(
+            JSON.stringify({
+              id: crypto.randomUUID(),
+              method,
+              params,
+            })
+          );
+        } catch (error) {
+          finish(
+            reject,
+            new BinanceApiError(
+              `Binance WebSocket API 请求发送失败：${error.message}`,
+              { data: { cause: error.name, url } }
+            )
+          );
+        }
+      });
+
+      socket.on("message", (buffer) => {
+        let message;
+
+        try {
+          message = JSON.parse(buffer.toString());
+        } catch (error) {
+          finish(
+            reject,
+            new BinanceApiError(
+              `Binance WebSocket API 响应解析失败：${error.message}`,
+              { data: { cause: error.name, url } }
+            )
+          );
+          return;
+        }
+
+        if (
+          message.error ||
+          (message.status !== undefined &&
+            (message.status < 200 || message.status >= 300))
+        ) {
+          const apiError = message.error || {};
+          finish(
+            reject,
+            new BinanceApiError(
+              apiError.msg || `Binance WebSocket API HTTP ${message.status}`,
+              {
+                status: message.status,
+                code: apiError.code,
+                data: message,
+              }
+            )
+          );
+          return;
+        }
+
+        finish(resolve, message.result);
+      });
+
+      socket.on("error", (error) => {
+        finish(
+          reject,
+          new BinanceApiError(`请求 Binance WebSocket API 失败：${error.message}`, {
+            data: { cause: error.name, url },
+          })
+        );
+      });
+
+      socket.on("close", (code, reasonBuffer) => {
+        if (settled) {
+          return;
+        }
+
+        const reason = reasonBuffer?.toString() || "";
+        finish(
+          reject,
+          new BinanceApiError("Binance WebSocket API 连接已关闭。", {
+            data: { code, reason, url },
+          })
+        );
+      });
+    });
+  }
+
+  async allOrders({ symbol, orderId, startTime, endTime, limit = 100 } = {}) {
+    const normalizedSymbol = this.validateSymbol(symbol);
+    this.assertTradingCredentials();
+
+    const { offsetMs } = await this.syncTradingServerTime();
+    const params = this.normalizeParams({
+      symbol: normalizedSymbol,
+      orderId,
+      startTime,
+      endTime,
+      limit,
+      recvWindow: 5_000,
+      apiKey: this.apiKey,
+      timestamp: Date.now() + offsetMs,
+    });
+
+    params.signature = this.createWsApiSignature(params);
+    return this.requestWsApi("allOrders", params, {
+      url: this.tradingWsApiBase,
+      agent: this.tradingProxyAgent,
+    });
+  }
+
+  async myTrades({
+    symbol,
+    orderId,
+    startTime,
+    endTime,
+    fromId,
+    limit = 100,
+  } = {}) {
+    const normalizedSymbol = this.validateSymbol(symbol);
+    this.assertTradingCredentials();
+
+    const timeBase = this.testnet ? this.tradingRestBase : this.restBase;
+    const { offsetMs } = await this.syncServerTimeForBase(timeBase);
+    const params = this.normalizeParams({
+      symbol: normalizedSymbol,
+      orderId,
+      startTime,
+      endTime,
+      fromId,
+      limit,
+      recvWindow: 5_000,
+      apiKey: this.apiKey,
+      timestamp: Date.now() + offsetMs,
+    });
+
+    params.signature = this.createWsApiSignature(params);
+    return this.requestWsApi("myTrades", params);
+  }
+
+  async accountStatus({ omitZeroBalances } = {}) {
+    this.assertTradingCredentials();
+
+    const timeBase = this.testnet ? this.tradingRestBase : this.restBase;
+    const { offsetMs } = await this.syncServerTimeForBase(timeBase);
+    const params = {
+      ...(omitZeroBalances === undefined
+        ? {}
+        : { omitZeroBalances: Boolean(omitZeroBalances) }),
+      recvWindow: "5000",
+      apiKey: this.apiKey,
+      timestamp: String(Date.now() + offsetMs),
+    };
+
+    params.signature = this.createWsApiSignature(params);
+    return this.requestWsApi("account.status", params);
+  }
+
+  async allOrderLists({ fromId, startTime, endTime, limit = 100 } = {}) {
+    this.assertTradingCredentials();
+
+    const timeBase = this.testnet ? this.tradingRestBase : this.restBase;
+    const { offsetMs } = await this.syncServerTimeForBase(timeBase);
+    const params = this.normalizeParams({
+      fromId,
+      startTime,
+      endTime,
+      limit,
+      recvWindow: 5_000,
+      apiKey: this.apiKey,
+      timestamp: Date.now() + offsetMs,
+    });
+
+    params.signature = this.createWsApiSignature(params);
+    return this.requestWsApi("allOrderLists", params);
   }
 
   connectDepth(symbol) {
