@@ -83,7 +83,6 @@ class Chart {
     }
      init(){
         const ctx= this.ctx;
-        debugger
         this.count = Math.floor((this.width - 150) / (this.barWidth * 2) ) * 2;
         
         
@@ -96,6 +95,20 @@ class Chart {
         
         this.renderRange(range);
        
+    }
+    reset(){
+        this.ctx.clearRect(0, 0, this.width, this.height);
+        this.rendered = false;
+        this.data = [];
+        this.start = 0;
+        this.currentPrice = undefined;
+        this.buyIndex = undefined;
+        this.askIndex = undefined;
+        this.lowerLimitindex = undefined;
+        this.UpperLimitindex = undefined;
+        this.placeOrder = [];
+        this.traded = {};
+        this.init();
     }
     setColor(type){
         if(type){
@@ -110,7 +123,9 @@ class Chart {
                 limit: '#EF2E2E',
                 low: '#00ff00',
                 high: "#ffff00",
-                order: '#fffbf0'
+                order: '#fffbf0',
+                orderBuy: '#ff0000',
+                orderSell: '#ff0000'
             }
         }else{
               
@@ -125,8 +140,10 @@ class Chart {
                 hold: '#00ff00',
                 limit: '#EF2E2E',
                 low: '#00ff00',
-                high: "#ffff00",
-                 order: 'red'
+                 high: "#ffff00",
+                 order: 'red',
+                 orderBuy: '#ff0000',
+                 orderSell: '#ff0000'
             }
         }
        
@@ -514,30 +531,24 @@ class Chart {
         if(this.data.length===0) return;
         
         const pricearray = this.placeOrder.reduce((a, b) => {
-            const {LimitPrice, VolumeTotalOriginal, Direction, VolumeTraded, OrderStatus, OrderSysID,StopPrice} =b;
-            
-            if(OrderStatus !== '3' && OrderStatus!=='1' && OrderStatus!=='b'){
+            const status = String(b.status || '').toUpperCase();
+            const price = Number(b.price) > 0 ? Number(b.price) : Number(b.stopPrice);
+            const volume = Math.max(0, Number(b.origQty) - Number(b.executedQty));
+            const side = String(b.side || '').toUpperCase();
+
+            if(!['NEW', 'PARTIALLY_FILLED'].includes(status) || !Number.isFinite(price) ||
+                !Number.isFinite(volume) || volume <= 0 || !['BUY', 'SELL'].includes(side)){
                 return a;
             }
-            const item = a.find(e=> {
-                
-                if(e.StopPrice){
-                    return e.StopPrice === StopPrice
-                }else{
-                    return e.price===LimitPrice;  
-                }
-                 
-                          
-            })
+
+            const item = a.find(e => e.price === price && e.side === side)
             if(item){
-                item.volume = item.volume + VolumeTotalOriginal -VolumeTraded
+                item.volume = item.volume + volume
             }else{
                 a.push({
-                    price: LimitPrice,
-                    volume: VolumeTotalOriginal -VolumeTraded,
-                    direction: Direction,
-                    OrderSysID,
-                    StopPrice
+                    price,
+                    volume,
+                    side
                 })
             }
             return a;
@@ -549,29 +560,25 @@ class Chart {
         const _x = X + 50.5;
         const {barWidth, volumeScaleHeight, range} = this;
         let _volume = [0, 0];
-        
-        pricearray.forEach(({price, volume, direction, OrderSysID = '', StopPrice}) => {
-            let index 
-            console.log(this.start, this.start + this.count)
-            const iscondition = OrderSysID.startsWith('TJBD_');
-            let color;
-            if(iscondition){
-                color = 'blue';
-                index = this.getindex(StopPrice, true);
-            }else{
-                index =this.getindex(price, true);
-                color= VALUECOLOR.order;
-                _volume[direction] = _volume[direction] + volume;
-            }
+        let visibleCount = 0;
+
+        pricearray.forEach(({price, volume, side}) => {
+            const index = this.getindex(price, true);
+            const color = side === 'BUY' ? VALUECOLOR.orderBuy : VALUECOLOR.orderSell;
+            const direction = side === 'BUY' ? 0 : 1;
+            _volume[direction] = _volume[direction] + volume;
             if(index < this.start || index > this.start + this.count)return;
             const  x = _x + (index-this.start) * barWidth;
-            const height = Chart.getHeight(range, volume, volumeScaleHeight); 
+            const height = Math.max(4, Chart.getHeight(range, volume, volumeScaleHeight));
             
             ctx.fillStyle = color
             ctx.fillRect(x,y,barWidth -1,height);
+            visibleCount += 1;
 
         })
         this.holdVolume = _volume;
+        this.visiblePlaceOrderCount = visibleCount;
+        this.totalPlaceOrderCount = pricearray.length;
         // console.log(this.placeOrder, pricearray)
         ctx.restore()
     }
@@ -788,12 +795,31 @@ const elements = {
   orderHistoryEnvironment: document.querySelector("#orderHistoryEnvironment"),
   tradeHistoryEnvironment: document.querySelector("#tradeHistoryEnvironment"),
   accountEnvironment: document.querySelector("#accountEnvironment"),
-  proxyStatus: document.querySelector("#proxyStatus"),
-  tradingProxyStatus: document.querySelector("#tradingProxyStatus"),
   credentials: document.querySelector("#credentials"),
+  chartOpenOrderStatus: document.querySelector("#chartOpenOrderStatus"),
   marketStatus: document.querySelector("#marketStatus"),
   timeOffset: document.querySelector("#timeOffset"),
   depthConfig: document.querySelector("#depthConfig"),
+  overviewSymbol: document.querySelector("#overviewSymbol"),
+  klineInterval: document.querySelector("#klineInterval"),
+  overviewStatus: document.querySelector("#overviewStatus"),
+  overviewLastPrice: document.querySelector("#overviewLastPrice"),
+  overviewBookTicker: document.querySelector("#overviewBookTicker"),
+  overviewAveragePrice: document.querySelector("#overviewAveragePrice"),
+  overviewChange: document.querySelector("#overviewChange"),
+  overviewHighLow: document.querySelector("#overviewHighLow"),
+  filterRulesBody: document.querySelector("#filterRulesBody"),
+  klineBody: document.querySelector("#klineBody"),
+  publicTradesBody: document.querySelector("#publicTradesBody"),
+  openOrdersSymbol: document.querySelector("#openOrdersSymbol"),
+  openOrdersStatus: document.querySelector("#openOrdersStatus"),
+  openOrdersBody: document.querySelector("#openOrdersBody"),
+  queryOrderSymbol: document.querySelector("#queryOrderSymbol"),
+  queryOrderId: document.querySelector("#queryOrderId"),
+  amendOrderQty: document.querySelector("#amendOrderQty"),
+  replaceOrderPrice: document.querySelector("#replaceOrderPrice"),
+  queryOrderStatus: document.querySelector("#queryOrderStatus"),
+  queryOrderBody: document.querySelector("#queryOrderBody"),
   marketSymbol: document.querySelector("#marketSymbol"),
   lastUpdateId: document.querySelector("#lastUpdateId"),
   receivedAt: document.querySelector("#receivedAt"),
@@ -805,6 +831,11 @@ const elements = {
   orderType: document.querySelector("#orderType"),
   quantity: document.querySelector("#quantity"),
   price: document.querySelector("#price"),
+  latestTradePriceToggle: document.querySelector("#latestTradePriceToggle"),
+  latestTradePriceState: document.querySelector("#latestTradePriceState"),
+  stopPrice: document.querySelector("#stopPrice"),
+  trailingDelta: document.querySelector("#trailingDelta"),
+  icebergQty: document.querySelector("#icebergQty"),
   cancelSymbol: document.querySelector("#cancelSymbol"),
   orderId: document.querySelector("#orderId"),
   orderHistorySymbol: document.querySelector("#orderHistorySymbol"),
@@ -828,6 +859,22 @@ const elements = {
   accountPermissions: document.querySelector("#accountPermissions"),
   accountUpdateTime: document.querySelector("#accountUpdateTime"),
   accountBalancesBody: document.querySelector("#accountBalancesBody"),
+  commissionSymbol: document.querySelector("#commissionSymbol"),
+  riskStatus: document.querySelector("#riskStatus"),
+  riskBody: document.querySelector("#riskBody"),
+  ocoSymbol: document.querySelector("#ocoSymbol"),
+  ocoSide: document.querySelector("#ocoSide"),
+  ocoQuantity: document.querySelector("#ocoQuantity"),
+  ocoWorkingPrice: document.querySelector("#ocoWorkingPrice"),
+  ocoAbovePrice: document.querySelector("#ocoAbovePrice"),
+  ocoAboveStopPrice: document.querySelector("#ocoAboveStopPrice"),
+  ocoBelowPrice: document.querySelector("#ocoBelowPrice"),
+  ocoBelowStopPrice: document.querySelector("#ocoBelowStopPrice"),
+  orderListId: document.querySelector("#orderListId"),
+  orderListsStatus: document.querySelector("#orderListsStatus"),
+  orderListsBody: document.querySelector("#orderListsBody"),
+  userDataStatus: document.querySelector("#userDataStatus"),
+  userDataBody: document.querySelector("#userDataBody"),
   requestDuration: document.querySelector("#requestDuration"),
   output: document.querySelector("#output"),
 };
@@ -881,8 +928,8 @@ function formatOrderTime(value) {
   return new Date(timestamp).toLocaleString();
 }
 
-function renderOrders(orders) {
-  elements.orderHistoryBody.replaceChildren();
+function renderOrders(orders, container = elements.orderHistoryBody) {
+  container.replaceChildren();
 
   if (!orders.length) {
     const row = document.createElement("tr");
@@ -890,7 +937,7 @@ function renderOrders(orders) {
     cell.colSpan = 9;
     cell.textContent = "当前交易对没有可展示的普通订单";
     row.append(cell);
-    elements.orderHistoryBody.append(row);
+    container.append(row);
     return;
   }
 
@@ -930,7 +977,7 @@ function renderOrders(orders) {
       executedQuantity,
       updateTime
     );
-    elements.orderHistoryBody.append(row);
+    container.append(row);
   }
 }
 
@@ -1022,14 +1069,14 @@ function renderAccountInfo(account) {
 
   elements.accountBalancesBody.replaceChildren();
   const balances = (Array.isArray(account.balances) ? account.balances : []).filter(
-    (balance) => Number(balance.free) !== 0 || Number(balance.locked) !== 0
+    (balance) => Number(balance.locked) !== 0
   );
 
   if (!balances.length) {
     const row = document.createElement("tr");
     const cell = document.createElement("td");
     cell.colSpan = 3;
-    cell.textContent = "当前账户没有非零资产余额";
+    cell.textContent = "当前账户没有锁定余额不为 0 的资产";
     row.append(cell);
     elements.accountBalancesBody.append(row);
     return;
@@ -1047,6 +1094,146 @@ function renderAccountInfo(account) {
     row.append(asset, free, locked);
     elements.accountBalancesBody.append(row);
   }
+}
+
+function appendTextRow(container, values, columnCount) {
+  const row = document.createElement("tr");
+  for (const value of values) {
+    const cell = document.createElement("td");
+    cell.textContent = value ?? "-";
+    row.append(cell);
+  }
+  if (values.length === 1 && columnCount > 1) {
+    row.firstChild.colSpan = columnCount;
+  }
+  container.append(row);
+}
+
+function renderExchangeInfo(result) {
+  elements.filterRulesBody.replaceChildren();
+  const symbolInfo = result?.symbol;
+  const filters = Array.isArray(symbolInfo?.filters) ? symbolInfo.filters : [];
+  if (!filters.length) {
+    appendTextRow(elements.filterRulesBody, ["没有可展示的交易规则"], 2);
+    return;
+  }
+  for (const filter of filters) {
+    const { filterType, ...rules } = filter;
+    appendTextRow(elements.filterRulesBody, [filterType, JSON.stringify(rules)], 2);
+  }
+}
+
+function renderMarketOverview(data) {
+  elements.overviewLastPrice.textContent = data.price?.price ?? "-";
+  elements.overviewBookTicker.textContent = `${data.bookTicker?.bidPrice ?? "-"} / ${data.bookTicker?.askPrice ?? "-"}`;
+  elements.overviewAveragePrice.textContent = `${data.averagePrice?.price ?? "-"}（${data.averagePrice?.mins ?? "-"} 分钟）`;
+  elements.overviewChange.textContent = `${data.ticker24hr?.priceChange ?? "-"} / ${data.ticker24hr?.priceChangePercent ?? "-"}%`;
+  elements.overviewHighLow.textContent = `${data.ticker24hr?.highPrice ?? "-"} / ${data.ticker24hr?.lowPrice ?? "-"}`;
+
+  elements.klineBody.replaceChildren();
+  const klines = Array.isArray(data.klines) ? data.klines.slice(-20).reverse() : [];
+  if (!klines.length) {
+    appendTextRow(elements.klineBody, ["没有 K 线数据"], 7);
+    return;
+  }
+  for (const kline of klines) {
+    appendTextRow(elements.klineBody, [
+      formatOrderTime(kline.openTime), kline.open, kline.high, kline.low,
+      kline.close, kline.volume, kline.tradeCount,
+    ], 7);
+  }
+
+  elements.publicTradesBody.replaceChildren();
+  const recent = (data.recentTrades || []).slice(-10).reverse().map((trade) => [
+    "recent", trade.id, trade.price, trade.qty, formatOrderTime(trade.time),
+    trade.isBuyerMaker === true ? "是" : "否",
+  ]);
+  const historical = (data.historicalTrades || []).slice(-10).reverse().map((trade) => [
+    "historical", trade.id, trade.price, trade.qty, formatOrderTime(trade.time),
+    trade.isBuyerMaker === true ? "是" : "否",
+  ]);
+  const aggregate = (data.aggregateTrades || []).slice(-10).reverse().map((trade) => [
+    "aggregate", trade.a, trade.p, trade.q, formatOrderTime(trade.T),
+    trade.m === true ? "是" : "否",
+  ]);
+  const trades = [...recent, ...historical, ...aggregate];
+  if (!trades.length) appendTextRow(elements.publicTradesBody, ["没有公开成交数据"], 6);
+  else for (const trade of trades) appendTextRow(elements.publicTradesBody, trade, 6);
+}
+
+function renderRiskRows(rows) {
+  elements.riskBody.replaceChildren();
+  if (!rows.length) {
+    appendTextRow(elements.riskBody, ["没有可展示的信息"], 5);
+    return;
+  }
+  for (const row of rows) appendTextRow(elements.riskBody, row, 5);
+}
+
+function renderOrderLists(lists) {
+  elements.orderListsBody.replaceChildren();
+  const normalized = Array.isArray(lists) ? lists : lists ? [lists] : [];
+  if (!normalized.length) {
+    appendTextRow(elements.orderListsBody, ["没有组合订单记录"], 7);
+    return;
+  }
+  for (const list of normalized) {
+    appendTextRow(elements.orderListsBody, [
+      list.orderListId, list.symbol, list.contingencyType,
+      list.listStatusType, list.listOrderStatus,
+      Array.isArray(list.orders) ? list.orders.length : "-",
+      formatOrderTime(list.transactionTime),
+    ], 7);
+  }
+}
+
+function summarizeUserDataEvent(event) {
+  if (event.e === "executionReport") {
+    return `${event.S || ""} ${event.o || ""} ${event.q || ""} @ ${event.p || ""}`.trim();
+  }
+  if (event.e === "outboundAccountPosition") {
+    return (event.B || []).map((balance) => `${balance.a}: ${balance.f}/${balance.l}`).join(", ");
+  }
+  if (event.e === "balanceUpdate") {
+    return `余额变化 ${event.d ?? "-"}`;
+  }
+  return JSON.stringify(event).slice(0, 240);
+}
+
+function prependUserDataEvent(payload) {
+  if (elements.userDataBody.querySelector("td[colspan]")) {
+    elements.userDataBody.replaceChildren();
+  }
+  const event = payload.event || {};
+  const row = document.createElement("tr");
+  for (const value of [
+    formatOrderTime(payload.receivedAt), event.e || "未知事件",
+    event.s || event.a || "-", event.X || event.x || event.l || "-",
+    event.i ?? "-", summarizeUserDataEvent(event),
+  ]) {
+    const cell = document.createElement("td");
+    cell.textContent = value;
+    row.append(cell);
+  }
+  elements.userDataBody.prepend(row);
+  while (elements.userDataBody.children.length > 100) {
+    elements.userDataBody.lastElementChild.remove();
+  }
+}
+
+function readOrderForm() {
+  const type = elements.orderType.value;
+  return {
+    symbol: elements.orderSymbol.value.trim(),
+    side: elements.side.value,
+    type,
+    quantity: elements.quantity.value.trim(),
+    price: elements.price.value.trim(),
+    stopPrice: elements.stopPrice.value.trim(),
+    trailingDelta: elements.trailingDelta.value.trim(),
+    icebergQty: elements.icebergQty.value.trim(),
+    timeInForce: ["LIMIT", "STOP_LOSS_LIMIT", "TAKE_PROFIT_LIMIT"].includes(type) ? "GTC" : undefined,
+  };
 }
 
 async function loadStatus() {
@@ -1082,9 +1269,6 @@ async function loadStatus() {
   )
     ? "Spot Testnet（account.status）"
     : "Spot Production（account.status）";
-  elements.proxyStatus.textContent = status.socks5Proxy || "未配置";
-  elements.tradingProxyStatus.textContent =
-    status.tradingSocks5Proxy || "未配置";
   elements.credentials.textContent =
     status.hasApiKey && status.hasApiSecret ? "已配置" : "未配置";
   elements.timeOffset.textContent = `${status.serverTimeOffsetMs} ms`;
@@ -1103,6 +1287,92 @@ document
     }
   });
 
+document.querySelector("#pingButton").addEventListener("click", async () => {
+  const result = await window.binance.ping();
+  printResult("Binance 连通性测试", result);
+  elements.overviewStatus.textContent = result.ok ? "连接正常" : formatError(result);
+});
+
+document.querySelector("#refreshRulesButton").addEventListener("click", async () => {
+  elements.overviewStatus.textContent = "加载交易规则中…";
+  const result = await window.binance.exchangeInfo({
+    symbol: elements.overviewSymbol.value.trim(), forceRefresh: true,
+  });
+  printResult("交易规则结果", result);
+  elements.overviewStatus.textContent = result.ok ? "交易规则已加载" : formatError(result);
+  if (result.ok) renderExchangeInfo(result.data);
+});
+
+document.querySelector("#refreshOverviewButton").addEventListener("click", async () => {
+  elements.overviewStatus.textContent = "加载行情中…";
+  const result = await window.binance.marketOverview({
+    symbol: elements.overviewSymbol.value.trim(),
+    interval: elements.klineInterval.value,
+    limit: 50,
+  });
+  printResult("综合行情结果", result);
+  elements.overviewStatus.textContent = result.ok ? "行情已加载" : formatError(result);
+  if (result.ok) renderMarketOverview(result.data);
+});
+
+document.querySelector("#refreshOpenOrdersButton").addEventListener("click", async () => {
+  elements.openOrdersStatus.textContent = "加载中…";
+  const result = await refreshTrackedOpenOrders(elements.openOrdersSymbol.value);
+  printResult("当前挂单结果", result);
+  if (result.ok) {
+    elements.openOrdersStatus.textContent = `当前挂单 ${result.data?.length || 0} 条`;
+  } else elements.openOrdersStatus.textContent = formatError(result);
+});
+
+document.querySelector("#cancelAllOpenOrdersButton").addEventListener("click", async () => {
+  const symbol = elements.openOrdersSymbol.value.trim();
+  if (!window.confirm(`确定撤销 ${symbol} 的全部当前挂单吗？`)) return;
+  const result = await window.binance.cancelAllOpenOrders({ symbol });
+  printResult("撤销全部挂单结果", result);
+  elements.openOrdersStatus.textContent = result.ok ? `已撤销 ${result.data?.length || 0} 条` : formatError(result);
+  if (result.ok) {
+    for (const order of result.data || []) applyOpenOrderUpdate(order);
+    await refreshTrackedOpenOrders(symbol);
+  }
+});
+
+document.querySelector("#queryOrderButton").addEventListener("click", async () => {
+  const result = await window.binance.queryOrder({
+    symbol: elements.queryOrderSymbol.value.trim(), orderId: elements.queryOrderId.value.trim(),
+  });
+  printResult("单笔订单结果", result);
+  elements.queryOrderStatus.textContent = result.ok ? `状态：${result.data.status}` : formatError(result);
+  if (result.ok) renderOrders([result.data], elements.queryOrderBody);
+});
+
+document.querySelector("#amendOrderButton").addEventListener("click", async () => {
+  const result = await window.binance.amendOrder({
+    symbol: elements.queryOrderSymbol.value.trim(), orderId: elements.queryOrderId.value.trim(),
+    newQty: elements.amendOrderQty.value.trim(),
+  });
+  printResult("减量改单结果", result);
+  elements.queryOrderStatus.textContent = result.ok ? "修改成功" : formatError(result);
+});
+
+document.querySelector("#cancelReplaceButton").addEventListener("click", async () => {
+  const current = await window.binance.queryOrder({
+    symbol: elements.queryOrderSymbol.value.trim(), orderId: elements.queryOrderId.value.trim(),
+  });
+  if (!current.ok) {
+    printResult("撤单重报前查询失败", current);
+    elements.queryOrderStatus.textContent = formatError(current);
+    return;
+  }
+  const result = await window.binance.cancelReplace({
+    cancelOrderId: current.data.orderId, symbol: current.data.symbol,
+    side: current.data.side, type: "LIMIT", timeInForce: "GTC",
+    quantity: elements.amendOrderQty.value.trim() || current.data.origQty,
+    price: elements.replaceOrderPrice.value.trim(),
+  });
+  printResult("撤单并重报结果", result);
+  elements.queryOrderStatus.textContent = result.ok ? "撤单重报完成" : formatError(result);
+});
+
 document
   .querySelector("#connectMarketButton")
   .addEventListener("click", async () => {
@@ -1111,9 +1381,15 @@ document
     elements.cancelSymbol.value = symbol;
     elements.orderHistorySymbol.value = symbol;
     elements.tradeHistorySymbol.value = symbol;
+    elements.overviewSymbol.value = symbol;
+    elements.openOrdersSymbol.value = symbol;
+    elements.queryOrderSymbol.value = symbol;
+    elements.commissionSymbol.value = symbol;
+    elements.ocoSymbol.value = symbol;
 
     const result = await window.binance.connectDepth(symbol);
     printResult("连接增量深度请求", result);
+    if (result.ok) await refreshTrackedOpenOrders(symbol);
   });
 
 document
@@ -1126,28 +1402,23 @@ document
 document
   .querySelector("#placeOrderButton")
   .addEventListener("click", async () => {
-    const type = elements.orderType.value;
-
-    const order = {
-      symbol: elements.orderSymbol.value.trim(),
-      side: elements.side.value,
-      type,
-      quantity: elements.quantity.value.trim(),
-    };
-
-    if (type === "LIMIT") {
-      order.price = elements.price.value.trim();
-      order.timeInForce = "GTC";
-    }
-
+    const order = readOrderForm();
     const result = await window.binance.placeOrder(order);
     printResult("下单结果", result);
 
     if (result.ok && result.data.orderId !== undefined) {
       elements.orderId.value = String(result.data.orderId);
+      elements.queryOrderId.value = String(result.data.orderId);
       elements.cancelSymbol.value = result.data.symbol;
+      elements.queryOrderSymbol.value = result.data.symbol;
+      applyOpenOrderUpdate(result.data);
     }
   });
+
+document.querySelector("#testOrderButton").addEventListener("click", async () => {
+  const result = await window.binance.testOrder(readOrderForm());
+  printResult("测试下单结果（不会进入撮合引擎）", result);
+});
 
 document
   .querySelector("#cancelOrderButton")
@@ -1158,18 +1429,19 @@ document
     });
 
     printResult("撤单结果", result);
+    if (result.ok) applyOpenOrderUpdate(result.data);
   });
 
-elements.refreshOrderHistoryButton.addEventListener("click", async () => {
+async function refreshOrderHistory(symbol, { showResult = true } = {}) {
   elements.refreshOrderHistoryButton.disabled = true;
   elements.orderHistoryStatus.textContent = "加载中…";
 
   try {
     const result = await window.binance.allOrders({
-      symbol: elements.orderHistorySymbol.value.trim(),
+      symbol,
       limit: 100,
     });
-    printResult("普通订单记录结果", result);
+    if (showResult) printResult("普通订单记录结果", result);
 
     if (!result.ok) {
       elements.orderHistoryStatus.textContent = formatError(result);
@@ -1185,18 +1457,22 @@ elements.refreshOrderHistoryButton.addEventListener("click", async () => {
   } finally {
     elements.refreshOrderHistoryButton.disabled = false;
   }
+}
+
+elements.refreshOrderHistoryButton.addEventListener("click", () => {
+  refreshOrderHistory(elements.orderHistorySymbol.value.trim());
 });
 
-elements.refreshTradeHistoryButton.addEventListener("click", async () => {
+async function refreshTradeHistory(symbol, { showResult = true } = {}) {
   elements.refreshTradeHistoryButton.disabled = true;
   elements.tradeHistoryStatus.textContent = "加载中…";
 
   try {
     const result = await window.binance.myTrades({
-      symbol: elements.tradeHistorySymbol.value.trim(),
+      symbol,
       limit: 100,
     });
-    printResult("账户成交历史结果", result);
+    if (showResult) printResult("账户成交历史结果", result);
 
     if (!result.ok) {
       elements.tradeHistoryStatus.textContent = formatError(result);
@@ -1212,6 +1488,10 @@ elements.refreshTradeHistoryButton.addEventListener("click", async () => {
   } finally {
     elements.refreshTradeHistoryButton.disabled = false;
   }
+}
+
+elements.refreshTradeHistoryButton.addEventListener("click", () => {
+  refreshTradeHistory(elements.tradeHistorySymbol.value.trim());
 });
 
 elements.refreshAccountButton.addEventListener("click", async () => {
@@ -1232,11 +1512,10 @@ elements.refreshAccountButton.addEventListener("click", async () => {
     renderAccountInfo(result.data || {});
     const balanceCount = Array.isArray(result.data?.balances)
       ? result.data.balances.filter(
-          (balance) =>
-            Number(balance.free) !== 0 || Number(balance.locked) !== 0
+          (balance) => Number(balance.locked) !== 0
         ).length
       : 0;
-    elements.accountStatus.textContent = `已加载 / 非零资产 ${balanceCount} 项 / ${new Date().toLocaleString()}`;
+    elements.accountStatus.textContent = `已加载 / 锁定余额不为 0 的资产 ${balanceCount} 项 / ${new Date().toLocaleString()}`;
   } catch (error) {
     elements.accountStatus.textContent = error.message || "加载失败";
     printResult("读取账户信息异常", { message: error.message });
@@ -1245,9 +1524,158 @@ elements.refreshAccountButton.addEventListener("click", async () => {
   }
 });
 
+document.querySelector("#refreshCommissionButton").addEventListener("click", async () => {
+  elements.riskStatus.textContent = "加载手续费率中…";
+  const result = await window.binance.accountCommission({
+    symbol: elements.commissionSymbol.value.trim(),
+  });
+  printResult("账户手续费率结果", result);
+  if (!result.ok) {
+    elements.riskStatus.textContent = formatError(result);
+    return;
+  }
+  const data = result.data || {};
+  renderRiskRows(Object.entries({
+    标准费率: data.standardCommission,
+    特殊费率: data.specialCommission,
+    税费率: data.taxCommission,
+  }).map(([name, rate]) => [name, rate?.maker, rate?.taker, rate?.buyer, rate?.seller]));
+  elements.riskStatus.textContent = `${data.symbol || ""} 手续费率已加载`;
+});
+
+document.querySelector("#refreshRateLimitsButton").addEventListener("click", async () => {
+  elements.riskStatus.textContent = "加载下单限频中…";
+  const result = await window.binance.accountRateLimits();
+  printResult("账户下单限频结果", result);
+  if (!result.ok) {
+    elements.riskStatus.textContent = formatError(result);
+    return;
+  }
+  renderRiskRows((result.data || []).map((rate) => [
+    `${rate.intervalNum} ${rate.interval}`, rate.limit, rate.count, "-", "-",
+  ]));
+  elements.riskStatus.textContent = "下单限频已加载";
+});
+
+function readOcoForm() {
+  return {
+    symbol: elements.ocoSymbol.value.trim(), side: elements.ocoSide.value,
+    quantity: elements.ocoQuantity.value.trim(), workingPrice: elements.ocoWorkingPrice.value.trim(),
+    abovePrice: elements.ocoAbovePrice.value.trim(), aboveStopPrice: elements.ocoAboveStopPrice.value.trim(),
+    belowPrice: elements.ocoBelowPrice.value.trim(), belowStopPrice: elements.ocoBelowStopPrice.value.trim(),
+  };
+}
+
+document.querySelector("#placeOcoButton").addEventListener("click", async () => {
+  const result = await window.binance.placeOco(readOcoForm());
+  printResult("创建 OCO 结果", result);
+  elements.orderListsStatus.textContent = result.ok ? "OCO 创建成功" : formatError(result);
+  if (result.ok) {
+    elements.orderListId.value = result.data.orderListId ?? "";
+    renderOrderLists(result.data);
+  }
+});
+
+document.querySelector("#placeOtoButton").addEventListener("click", async () => {
+  const form = readOcoForm();
+  const result = await window.binance.placeOto({
+    symbol: form.symbol,
+    workingSide: form.side,
+    workingPrice: form.workingPrice,
+    workingQuantity: form.quantity,
+    pendingSide: form.side === "BUY" ? "SELL" : "BUY",
+    pendingPrice: form.belowPrice,
+    pendingQuantity: form.quantity,
+  });
+  printResult("创建 OTO 结果", result);
+  elements.orderListsStatus.textContent = result.ok ? "OTO 创建成功" : formatError(result);
+  if (result.ok) {
+    elements.orderListId.value = result.data.orderListId ?? "";
+    renderOrderLists(result.data);
+  }
+});
+
+document.querySelector("#placeOtocoButton").addEventListener("click", async () => {
+  const form = readOcoForm();
+  const result = await window.binance.placeOtoco({
+    symbol: form.symbol,
+    workingSide: form.side,
+    workingPrice: form.workingPrice,
+    workingQuantity: form.quantity,
+    pendingSide: form.side === "BUY" ? "SELL" : "BUY",
+    pendingQuantity: form.quantity,
+    pendingAbovePrice: form.abovePrice,
+    pendingBelowPrice: form.belowPrice,
+    pendingBelowStopPrice: form.belowStopPrice,
+  });
+  printResult("创建 OTOCO 结果", result);
+  elements.orderListsStatus.textContent = result.ok ? "OTOCO 创建成功" : formatError(result);
+  if (result.ok) {
+    elements.orderListId.value = result.data.orderListId ?? "";
+    renderOrderLists(result.data);
+  }
+});
+
+document.querySelector("#refreshAllOrderListsButton").addEventListener("click", async () => {
+  const result = await window.binance.allOrderLists({ limit: 100 });
+  printResult("组合订单历史结果", result);
+  elements.orderListsStatus.textContent = result.ok ? `已加载 ${result.data?.length || 0} 条` : formatError(result);
+  if (result.ok) renderOrderLists(result.data);
+});
+
+document.querySelector("#refreshOpenOrderListsButton").addEventListener("click", async () => {
+  const result = await window.binance.openOrderLists();
+  printResult("当前组合挂单结果", result);
+  elements.orderListsStatus.textContent = result.ok ? `当前组合挂单 ${result.data?.length || 0} 条` : formatError(result);
+  if (result.ok) renderOrderLists(result.data);
+});
+
+document.querySelector("#queryOrderListButton").addEventListener("click", async () => {
+  const result = await window.binance.queryOrderList({ orderListId: elements.orderListId.value.trim() });
+  printResult("组合订单查询结果", result);
+  elements.orderListsStatus.textContent = result.ok ? "组合订单已加载" : formatError(result);
+  if (result.ok) renderOrderLists(result.data);
+});
+
+document.querySelector("#cancelOrderListButton").addEventListener("click", async () => {
+  if (!window.confirm(`确定撤销组合订单 ${elements.orderListId.value.trim()} 吗？`)) return;
+  const result = await window.binance.cancelOrderList({
+    symbol: elements.ocoSymbol.value.trim(), orderListId: elements.orderListId.value.trim(),
+  });
+  printResult("撤销组合订单结果", result);
+  elements.orderListsStatus.textContent = result.ok ? "组合订单已撤销" : formatError(result);
+  if (result.ok) renderOrderLists(result.data);
+});
+
+document.querySelector("#connectUserDataButton").addEventListener("click", async () => {
+  elements.userDataStatus.textContent = "连接中…";
+  const result = await window.binance.connectUserData();
+  printResult("连接实时账户事件", result);
+  elements.userDataStatus.textContent = result.ok
+    ? `已连接 / subscriptionId=${result.data.subscriptionId}`
+    : formatError(result);
+});
+
+document.querySelector("#disconnectUserDataButton").addEventListener("click", async () => {
+  const result = await window.binance.disconnectUserData();
+  printResult("断开实时账户事件", result);
+  elements.userDataStatus.textContent = result.ok ? "已断开" : formatError(result);
+});
+
+document.querySelector("#clearUserDataButton").addEventListener("click", () => {
+  elements.userDataBody.replaceChildren();
+  appendTextRow(elements.userDataBody, ["连接后等待账户事件"], 6);
+});
+
 elements.orderType.addEventListener("change", () => {
-  const isLimit = elements.orderType.value === "LIMIT";
-  elements.price.disabled = !isLimit;
+  const type = elements.orderType.value;
+  const needsPrice = ["LIMIT", "LIMIT_MAKER", "STOP_LOSS_LIMIT", "TAKE_PROFIT_LIMIT"].includes(type);
+  const needsStop = type.includes("STOP") || type.includes("TAKE_PROFIT");
+  const supportsIceberg = ["LIMIT", "STOP_LOSS_LIMIT", "TAKE_PROFIT_LIMIT"].includes(type);
+  elements.price.disabled = !needsPrice;
+  elements.stopPrice.disabled = !needsStop;
+  elements.trailingDelta.disabled = !needsStop;
+  elements.icebergQty.disabled = !supportsIceberg;
 });
 const chartDom = document.querySelector('#can');
 const chart = new Chart(chartDom,980, 300, 0.01,{
@@ -1264,26 +1692,300 @@ const chart = new Chart(chartDom,980, 300, 0.01,{
     calcBarType: 2
 
 });
+let chartSymbol = null;
+const latestTradePrices = new Map();
+const openOrdersByKey = new Map();
+let numpadOrderBusy = false;
+let executionReportRefreshTimer = null;
+let executionReportRefreshSymbol = null;
+
+function offsetTradePrice(price, offset) {
+  const numericPrice = Number(price);
+  if (!Number.isFinite(numericPrice)) return null;
+  const decimals = Math.min(12, Math.max(
+    (String(price).split(".")[1] || "").length,
+    1
+  ));
+  return (numericPrice + offset).toFixed(decimals);
+}
+
+async function placeOrderFromNumpad(side) {
+  const symbol = String(chartSymbol || elements.marketSymbol.value || "").toUpperCase();
+  const latestPrice = latestTradePrices.get(symbol);
+  const offset = side === "SELL" ? 0.1 : -0.1;
+  const price = offsetTradePrice(latestPrice, offset);
+
+  if (!latestPrice || !price || Number(price) <= 0) {
+    printResult("小键盘报单失败", {
+      ok: false,
+      error: { message: `${symbol || "当前交易对"} 尚未收到最新成交价。` },
+    });
+    return;
+  }
+
+  elements.orderSymbol.value = symbol;
+  elements.side.value = side;
+  elements.orderType.value = "LIMIT";
+  elements.quantity.value = "0.001";
+  elements.price.value = price;
+
+  const result = await window.binance.placeOrder({
+    symbol,
+    side,
+    type: "LIMIT",
+    quantity: "0.001",
+    price,
+    timeInForce: "GTC",
+  });
+  printResult(
+    side === "SELL" ? "小键盘 1 报空单结果" : "小键盘 3 报多单结果",
+    result
+  );
+
+  if (result.ok) {
+    elements.orderId.value = String(result.data.orderId ?? "");
+    elements.queryOrderId.value = String(result.data.orderId ?? "");
+    elements.cancelSymbol.value = result.data.symbol || symbol;
+    elements.queryOrderSymbol.value = result.data.symbol || symbol;
+    applyOpenOrderUpdate(result.data);
+  }
+}
+
+async function cancelAllOpenOrdersFromNumpad() {
+  const openResult = await window.binance.openOrders({});
+  if (!openResult.ok) {
+    printResult("小键盘 5 查询全部未成交订单失败", openResult);
+    return;
+  }
+
+  const symbols = [...new Set(
+    (openResult.data || []).map((order) => String(order.symbol || "").toUpperCase()).filter(Boolean)
+  )];
+  if (!symbols.length) {
+    printResult("小键盘 5 撤销全部未成交订单", {
+      ok: true,
+      data: { canceledOrderCount: 0, symbols: [] },
+    });
+    return;
+  }
+
+  const cancellations = [];
+  for (const symbol of symbols) {
+    const result = await window.binance.cancelAllOpenOrders({ symbol });
+    cancellations.push({ symbol, ...result });
+    if (result.ok) {
+      for (const order of result.data || []) applyOpenOrderUpdate(order);
+    }
+  }
+
+  const failed = cancellations.filter((result) => !result.ok);
+  printResult("小键盘 5 撤销全部未成交订单结果", {
+    ok: failed.length === 0,
+    data: {
+      symbols,
+      canceledOrderCount: cancellations.reduce(
+        (count, result) => count + (Array.isArray(result.data) ? result.data.length : 0),
+        0
+      ),
+      cancellations,
+    },
+    ...(failed.length ? { error: { message: `${failed.length} 个交易对撤单失败。` } } : {}),
+  });
+  await refreshTrackedOpenOrders();
+}
+
+document.addEventListener("keydown", async (event) => {
+  if (event.repeat || event.ctrlKey || event.altKey || event.metaKey ||
+      !["Numpad1", "Numpad3", "Numpad5"].includes(event.code)) {
+    return;
+  }
+
+  event.preventDefault();
+  if (numpadOrderBusy) {
+    printResult("小键盘订单操作", {
+      ok: false,
+      error: { message: "上一笔小键盘订单操作尚未完成，请稍候。" },
+    });
+    return;
+  }
+
+  numpadOrderBusy = true;
+  try {
+    if (event.code === "Numpad1") await placeOrderFromNumpad("SELL");
+    if (event.code === "Numpad3") await placeOrderFromNumpad("BUY");
+    if (event.code === "Numpad5") await cancelAllOpenOrdersFromNumpad();
+  } catch (error) {
+    printResult("小键盘订单操作异常", {
+      ok: false,
+      error: { name: error.name, message: error.message },
+    });
+  } finally {
+    numpadOrderBusy = false;
+  }
+});
+
+function scheduleExecutionReportRefresh(event) {
+  executionReportRefreshSymbol = String(event.s || "").toUpperCase();
+  clearTimeout(executionReportRefreshTimer);
+  executionReportRefreshTimer = setTimeout(() => {
+    const symbol = executionReportRefreshSymbol;
+    if (!symbol) return;
+    elements.orderHistorySymbol.value = symbol;
+    elements.tradeHistorySymbol.value = symbol;
+    Promise.all([
+      refreshOrderHistory(symbol, { showResult: false }),
+      refreshTradeHistory(symbol, { showResult: false }),
+    ]).catch((error) => {
+      printResult("账户事件自动刷新异常", {
+        ok: false,
+        error: { name: error.name, message: error.message },
+      });
+    });
+  }, 250);
+}
+
+function openOrderKey(order) {
+  return `${order.symbol}:${order.orderId}`;
+}
+
+function normalizeOpenOrder(order, receivedAt = Date.now()) {
+  const normalized = {
+    symbol: String(order.symbol ?? order.s ?? "").toUpperCase(),
+    orderId: order.orderId ?? order.i,
+    side: String(order.side ?? order.S ?? "").toUpperCase(),
+    type: String(order.type ?? order.o ?? "").toUpperCase(),
+    status: String(order.status ?? order.X ?? "").toUpperCase(),
+    price: String(order.price ?? order.p ?? "0"),
+    stopPrice: String(order.stopPrice ?? order.P ?? "0"),
+    origQty: String(order.origQty ?? order.q ?? "0"),
+    executedQty: String(order.executedQty ?? order.z ?? "0"),
+    updateTime: Number(order.updateTime ?? order.T ?? order.E ?? Date.now()),
+    receivedAt,
+  };
+
+  return normalized.symbol && normalized.orderId !== undefined
+    ? normalized
+    : null;
+}
+
+function isOpenOrder(order) {
+  return ["NEW", "PARTIALLY_FILLED"].includes(order.status) &&
+    Number(order.origQty) - Number(order.executedQty) > 0;
+}
+
+function updateChartOrderStatus() {
+  const total = chart.totalPlaceOrderCount ?? chart.placeOrder.length;
+  const visible = chart.visiblePlaceOrderCount ?? 0;
+  elements.chartOpenOrderStatus.innerHTML =
+    `<span class="open-order">鲜红色柱：自有未成交挂单</span>，` +
+    `图内 ${visible} 个价位 / 共 ${total} 个价位（柱高为剩余数量）`;
+}
+
+function syncTrackedOpenOrders() {
+  const symbol = String(chartSymbol || elements.marketSymbol.value || "").toUpperCase();
+  const orders = [...openOrdersByKey.values()]
+    .filter((order) => order.symbol === symbol && isOpenOrder(order));
+
+  chart.placeOrder = orders;
+  chart.totalPlaceOrderCount = orders.length;
+
+  const tableSymbol = elements.openOrdersSymbol.value.trim().toUpperCase();
+  const tableOrders = [...openOrdersByKey.values()]
+    .filter((order) => order.symbol === tableSymbol && isOpenOrder(order));
+  renderOrders(tableOrders, elements.openOrdersBody);
+  elements.openOrdersStatus.textContent = `实时未成交 ${tableOrders.length} 笔`;
+  updateChartOrderStatus();
+}
+
+function applyOpenOrderUpdate(order, receivedAt = Date.now()) {
+  const normalized = normalizeOpenOrder(order, receivedAt);
+  if (!normalized) return;
+
+  const key = openOrderKey(normalized);
+  const existing = openOrdersByKey.get(key);
+  if (existing && existing.receivedAt > normalized.receivedAt) return;
+
+  if (isOpenOrder(normalized)) openOrdersByKey.set(key, normalized);
+  else openOrdersByKey.delete(key);
+  syncTrackedOpenOrders();
+}
+
+async function refreshTrackedOpenOrders(symbol = elements.marketSymbol.value) {
+  const normalizedSymbol = String(symbol || "").trim().toUpperCase();
+  const snapshotStartedAt = Date.now();
+  const result = await window.binance.openOrders({ symbol: normalizedSymbol });
+  if (!result.ok) return result;
+
+  for (const [key, order] of openOrdersByKey) {
+    if (order.symbol === normalizedSymbol && order.receivedAt <= snapshotStartedAt) {
+      openOrdersByKey.delete(key);
+    }
+  }
+  for (const order of result.data || []) {
+    const normalized = normalizeOpenOrder(order, snapshotStartedAt);
+    if (normalized && isOpenOrder(normalized)) {
+      openOrdersByKey.set(openOrderKey(normalized), normalized);
+    }
+  }
+  syncTrackedOpenOrders();
+  return result;
+}
+
+function fillLatestTradePrice() {
+  const symbol = elements.orderSymbol.value.trim().toUpperCase();
+  const price = latestTradePrices.get(symbol);
+
+  if (elements.latestTradePriceToggle.checked && price) {
+    elements.price.value = price;
+  }
+}
+
+elements.latestTradePriceToggle.addEventListener("change", () => {
+  elements.latestTradePriceState.textContent = elements.latestTradePriceToggle.checked
+    ? "选中"
+    : "未选中";
+  fillLatestTradePrice();
+});
+
+elements.orderSymbol.addEventListener("change", fillLatestTradePrice);
+
+window.binance.onTradeUpdate((trade) => {
+  const symbol = String(trade.symbol || "").toUpperCase();
+  const price = String(trade.price || "");
+
+  if (symbol && price && Number.isFinite(Number(price))) {
+    latestTradePrices.set(symbol, price);
+    fillLatestTradePrice();
+  }
+});
+
+function createChartDepthData(depth) {
+  const data = {};
+  const sides = [
+    ["Bid", depth.bids],
+    ["Ask", depth.asks],
+  ];
+
+  for (const [side, levels] of sides) {
+    for (const [index, level] of (levels || []).slice(0, 5).entries()) {
+      const price = Number(level.price);
+      const volume = Number(level.quantity);
+
+      if (Number.isFinite(price) && Number.isFinite(volume)) {
+        data[`${side}Price${index + 1}`] = price;
+        data[`${side}Volume${index + 1}`] = volume;
+      }
+    }
+  }
+
+  data.LastPrice = data.AskPrice1 || data.BidPrice1;
+  return data;
+}
+
 window.binance.onDepthUpdate((depth) => {
-    
   renderDepthRows(elements.bidRows, depth.bids || []);
   renderDepthRows(elements.askRows, depth.asks || []);
-    const data = {
 
-    } 
-  if(depth.bids && depth.bids.length){
-    for(let i = 0; i<depth.bids.length; i++){
-        data[`BidPrice${i+1}` ] = parseFloat(depth.bids[i].price);
-         data[`BidVolume${i+1}` ] =  parseFloat(depth.bids[i].quantity);
-    }
-  }
-   if(depth.asks && depth.asks.length){
-    for(let i = 0; i<depth.asks.length; i++){
-        data[`AskPrice${i+1}` ] = parseFloat(depth.asks[i].price);
-         data[`AskVolume${i+1}` ] =  parseFloat(depth.asks[i].quantity);
-    }
-  }
-  chart.render(data);
   const bestBid = depth.bids?.[0]?.price;
   const bestAsk = depth.asks?.[0]?.price;
   const spread =
@@ -1297,6 +1999,25 @@ window.binance.onDepthUpdate((depth) => {
     spread === null || !Number.isFinite(spread)
       ? "-"
       : String(spread);
+
+  if (depth.symbol && chartSymbol !== depth.symbol) {
+    chart.reset();
+    chartSymbol = depth.symbol;
+    syncTrackedOpenOrders();
+  }
+
+  try {
+    chart.render(createChartDepthData(depth));
+    updateChartOrderStatus();
+  } catch (error) {
+    printResult("行情图表渲染错误", {
+      ok: false,
+      error: {
+        name: error.name,
+        message: error.message,
+      },
+    });
+  }
 });
 
 window.binance.onMarketStatus((status) => {
@@ -1316,7 +2037,45 @@ window.binance.onMarketError((error) => {
   printResult("行情连接错误", error);
 });
 
-loadStatus().catch((error) => {
+window.binance.onUserDataEvent((payload) => {
+  prependUserDataEvent(payload);
+  if (payload.event?.e === "executionReport") {
+    applyOpenOrderUpdate(payload.event, payload.receivedAt);
+    scheduleExecutionReportRefresh(payload.event);
+  }
+});
+
+window.binance.onUserDataStatus((status) => {
+  elements.userDataStatus.textContent = [
+    status.status,
+    status.subscriptionId !== undefined ? `subscriptionId=${status.subscriptionId}` : "",
+    status.code !== undefined ? `code=${status.code}` : "",
+  ].filter(Boolean).join(" / ");
+
+  if (status.status === "connected") {
+    refreshTrackedOpenOrders().catch((error) => {
+      printResult("同步当前挂单失败", { ok: false, error: { message: error.message } });
+    });
+  }
+});
+
+window.binance.onUserDataError((error) => {
+  printResult("实时账户事件错误", error);
+});
+
+async function initializeApp() {
+  await loadStatus();
+
+  const symbol = elements.marketSymbol.value.trim().toUpperCase();
+  elements.marketStatus.textContent = `connecting / ${symbol}`;
+  const result = await window.binance.connectDepth(symbol);
+
+  if (!result.ok) {
+    printResult("自动连接增量深度失败", result);
+  }
+}
+
+initializeApp().catch((error) => {
   printResult("初始化异常", {
     message: error.message,
   });

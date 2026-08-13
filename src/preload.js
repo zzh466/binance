@@ -16,6 +16,11 @@ function subscribe(channel, callback) {
 contextBridge.exposeInMainWorld("binance", {
   getStatus: () => ipcRenderer.invoke("binance:get-status"),
   syncTime: () => ipcRenderer.invoke("binance:sync-time"),
+  ping: () => ipcRenderer.invoke("binance:ping"),
+  exchangeInfo: (options) =>
+    ipcRenderer.invoke("binance:exchange-info", options || {}),
+  marketOverview: (options) =>
+    ipcRenderer.invoke("binance:market-overview", options || {}),
 
   connectDepth: (symbol) =>
     ipcRenderer.invoke("binance:connect-depth", { symbol }),
@@ -24,8 +29,20 @@ contextBridge.exposeInMainWorld("binance", {
 
   placeOrder: (order) =>
     ipcRenderer.invoke("binance:place-order", order),
+  testOrder: (order) =>
+    ipcRenderer.invoke("binance:test-order", order),
   cancelOrder: (order) =>
     ipcRenderer.invoke("binance:cancel-order", order),
+  queryOrder: (options) =>
+    ipcRenderer.invoke("binance:query-order", options || {}),
+  openOrders: (options) =>
+    ipcRenderer.invoke("binance:open-orders", options || {}),
+  cancelAllOpenOrders: (options) =>
+    ipcRenderer.invoke("binance:cancel-all-open-orders", options || {}),
+  amendOrder: (options) =>
+    ipcRenderer.invoke("binance:amend-order", options || {}),
+  cancelReplace: (options) =>
+    ipcRenderer.invoke("binance:cancel-replace", options || {}),
   allOrderLists: (options) =>
     ipcRenderer.invoke("binance:all-order-lists", options || {}),
   allOrders: (options) =>
@@ -34,11 +51,39 @@ contextBridge.exposeInMainWorld("binance", {
     ipcRenderer.invoke("binance:my-trades", options || {}),
   accountStatus: (options) =>
     ipcRenderer.invoke("binance:account-status", options || {}),
+  accountRateLimits: () =>
+    ipcRenderer.invoke("binance:account-rate-limits"),
+  accountCommission: (options) =>
+    ipcRenderer.invoke("binance:account-commission", options || {}),
+  queryOrderList: (options) =>
+    ipcRenderer.invoke("binance:query-order-list", options || {}),
+  openOrderLists: () =>
+    ipcRenderer.invoke("binance:open-order-lists"),
+  placeOco: (options) =>
+    ipcRenderer.invoke("binance:place-oco", options || {}),
+  placeOto: (options) =>
+    ipcRenderer.invoke("binance:place-oto", options || {}),
+  placeOtoco: (options) =>
+    ipcRenderer.invoke("binance:place-otoco", options || {}),
+  cancelOrderList: (options) =>
+    ipcRenderer.invoke("binance:cancel-order-list", options || {}),
+  connectUserData: () =>
+    ipcRenderer.invoke("binance:connect-user-data"),
+  disconnectUserData: () =>
+    ipcRenderer.invoke("binance:disconnect-user-data"),
 
   onDepthUpdate: (callback) =>
     subscribe("binance:depth-update", callback),
+  onTradeUpdate: (callback) =>
+    subscribe("binance:trade-update", callback),
   onMarketStatus: (callback) =>
     subscribe("binance:market-status", callback),
   onMarketError: (callback) =>
     subscribe("binance:market-error", callback),
+  onUserDataEvent: (callback) =>
+    subscribe("binance:user-data-event", callback),
+  onUserDataStatus: (callback) =>
+    subscribe("binance:user-data-status", callback),
+  onUserDataError: (callback) =>
+    subscribe("binance:user-data-error", callback),
 });

@@ -3,15 +3,10 @@ const { EventEmitter } = require("node:events");
 const https = require("node:https");
 const WebSocket = require("ws");
 const { LocalOrderBook } = require("./localOrderBook");
-const { SocksProxyAgent } = require("socks-proxy-agent");
-
-const DEFAULT_SOCKS5_PROXY = "socks5h://139.224.34.110:1080";
-const DEFAULT_TRADING_SOCKS5_PROXY = "socks5h://127.0.0.1:1081";
 const REST_BASE = {
   testnet: "https://testnet.binance.vision/api",
   production: "https://api.binance.com/api",
 };
-const TRADING_REST_BASE = REST_BASE.testnet;
 
 const WS_BASE = {
   testnet: "wss://stream.testnet.binance.vision/ws",
@@ -26,7 +21,7 @@ const WS_API_BASE = {
 const DEPTH_SPEEDS = new Set(["100ms", "1000ms"]);
 const DEPTH_SNAPSHOT_LIMITS = new Set([100, 500, 1000, 5000]);
 
-function requestHttpsThroughProxy(url, options = {}) {
+function requestHttps(url, options = {}) {
   return new Promise((resolve, reject) => {
     const timeoutMs = options.timeout || 10_000;
     let request;
@@ -74,8 +69,6 @@ class BinanceSpotClient extends EventEmitter {
     apiKey = "",
     apiSecret = "",
     testnet = true,
-    socks5Proxy = DEFAULT_SOCKS5_PROXY,
-    tradingSocks5Proxy = DEFAULT_TRADING_SOCKS5_PROXY,
     depthSpeed = "100ms",
     depthSnapshotLimit = 1000,
     depthDisplayLevels = 10,
@@ -85,23 +78,14 @@ class BinanceSpotClient extends EventEmitter {
     this.apiKey = apiKey.trim();
     this.apiSecret = apiSecret.trim();
     this.testnet = Boolean(testnet);
-    this.socks5Proxy = String(socks5Proxy || DEFAULT_SOCKS5_PROXY).trim();
-    this.tradingSocks5Proxy = String(
-      tradingSocks5Proxy || DEFAULT_TRADING_SOCKS5_PROXY
-    ).trim();
-    this.proxyAgent = new SocksProxyAgent(this.socks5Proxy);
-    this.tradingProxyAgent = new SocksProxyAgent(this.tradingSocks5Proxy);
 
     this.restBase = this.testnet ? REST_BASE.testnet : REST_BASE.production;
-    this.tradingRestBase = TRADING_REST_BASE;
+    this.tradingRestBase = this.restBase;
     this.wsBase = this.testnet ? WS_BASE.testnet : WS_BASE.production;
     this.wsApiBase = this.testnet
       ? WS_API_BASE.testnet
       : WS_API_BASE.production;
-    this.tradingWsApiBase =
-      this.tradingRestBase === REST_BASE.production
-        ? WS_API_BASE.production
-        : WS_API_BASE.testnet;
+    this.tradingWsApiBase = this.wsApiBase;
 
     this.depthSpeed = DEPTH_SPEEDS.has(depthSpeed) ? depthSpeed : "100ms";
 
@@ -125,11 +109,21 @@ class BinanceSpotClient extends EventEmitter {
     this.marketManualClose = false;
     this.marketReconnectTimer = null;
     this.marketReconnectDelayMs = 1_000;
+    this.tradeSocket = null;
+    this.tradeReconnectTimer = null;
+    this.tradeReconnectDelayMs = 1_000;
 
     this.orderBook = new LocalOrderBook();
     this.depthEventBuffer = [];
     this.depthReady = false;
     this.depthSyncVersion = 0;
+
+    this.exchangeInfoCache = new Map();
+    this.userDataSocket = null;
+    this.userDataManualClose = false;
+    this.userDataReconnectTimer = null;
+    this.userDataReconnectDelayMs = 1_000;
+    this.userDataSubscriptionId = null;
   }
 
   async initialize() {
@@ -227,14 +221,9 @@ class BinanceSpotClient extends EventEmitter {
 
     let response;
     try {
-      const agent =
-        baseUrl === this.tradingRestBase
-          ? this.tradingProxyAgent
-          : this.proxyAgent;
-      response = await requestHttpsThroughProxy(url, {
+      response = await requestHttps(url, {
         method,
         headers,
-        agent,
         timeout: 10_000,
       });
     } catch (error) {
@@ -276,53 +265,301 @@ class BinanceSpotClient extends EventEmitter {
     return normalized;
   }
 
-  async placeOrder(order) {
+  async ping() {
+    await this.request("GET", "/v3/ping");
+    return { connected: true, environment: this.testnet ? "testnet" : "production" };
+  }
+
+  async exchangeInfo(symbol, { forceRefresh = false } = {}) {
+    const normalizedSymbol = this.validateSymbol(symbol);
+    const cached = this.exchangeInfoCache.get(normalizedSymbol);
+
+    if (!forceRefresh && cached && Date.now() - cached.loadedAt < 300_000) {
+      return cached.data;
+    }
+
+    const result = await this.request("GET", "/v3/exchangeInfo", {
+      symbol: normalizedSymbol,
+    });
+    const data = {
+      ...result,
+      symbol: result.symbols?.[0] || null,
+    };
+    this.exchangeInfoCache.set(normalizedSymbol, { loadedAt: Date.now(), data });
+    return data;
+  }
+
+  async marketOverview(symbol, { interval = "1m", limit = 50 } = {}) {
+    const normalizedSymbol = this.validateSymbol(symbol);
+    const normalizedLimit = Math.min(1000, Math.max(1, Number(limit) || 50));
+    const [price, bookTicker, averagePrice, ticker24hr, recentTrades, aggregateTrades, klines] =
+      await Promise.all([
+        this.request("GET", "/v3/ticker/price", { symbol: normalizedSymbol }),
+        this.request("GET", "/v3/ticker/bookTicker", { symbol: normalizedSymbol }),
+        this.request("GET", "/v3/avgPrice", { symbol: normalizedSymbol }),
+        this.request("GET", "/v3/ticker/24hr", { symbol: normalizedSymbol }),
+        this.request("GET", "/v3/trades", { symbol: normalizedSymbol, limit: normalizedLimit }),
+        this.request("GET", "/v3/aggTrades", { symbol: normalizedSymbol, limit: normalizedLimit }),
+        this.request("GET", "/v3/klines", {
+          symbol: normalizedSymbol,
+          interval,
+          limit: normalizedLimit,
+        }),
+      ]);
+
+    let historicalTrades = [];
+    let historicalTradesError = null;
+    try {
+      historicalTrades = await this.request("GET", "/v3/historicalTrades", {
+        symbol: normalizedSymbol,
+        limit: normalizedLimit,
+      });
+    } catch (error) {
+      historicalTradesError = {
+        name: error.name,
+        message: error.message,
+        status: error.status,
+        code: error.code,
+      };
+    }
+
+    return {
+      symbol: normalizedSymbol,
+      price,
+      bookTicker,
+      averagePrice,
+      ticker24hr,
+      recentTrades,
+      historicalTrades,
+      historicalTradesError,
+      aggregateTrades,
+      klines: klines.map((kline) => ({
+        openTime: kline[0],
+        open: kline[1],
+        high: kline[2],
+        low: kline[3],
+        close: kline[4],
+        volume: kline[5],
+        closeTime: kline[6],
+        quoteVolume: kline[7],
+        tradeCount: kline[8],
+      })),
+    };
+  }
+
+  decimalPlaces(value) {
+    const text = String(value ?? "").toLowerCase();
+    if (text.includes("e-")) {
+      return Number(text.split("e-")[1]) || 0;
+    }
+    return (text.split(".")[1] || "").length;
+  }
+
+  alignToStep(value, step, mode = "floor") {
+    const numericValue = Number(value);
+    const numericStep = Number(step);
+    if (!Number.isFinite(numericValue) || numericValue <= 0 || !numericStep) {
+      return String(value);
+    }
+
+    const precision = this.decimalPlaces(step);
+    const scaled = numericValue / numericStep;
+    const aligned = (mode === "ceil" ? Math.ceil(scaled - 1e-12) : Math.floor(scaled + 1e-12)) * numericStep;
+    return aligned.toFixed(precision);
+  }
+
+  assertFilterRange(name, value, min, max) {
+    const numeric = Number(value);
+    if (Number(min) > 0 && numeric < Number(min)) {
+      throw new BinanceApiError(`${name} ${value} 小于当前环境允许的最小值 ${min}。`);
+    }
+    if (Number(max) > 0 && numeric > Number(max)) {
+      throw new BinanceApiError(`${name} ${value} 大于当前环境允许的最大值 ${max}。`);
+    }
+  }
+
+  async prepareOrder(order) {
     const symbol = this.validateSymbol(order.symbol);
     const side = String(order.side || "").toUpperCase();
     const type = String(order.type || "").toUpperCase();
+    const supportedTypes = new Set([
+      "LIMIT",
+      "MARKET",
+      "LIMIT_MAKER",
+      "STOP_LOSS",
+      "STOP_LOSS_LIMIT",
+      "TAKE_PROFIT",
+      "TAKE_PROFIT_LIMIT",
+    ]);
 
     if (!["BUY", "SELL"].includes(side)) {
       throw new BinanceApiError(`side 只支持 BUY 或 SELL，当前值：${side}`);
     }
-
-    if (!["LIMIT", "MARKET"].includes(type)) {
-      throw new BinanceApiError(
-        `示例代码只支持 LIMIT 或 MARKET，当前值：${type}`
-      );
+    if (!supportedTypes.has(type)) {
+      throw new BinanceApiError(`当前页面不支持委托类型：${type}`);
     }
 
-    const params = {
+    const info = await this.exchangeInfo(symbol);
+    const symbolInfo = info.symbol;
+    if (!symbolInfo || symbolInfo.status !== "TRADING") {
+      throw new BinanceApiError(`${symbol} 在当前环境不可交易。`);
+    }
+
+    const filters = Object.fromEntries(
+      (symbolInfo.filters || []).map((filter) => [filter.filterType, filter])
+    );
+    const quantityFilter = type === "MARKET"
+      ? filters.MARKET_LOT_SIZE || filters.LOT_SIZE
+      : filters.LOT_SIZE;
+
+    const params = this.normalizeParams({
       symbol,
       side,
       type,
+      timeInForce: order.timeInForce,
+      quantity: order.quantity,
+      quoteOrderQty: order.quoteOrderQty,
+      price: order.price,
+      stopPrice: order.stopPrice,
+      trailingDelta: order.trailingDelta,
+      icebergQty: order.icebergQty,
       newClientOrderId: order.newClientOrderId,
       newOrderRespType: order.newOrderRespType || "RESULT",
-    };
+    });
 
-    if (type === "LIMIT") {
-      if (!order.quantity || !order.price) {
-        throw new BinanceApiError("LIMIT 委托必须提供 quantity 和 price。");
+    const limitLike = new Set(["LIMIT", "STOP_LOSS_LIMIT", "TAKE_PROFIT_LIMIT"]);
+    if (limitLike.has(type)) {
+      params.timeInForce ||= "GTC";
+    }
+    if (type !== "MARKET" && type !== "STOP_LOSS" && type !== "TAKE_PROFIT" && !params.price) {
+      throw new BinanceApiError(`${type} 委托必须提供 price。`);
+    }
+    if (!params.quantity && !params.quoteOrderQty) {
+      throw new BinanceApiError("委托必须提供 quantity 或 quoteOrderQty。");
+    }
+    if ((type.includes("STOP") || type.includes("TAKE_PROFIT")) && !params.stopPrice && !params.trailingDelta) {
+      throw new BinanceApiError(`${type} 委托必须提供 stopPrice 或 trailingDelta。`);
+    }
+
+    if (!new Set(["LIMIT", "LIMIT_MAKER", "STOP_LOSS_LIMIT", "TAKE_PROFIT_LIMIT"]).has(type)) {
+      delete params.price;
+    }
+    if (!type.includes("STOP") && !type.includes("TAKE_PROFIT")) {
+      delete params.stopPrice;
+      delete params.trailingDelta;
+    }
+
+    const adjustments = [];
+    if (params.price && filters.PRICE_FILTER) {
+      const original = params.price;
+      params.price = this.alignToStep(params.price, filters.PRICE_FILTER.tickSize);
+      this.assertFilterRange("price", params.price, filters.PRICE_FILTER.minPrice, filters.PRICE_FILTER.maxPrice);
+      if (original !== params.price) adjustments.push(`price: ${original} -> ${params.price}`);
+    }
+    if (params.stopPrice && filters.PRICE_FILTER) {
+      const original = params.stopPrice;
+      params.stopPrice = this.alignToStep(params.stopPrice, filters.PRICE_FILTER.tickSize);
+      this.assertFilterRange("stopPrice", params.stopPrice, filters.PRICE_FILTER.minPrice, filters.PRICE_FILTER.maxPrice);
+      if (original !== params.stopPrice) adjustments.push(`stopPrice: ${original} -> ${params.stopPrice}`);
+    }
+    if (params.quantity && quantityFilter) {
+      const original = params.quantity;
+      params.quantity = this.alignToStep(params.quantity, quantityFilter.stepSize);
+      this.assertFilterRange("quantity", params.quantity, quantityFilter.minQty, quantityFilter.maxQty);
+      if (original !== params.quantity) adjustments.push(`quantity: ${original} -> ${params.quantity}`);
+    }
+    if (params.icebergQty && filters.LOT_SIZE) {
+      const original = params.icebergQty;
+      params.icebergQty = this.alignToStep(params.icebergQty, filters.LOT_SIZE.stepSize);
+      this.assertFilterRange("icebergQty", params.icebergQty, filters.LOT_SIZE.minQty, filters.LOT_SIZE.maxQty);
+      if (Number(params.icebergQty) > Number(params.quantity || 0)) {
+        throw new BinanceApiError("icebergQty 不能大于订单 quantity。");
       }
+      if (original !== params.icebergQty) adjustments.push(`icebergQty: ${original} -> ${params.icebergQty}`);
+    }
 
-      params.timeInForce = order.timeInForce || "GTC";
-      params.quantity = order.quantity;
-      params.price = order.price;
-    } else {
-      if (order.quantity) {
-        params.quantity = order.quantity;
-      } else if (order.quoteOrderQty) {
-        params.quoteOrderQty = order.quoteOrderQty;
-      } else {
-        throw new BinanceApiError(
-          "MARKET 委托必须提供 quantity 或 quoteOrderQty。"
-        );
+    if (params.price) {
+      const average = await this.request("GET", "/v3/avgPrice", { symbol });
+      const referencePrice = Number(average.price);
+      const percentBySide = filters.PERCENT_PRICE_BY_SIDE;
+      const percentPrice = filters.PERCENT_PRICE;
+      if (percentBySide && referencePrice > 0) {
+        const upper = referencePrice * Number(side === "BUY" ? percentBySide.bidMultiplierUp : percentBySide.askMultiplierUp);
+        const lower = referencePrice * Number(side === "BUY" ? percentBySide.bidMultiplierDown : percentBySide.askMultiplierDown);
+        this.assertFilterRange("price", params.price, lower, upper);
+      } else if (percentPrice && referencePrice > 0) {
+        this.assertFilterRange("price", params.price, referencePrice * Number(percentPrice.multiplierDown), referencePrice * Number(percentPrice.multiplierUp));
       }
     }
 
+    const notional = params.price && params.quantity
+      ? Number(params.price) * Number(params.quantity)
+      : Number(params.quoteOrderQty || 0);
+    const notionalFilter = filters.NOTIONAL || filters.MIN_NOTIONAL;
+    if (notional > 0 && notionalFilter) {
+      this.assertFilterRange(
+        "订单金额",
+        notional,
+        notionalFilter.minNotional,
+        notionalFilter.maxNotional
+      );
+    }
+
+    return { params, adjustments, symbolInfo };
+  }
+
+  async placeOrder(order, { testOnly = false } = {}) {
+    const { params, adjustments, symbolInfo } = await this.prepareOrder(order);
     this.assertTradingCredentials();
     await this.syncTradingServerTime();
+    await this.validateAvailableBalance(params, symbolInfo);
+    const result = await this.request(
+      "POST",
+      testOnly ? "/v3/order/test" : "/v3/order",
+      params,
+      true,
+      this.tradingRestBase
+    );
+    return { ...result, testOnly, adjustments };
+  }
 
-    return this.request("POST", "/v3/order", params, true, this.tradingRestBase);
+  async validateAvailableBalance(params, symbolInfo) {
+    const account = await this.accountStatus({ omitZeroBalances: false });
+    const balances = Object.fromEntries(
+      (account.balances || []).map((balance) => [balance.asset, Number(balance.free)])
+    );
+    const baseAsset = symbolInfo.baseAsset;
+    const quoteAsset = symbolInfo.quoteAsset;
+
+    if (params.side === "SELL") {
+      const required = Number(params.quantity || 0);
+      const available = balances[baseAsset] || 0;
+      if (required > available) {
+        throw new BinanceApiError(
+          `${baseAsset} 可用余额不足：需要 ${required}，当前可用 ${available}。`
+        );
+      }
+      return { asset: baseAsset, required, available };
+    }
+
+    let required = Number(params.quoteOrderQty || 0);
+    if (!required) {
+      let referencePrice = Number(params.price || params.stopPrice || 0);
+      if (!referencePrice) {
+        const ticker = await this.request("GET", "/v3/ticker/price", {
+          symbol: params.symbol,
+        });
+        referencePrice = Number(ticker.price);
+      }
+      required = referencePrice * Number(params.quantity || 0);
+    }
+    const available = balances[quoteAsset] || 0;
+    if (required > available) {
+      throw new BinanceApiError(
+        `${quoteAsset} 可用余额不足：预计需要 ${required}，当前可用 ${available}。`
+      );
+    }
+    return { asset: quoteAsset, required, available };
   }
 
   async cancelOrder({ symbol, orderId, origClientOrderId }) {
@@ -350,6 +587,248 @@ class BinanceSpotClient extends EventEmitter {
     );
   }
 
+  async signedRest(method, path, params = {}) {
+    this.assertTradingCredentials();
+    await this.syncTradingServerTime();
+    return this.request(
+      method,
+      path,
+      params,
+      true,
+      this.tradingRestBase
+    );
+  }
+
+  async queryOrder({ symbol, orderId, origClientOrderId }) {
+    if (!orderId && !origClientOrderId) {
+      throw new BinanceApiError("查询单笔订单必须提供 orderId 或 origClientOrderId。");
+    }
+    return this.signedRest("GET", "/v3/order", {
+      symbol: this.validateSymbol(symbol),
+      orderId,
+      origClientOrderId,
+    });
+  }
+
+  async openOrders({ symbol } = {}) {
+    return this.signedRest("GET", "/v3/openOrders", {
+      symbol: symbol ? this.validateSymbol(symbol) : undefined,
+    });
+  }
+
+  async cancelAllOpenOrders({ symbol }) {
+    return this.signedRest("DELETE", "/v3/openOrders", {
+      symbol: this.validateSymbol(symbol),
+    });
+  }
+
+  async amendOrder({ symbol, orderId, origClientOrderId, newQty, newClientOrderId }) {
+    if (!orderId && !origClientOrderId) {
+      throw new BinanceApiError("修改订单必须提供 orderId 或 origClientOrderId。");
+    }
+    if (!newQty || Number(newQty) <= 0) {
+      throw new BinanceApiError("修改订单必须提供大于 0 的 newQty。");
+    }
+
+    const info = await this.exchangeInfo(symbol);
+    const lotSize = info.symbol?.filters?.find((filter) => filter.filterType === "LOT_SIZE");
+    const alignedQty = lotSize
+      ? this.alignToStep(newQty, lotSize.stepSize)
+      : String(newQty);
+    return this.signedRest("PUT", "/v3/order/amend/keepPriority", {
+      symbol: this.validateSymbol(symbol),
+      orderId,
+      origClientOrderId,
+      newQty: alignedQty,
+      newClientOrderId,
+    });
+  }
+
+  async cancelReplace({
+    cancelOrderId,
+    cancelOrigClientOrderId,
+    cancelReplaceMode = "STOP_ON_FAILURE",
+    ...order
+  }) {
+    if (!cancelOrderId && !cancelOrigClientOrderId) {
+      throw new BinanceApiError("撤单重报必须提供原订单 ID。");
+    }
+    const { params, adjustments } = await this.prepareOrder(order);
+    const result = await this.signedRest("POST", "/v3/order/cancelReplace", {
+      ...params,
+      cancelReplaceMode,
+      cancelOrderId,
+      cancelOrigClientOrderId,
+    });
+    return { ...result, adjustments };
+  }
+
+  async accountRateLimits() {
+    return this.signedRest("GET", "/v3/rateLimit/order");
+  }
+
+  async accountCommission({ symbol }) {
+    return this.signedRest("GET", "/v3/account/commission", {
+      symbol: this.validateSymbol(symbol),
+    });
+  }
+
+  async queryOrderList({ orderListId, origClientOrderId }) {
+    if (!orderListId && !origClientOrderId) {
+      throw new BinanceApiError("查询组合订单必须提供 orderListId 或 origClientOrderId。");
+    }
+    return this.signedRest("GET", "/v3/orderList", {
+      orderListId,
+      origClientOrderId,
+    });
+  }
+
+  async openOrderLists() {
+    return this.signedRest("GET", "/v3/openOrderList");
+  }
+
+  async cancelOrderList({ symbol, orderListId, listClientOrderId }) {
+    if (!orderListId && !listClientOrderId) {
+      throw new BinanceApiError("撤销组合订单必须提供 orderListId 或 listClientOrderId。");
+    }
+    return this.signedRest("DELETE", "/v3/orderList", {
+      symbol: this.validateSymbol(symbol),
+      orderListId,
+      listClientOrderId,
+    });
+  }
+
+  async placeOco({
+    symbol,
+    side,
+    quantity,
+    abovePrice,
+    aboveStopPrice,
+    belowPrice,
+    belowStopPrice,
+  }) {
+    const normalizedSide = String(side || "").toUpperCase();
+    if (!["BUY", "SELL"].includes(normalizedSide)) {
+      throw new BinanceApiError("OCO 的 side 必须是 BUY 或 SELL。");
+    }
+    if (!quantity || !abovePrice || !belowPrice) {
+      throw new BinanceApiError("OCO 必须提供数量、上方价格和下方价格。");
+    }
+    if (normalizedSide === "SELL" && !belowStopPrice) {
+      throw new BinanceApiError("SELL OCO 必须提供下方触发价。");
+    }
+    if (normalizedSide === "BUY" && !aboveStopPrice) {
+      throw new BinanceApiError("BUY OCO 必须提供上方触发价。");
+    }
+
+    const info = await this.exchangeInfo(symbol);
+    const filters = Object.fromEntries(
+      (info.symbol?.filters || []).map((filter) => [filter.filterType, filter])
+    );
+    const alignedQuantity = filters.LOT_SIZE
+      ? this.alignToStep(quantity, filters.LOT_SIZE.stepSize)
+      : String(quantity);
+    const alignPrice = (value) => filters.PRICE_FILTER
+      ? this.alignToStep(value, filters.PRICE_FILTER.tickSize)
+      : String(value);
+
+    const sideSpecificParams = normalizedSide === "SELL"
+      ? {
+          aboveType: "LIMIT_MAKER",
+          abovePrice: alignPrice(abovePrice),
+          belowType: "STOP_LOSS_LIMIT",
+          belowPrice: alignPrice(belowPrice),
+          belowStopPrice: alignPrice(belowStopPrice),
+          belowTimeInForce: "GTC",
+        }
+      : {
+          aboveType: "STOP_LOSS_LIMIT",
+          abovePrice: alignPrice(abovePrice),
+          aboveStopPrice: alignPrice(aboveStopPrice),
+          aboveTimeInForce: "GTC",
+          belowType: "LIMIT_MAKER",
+          belowPrice: alignPrice(belowPrice),
+        };
+
+    return this.signedRest("POST", "/v3/orderList/oco", {
+      symbol: this.validateSymbol(symbol),
+      side: normalizedSide,
+      quantity: alignedQuantity,
+      ...sideSpecificParams,
+      newOrderRespType: "RESULT",
+    });
+  }
+
+  async placeOto({
+    symbol,
+    workingSide,
+    workingPrice,
+    workingQuantity,
+    pendingSide,
+    pendingPrice,
+    pendingQuantity,
+  }) {
+    if (!workingPrice || !workingQuantity || !pendingPrice || !pendingQuantity) {
+      throw new BinanceApiError("OTO 必须提供工作单和待触发单的价格与数量。");
+    }
+    const info = await this.exchangeInfo(symbol);
+    const filters = Object.fromEntries((info.symbol?.filters || []).map((filter) => [filter.filterType, filter]));
+    const alignPrice = (value) => filters.PRICE_FILTER ? this.alignToStep(value, filters.PRICE_FILTER.tickSize) : String(value);
+    const alignQty = (value) => filters.LOT_SIZE ? this.alignToStep(value, filters.LOT_SIZE.stepSize) : String(value);
+    return this.signedRest("POST", "/v3/orderList/oto", {
+      symbol: this.validateSymbol(symbol),
+      workingType: "LIMIT",
+      workingSide: String(workingSide).toUpperCase(),
+      workingPrice: alignPrice(workingPrice),
+      workingQuantity: alignQty(workingQuantity),
+      workingTimeInForce: "GTC",
+      pendingType: "LIMIT",
+      pendingSide: String(pendingSide).toUpperCase(),
+      pendingPrice: alignPrice(pendingPrice),
+      pendingQuantity: alignQty(pendingQuantity),
+      pendingTimeInForce: "GTC",
+      newOrderRespType: "RESULT",
+    });
+  }
+
+  async placeOtoco({
+    symbol,
+    workingSide,
+    workingPrice,
+    workingQuantity,
+    pendingSide,
+    pendingQuantity,
+    pendingAbovePrice,
+    pendingBelowPrice,
+    pendingBelowStopPrice,
+  }) {
+    const required = [workingPrice, workingQuantity, pendingQuantity, pendingAbovePrice, pendingBelowPrice, pendingBelowStopPrice];
+    if (required.some((value) => !value)) {
+      throw new BinanceApiError("OTOCO 的工作单及待触发 OCO 价格、数量必须填写完整。");
+    }
+    const info = await this.exchangeInfo(symbol);
+    const filters = Object.fromEntries((info.symbol?.filters || []).map((filter) => [filter.filterType, filter]));
+    const alignPrice = (value) => filters.PRICE_FILTER ? this.alignToStep(value, filters.PRICE_FILTER.tickSize) : String(value);
+    const alignQty = (value) => filters.LOT_SIZE ? this.alignToStep(value, filters.LOT_SIZE.stepSize) : String(value);
+    return this.signedRest("POST", "/v3/orderList/otoco", {
+      symbol: this.validateSymbol(symbol),
+      workingType: "LIMIT",
+      workingSide: String(workingSide).toUpperCase(),
+      workingPrice: alignPrice(workingPrice),
+      workingQuantity: alignQty(workingQuantity),
+      workingTimeInForce: "GTC",
+      pendingSide: String(pendingSide).toUpperCase(),
+      pendingQuantity: alignQty(pendingQuantity),
+      pendingAboveType: "LIMIT_MAKER",
+      pendingAbovePrice: alignPrice(pendingAbovePrice),
+      pendingBelowType: "STOP_LOSS_LIMIT",
+      pendingBelowPrice: alignPrice(pendingBelowPrice),
+      pendingBelowStopPrice: alignPrice(pendingBelowStopPrice),
+      pendingBelowTimeInForce: "GTC",
+      newOrderRespType: "RESULT",
+    });
+  }
+
   createWsApiSignature(params) {
     const payload = Object.entries(params)
       .filter(([key]) => key !== "signature")
@@ -368,7 +847,6 @@ class BinanceSpotClient extends EventEmitter {
     params,
     {
       url = this.wsApiBase,
-      agent = this.testnet ? this.tradingProxyAgent : this.proxyAgent,
     } = {}
   ) {
 
@@ -397,7 +875,7 @@ class BinanceSpotClient extends EventEmitter {
       };
 
       try {
-        socket = new WebSocket(url, { agent });
+        socket = new WebSocket(url);
       } catch (error) {
         finish(
           reject,
@@ -520,7 +998,6 @@ class BinanceSpotClient extends EventEmitter {
     params.signature = this.createWsApiSignature(params);
     return this.requestWsApi("allOrders", params, {
       url: this.tradingWsApiBase,
-      agent: this.tradingProxyAgent,
     });
   }
 
@@ -535,7 +1012,7 @@ class BinanceSpotClient extends EventEmitter {
     const normalizedSymbol = this.validateSymbol(symbol);
     this.assertTradingCredentials();
 
-    const timeBase = this.testnet ? this.tradingRestBase : this.restBase;
+    const timeBase = this.tradingRestBase;
     const { offsetMs } = await this.syncServerTimeForBase(timeBase);
     const params = this.normalizeParams({
       symbol: normalizedSymbol,
@@ -556,7 +1033,7 @@ class BinanceSpotClient extends EventEmitter {
   async accountStatus({ omitZeroBalances } = {}) {
     this.assertTradingCredentials();
 
-    const timeBase = this.testnet ? this.tradingRestBase : this.restBase;
+    const timeBase = this.tradingRestBase;
     const { offsetMs } = await this.syncServerTimeForBase(timeBase);
     const params = {
       ...(omitZeroBalances === undefined
@@ -574,7 +1051,7 @@ class BinanceSpotClient extends EventEmitter {
   async allOrderLists({ fromId, startTime, endTime, limit = 100 } = {}) {
     this.assertTradingCredentials();
 
-    const timeBase = this.testnet ? this.tradingRestBase : this.restBase;
+    const timeBase = this.tradingRestBase;
     const { offsetMs } = await this.syncServerTimeForBase(timeBase);
     const params = this.normalizeParams({
       fromId,
@@ -590,6 +1067,168 @@ class BinanceSpotClient extends EventEmitter {
     return this.requestWsApi("allOrderLists", params);
   }
 
+  async connectUserData() {
+    this.assertTradingCredentials();
+    if (this.userDataSocket?.readyState === WebSocket.OPEN && this.userDataSubscriptionId !== null) {
+      const result = { subscriptionId: this.userDataSubscriptionId, reused: true };
+      this.emit("user-data-status", {
+        status: "connected",
+        ...result,
+        time: Date.now(),
+      });
+      return result;
+    }
+
+    this.disconnectUserData(true);
+    this.userDataManualClose = false;
+    this.userDataReconnectDelayMs = 1_000;
+    return this.openUserDataSocket();
+  }
+
+  async openUserDataSocket() {
+    const { offsetMs } = await this.syncTradingServerTime();
+    const requestId = crypto.randomUUID();
+    const params = this.normalizeParams({
+      apiKey: this.apiKey,
+      recvWindow: 5_000,
+      timestamp: Date.now() + offsetMs,
+    });
+    params.signature = this.createWsApiSignature(params);
+
+    return new Promise((resolve, reject) => {
+      const socket = new WebSocket(this.wsApiBase);
+      let subscribed = false;
+      let timeoutId = setTimeout(() => {
+        if (!subscribed) {
+          reject(new BinanceApiError("账户事件订阅超时。"));
+          socket.terminate();
+        }
+      }, 15_000);
+
+      this.userDataSocket = socket;
+      this.emit("user-data-status", {
+        status: "connecting",
+        url: this.wsApiBase,
+        time: Date.now(),
+      });
+
+      socket.on("open", () => {
+        socket.send(JSON.stringify({
+          id: requestId,
+          method: "userDataStream.subscribe.signature",
+          params,
+        }));
+      });
+
+      socket.on("message", (buffer) => {
+        let message;
+        try {
+          message = JSON.parse(buffer.toString());
+        } catch (error) {
+          this.emit("user-data-error", {
+            message: `账户事件解析失败：${error.message}`,
+            time: Date.now(),
+          });
+          return;
+        }
+
+        if (message.id === requestId) {
+          if (message.error || (message.status && message.status >= 400)) {
+            const apiError = message.error || {};
+            clearTimeout(timeoutId);
+            reject(new BinanceApiError(apiError.msg || "账户事件订阅失败。", {
+              status: message.status,
+              code: apiError.code,
+              data: message,
+            }));
+            this.userDataManualClose = true;
+            socket.close(1000, "subscription rejected");
+            return;
+          }
+
+          subscribed = true;
+          clearTimeout(timeoutId);
+          this.userDataSubscriptionId = message.result?.subscriptionId ?? null;
+          this.userDataReconnectDelayMs = 1_000;
+          const result = { subscriptionId: this.userDataSubscriptionId };
+          this.emit("user-data-status", {
+            status: "connected",
+            ...result,
+            time: Date.now(),
+          });
+          resolve(result);
+          return;
+        }
+
+        if (message.event) {
+          this.emit("user-data-event", {
+            subscriptionId: message.subscriptionId,
+            event: message.event,
+            receivedAt: Date.now(),
+          });
+        }
+      });
+
+      socket.on("error", (error) => {
+        this.emit("user-data-error", {
+          message: error.message,
+          time: Date.now(),
+        });
+        if (!subscribed) {
+          clearTimeout(timeoutId);
+          reject(new BinanceApiError(`账户事件连接失败：${error.message}`));
+        }
+      });
+
+      socket.on("close", (code, reasonBuffer) => {
+        clearTimeout(timeoutId);
+        if (this.userDataSocket !== socket) return;
+        this.userDataSocket = null;
+        this.userDataSubscriptionId = null;
+        const reason = reasonBuffer?.toString() || "";
+        this.emit("user-data-status", {
+          status: this.userDataManualClose ? "disconnected" : "reconnecting",
+          code,
+          reason,
+          time: Date.now(),
+        });
+        if (!this.userDataManualClose) {
+          this.scheduleUserDataReconnect();
+        }
+      });
+    });
+  }
+
+  scheduleUserDataReconnect() {
+    clearTimeout(this.userDataReconnectTimer);
+    const delay = this.userDataReconnectDelayMs;
+    this.userDataReconnectDelayMs = Math.min(delay * 2, 30_000);
+    this.userDataReconnectTimer = setTimeout(() => {
+      this.openUserDataSocket().catch((error) => {
+        this.emit("user-data-error", { message: error.message, time: Date.now() });
+      });
+    }, delay);
+  }
+
+  disconnectUserData(manual = true) {
+    this.userDataManualClose = manual;
+    clearTimeout(this.userDataReconnectTimer);
+    this.userDataReconnectTimer = null;
+    this.userDataSubscriptionId = null;
+
+    if (this.userDataSocket) {
+      const socket = this.userDataSocket;
+      this.userDataSocket = null;
+      if (socket.readyState === WebSocket.OPEN) {
+        socket.close(1000, "client disconnect");
+      } else {
+        socket.terminate();
+      }
+    }
+
+    return { disconnected: true };
+  }
+
   connectDepth(symbol) {
     const normalizedSymbol = this.validateSymbol(symbol);
     this.disconnectMarket();
@@ -597,8 +1236,10 @@ class BinanceSpotClient extends EventEmitter {
     this.marketSymbol = normalizedSymbol;
     this.marketManualClose = false;
     this.marketReconnectDelayMs = 1_000;
+    this.tradeReconnectDelayMs = 1_000;
 
     this.openDepthSocket();
+    this.openTradeSocket();
 
     return {
       symbol: normalizedSymbol,
@@ -615,6 +1256,71 @@ class BinanceSpotClient extends EventEmitter {
     this.depthSyncVersion += 1;
   }
 
+  openTradeSocket() {
+    if (!this.marketSymbol || this.marketManualClose) {
+      return;
+    }
+
+    const symbol = this.marketSymbol;
+    const url = `${this.wsBase}/${symbol.toLowerCase()}@trade`;
+    const socket = new WebSocket(url);
+    this.tradeSocket = socket;
+
+    socket.on("open", () => {
+      if (this.tradeSocket === socket) {
+        this.tradeReconnectDelayMs = 1_000;
+      }
+    });
+
+    socket.on("message", (buffer) => {
+      if (this.tradeSocket !== socket) {
+        return;
+      }
+
+      try {
+        const message = JSON.parse(buffer.toString());
+
+        if (message.e !== "trade") {
+          return;
+        }
+
+        this.emit("trade-update", {
+          symbol: message.s || symbol,
+          price: String(message.p),
+          quantity: String(message.q),
+          tradeId: Number(message.t),
+          eventTime: Number(message.E),
+          tradeTime: Number(message.T),
+          receivedAt: Date.now(),
+        });
+      } catch (error) {
+        this.emit("market-error", {
+          message: `成交行情 JSON 解析失败：${error.message}`,
+          symbol,
+          time: Date.now(),
+        });
+      }
+    });
+
+    socket.on("error", (error) => {
+      this.emit("market-error", {
+        message: `成交行情连接失败：${error.message}`,
+        symbol,
+        time: Date.now(),
+      });
+    });
+
+    socket.on("close", () => {
+      if (this.tradeSocket === socket) {
+        this.tradeSocket = null;
+      }
+
+      if (!this.marketManualClose && this.marketSymbol === symbol) {
+        this.scheduleTradeReconnect();
+      }
+    });
+  }
+
   openDepthSocket() {
     if (!this.marketSymbol || this.marketManualClose) {
       return;
@@ -623,8 +1329,7 @@ class BinanceSpotClient extends EventEmitter {
     const symbol = this.marketSymbol;
     const streamName = `${symbol.toLowerCase()}@depth@${this.depthSpeed}`;
     const url = `${this.wsBase}/${streamName}`;
-    const agent = this.testnet ? this.tradingProxyAgent : this.proxyAgent;
-    const socket = new WebSocket(url, { agent });
+    const socket = new WebSocket(url);
 
     this.marketSocket = socket;
     this.resetDepthState();
@@ -901,10 +1606,26 @@ class BinanceSpotClient extends EventEmitter {
     }, delay);
   }
 
+  scheduleTradeReconnect() {
+    clearTimeout(this.tradeReconnectTimer);
+
+    const delay = this.tradeReconnectDelayMs;
+    this.tradeReconnectDelayMs = Math.min(
+      this.tradeReconnectDelayMs * 2,
+      30_000
+    );
+
+    this.tradeReconnectTimer = setTimeout(() => {
+      this.openTradeSocket();
+    }, delay);
+  }
+
   disconnectMarket() {
     this.marketManualClose = true;
     clearTimeout(this.marketReconnectTimer);
     this.marketReconnectTimer = null;
+    clearTimeout(this.tradeReconnectTimer);
+    this.tradeReconnectTimer = null;
     this.depthSyncVersion += 1;
     this.depthReady = false;
     this.depthEventBuffer = [];
@@ -915,6 +1636,17 @@ class BinanceSpotClient extends EventEmitter {
       this.marketSocket = null;
       socket.removeAllListeners();
       socket.close(1000, "client disconnect");
+    }
+
+    if (this.tradeSocket) {
+      const socket = this.tradeSocket;
+      this.tradeSocket = null;
+      socket.removeAllListeners();
+      if (socket.readyState === WebSocket.OPEN) {
+        socket.close(1000, "client disconnect");
+      } else {
+        socket.terminate();
+      }
     }
 
     this.emit("market-status", {
@@ -928,6 +1660,7 @@ class BinanceSpotClient extends EventEmitter {
 
   close() {
     this.disconnectMarket();
+    this.disconnectUserData();
     this.removeAllListeners();
   }
 }

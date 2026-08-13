@@ -5,12 +5,12 @@
   "description": "Electron main-process Binance Spot market data and trading demo",
   "main": "src/main.js",
   "scripts": {
-    "start": "electron ."
+    "start": "electron .",
+    "test": "node --test"
   },
   "dependencies": {
     "dotenv": "^17.4.2",
-    "ws": "^8.21.1",
-    "socks-proxy-agent" : "^10.1.0"
+    "ws": "^8.21.1"
   },
   "devDependencies": {
     "electron": "^43.2.0"

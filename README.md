@@ -1,94 +1,55 @@
-# Electron Binance Spot 后台示例
+# Electron Binance Spot 交易测试台
 
-这是一个最小可运行项目：
+本工程通过 Electron 主进程直接连接 Binance Spot，Secret 不会暴露给渲染页面。东京出口由操作系统的 WireGuard 路由负责，工程不包含代理配置。
 
-- Electron 主进程保存 API Key/Secret。
-- Binance Spot WebSocket 接收 `bookTicker` 最优买卖价。
-- Binance Spot REST API 执行限价/市价下单。
-- Binance Spot REST API 按 `orderId` 撤单。
-- Binance Spot WebSocket API 查询 `allOrders`、`myTrades` 和 `account.status`，页面独立展示普通订单历史、账户成交历史与账户信息；同时保留 `allOrderLists` 供 OCO/OTO/OTOCO 等组合订单使用。
-- 渲染进程只通过白名单 IPC 调用主进程。
-- 默认启用 Spot Testnet。
+## 已实现功能
 
-## 1. 安装
+- REST 连通性和服务器时间同步。
+- `exchangeInfo` 交易规则与过滤器展示。
+- 最新价、最优买卖、平均价、24 小时行情、最近成交、聚合成交和 K 线。
+- REST 深度快照 + WebSocket 增量维护本地订单簿。
+- `LIMIT`、`MARKET`、`LIMIT_MAKER`、止盈止损类普通订单。
+- `/api/v3/order/test` 测试下单（只校验，不进入撮合引擎）。
+- 下单前按 `PRICE_FILTER`、`LOT_SIZE`、`MIN_NOTIONAL/NOTIONAL`、`PERCENT_PRICE(_BY_SIDE)` 校验，并按 tickSize/stepSize 修正精度。
+- 单笔撤单、全部撤单、当前挂单、单笔订单、全部订单、减量改单、撤单重报。
+- 账户信息、成交历史、手续费率和下单限频。
+- OCO、OTO、OTOCO 创建；组合订单历史、当前组合挂单、单笔查询和撤销。
+- User Data Stream 实时接收订单、成交、余额和组合订单事件，断线自动重连。
+- 所有请求在“执行结果与错误”展示毫秒级耗时。
 
-```bash
-npm install
-```
+## 配置
 
-## 2. 配置 Testnet 密钥
-
-复制环境变量模板：
-
-### macOS / Linux
+复制模板并填写当前环境的 API Key 和 Secret：
 
 ```bash
 cp .env.example .env
 ```
 
-### Windows PowerShell
-
-```powershell
-Copy-Item .env.example .env
-```
-
-编辑 `.env`：
-
 ```dotenv
 BINANCE_TESTNET=true
-BINANCE_SOCKS5_PROXY=socks5h://139.224.34.110:1080
-BINANCE_TRADING_SOCKS5_PROXY=socks5h://127.0.0.1:1081
-BINANCE_API_KEY=你的_Testnet_API_Key
-BINANCE_API_SECRET=你的_Testnet_API_Secret
+BINANCE_API_KEY=你的当前环境_API_Key
+BINANCE_API_SECRET=你的当前环境_API_Secret
 ```
 
-行情请求使用 `BINANCE_SOCKS5_PROXY`；Testnet 时间同步、下单、撤单使用 `BINANCE_TRADING_SOCKS5_PROXY`。行情环境由 `BINANCE_TESTNET` 控制；下单、撤单及其签名时间同步固定使用 Spot Testnet 接口。`socks5h` 会让域名由代理端解析；如果隧道地址不同，分别修改这两个变量。
+`BINANCE_TESTNET=true` 时，REST、行情流、WebSocket API、下单和账户查询均连接 Spot Testnet；设置为 `false` 时全部连接正式环境。所有连接直接使用系统网络，因此 WireGuard 必须在操作系统层面处于可用状态。
 
-页面点击“刷新订单记录”“刷新成交历史”或“刷新账户信息”时，通过 WebSocket API 的 `allOrders`、`myTrades` 或 `account.status` 查询数据。`myTrades` 和 `account.status` 严格跟随 `BINANCE_TESTNET`：测试环境使用 Testnet WebSocket 和交易代理，正式环境使用正式 WebSocket 和行情代理。`allOrderLists` 只返回 OCO/OTO/OTOCO 等订单列表，不包含普通单笔订单。
+Testnet 和正式环境的 API Key 不通用。切换环境时必须同步更换 Key/Secret。
 
-如果你的隧道只允许访问你给出的正式环境地址（`stream.binance.com`），请将 `BINANCE_TESTNET=false`；保持 `true` 时会访问 `testnet.binance.vision`，两套环境的连通性是分开的。
-
-行情订阅不需要密钥；下单和撤单需要密钥。
-
-## 3. 启动
+## 运行与测试
 
 ```bash
+npm install
+npm test
 npm start
 ```
 
-## 4. 建议验证顺序
+建议先点击“测试连通性”和“刷新交易规则”，再使用“仅测试参数”验证委托。`/api/v3/order/test` 成功不会生成订单，因此不会出现在订单历史和当前挂单中。
 
-1. 启动后确认环境显示 `Spot Testnet`。
-2. 连接 `BTCUSDT` 行情，确认 Bid/Ask 持续变化。
-3. 使用明显偏离市场的 LIMIT 价格下一个小数量挂单。
-4. 记录返回的 `orderId`。
-5. 使用同一交易对和 `orderId` 撤单。
-6. 确认撤单响应状态正常。
+“提交真实委托”、组合订单以及撤单操作即使在 Testnet 也会改变测试账户状态；正式环境则会涉及真实资产。正式环境使用前请为 API Key 设置 IP 白名单，只开放读取和现货交易权限，禁止提现权限。
 
-## 5. 切换正式环境
+## 当前边界
 
-把 `.env` 改为：
-
-```dotenv
-BINANCE_TESTNET=false
-```
-
-正式环境执行真实资金交易。切换前至少补充：
-
-- 交易对过滤器校验，包括 `PRICE_FILTER`、`LOT_SIZE`、`MIN_NOTIONAL/NOTIONAL`。
-- User Data Stream，用于确认成交、拒单、撤单和部分成交。
-- 订单状态查询与超时后的幂等恢复。
-- 限频、重试、熔断和审计日志。
-- 操作系统密钥链或独立交易后端，不要把真实 Secret 明文打进安装包。
-- API Key 限制交易权限并配置 IP 白名单，禁止提现权限。
-
-## 6. 当前边界
-
-示例仅实现 Spot 的 `LIMIT` 和 `MARKET`，没有实现：
-
-- U 本位/币本位合约。
-- 杠杆、止盈止损、OCO。
-- 深度增量本地订单簿。
-- 用户数据流和成交回报。
-- 自动读取交易规则并修正价格、数量精度。
-- 数据落库与断线补偿。
+- 仅覆盖 Binance Spot；不包含 U 本位/币本位合约和杠杆账户。
+- 没有数据库持久化、跨进程审计日志和多账户管理。
+- 未实现 SOR、OPO/OPOCO、批量订单、FIX/SBE 等专业接口。
+- 页面提供 OCO/OTO/OTOCO 常用参数组合；更复杂的追踪止损、冰山及挂钩价格参数仍需扩展表单。

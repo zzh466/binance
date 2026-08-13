@@ -8,7 +8,7 @@
       content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'none'; img-src 'self' data:"
     />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Binance Spot Depth Electron Demo</title>
+    <title>Binance Spot 交易测试台</title>
     <style>
       :root {
         font-family:
@@ -96,6 +96,43 @@
         gap: 8px;
       }
 
+      .price-input-row {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) auto;
+        align-items: stretch;
+        gap: 8px;
+      }
+
+      .latest-price-option {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        min-height: 38px;
+        margin: 0;
+        padding: 8px 10px;
+        border: 1px solid color-mix(in srgb, CanvasText 28%, transparent);
+        border-radius: 6px;
+        white-space: nowrap;
+        cursor: pointer;
+      }
+
+      .latest-price-option input[type="checkbox"] {
+        width: auto;
+        min-height: auto;
+        margin: 0;
+        padding: 0;
+      }
+
+      .chart-order-status {
+        margin: 6px 0 14px;
+        font-size: 13px;
+        font-weight: 700;
+      }
+
+      .chart-order-status .open-order {
+        color: #ff0000;
+      }
+
       dl {
         display: grid;
         grid-template-columns: 110px 1fr;
@@ -122,9 +159,11 @@
 
       .order-history-toolbar,
       .trade-history-toolbar,
-      .account-toolbar {
+      .account-toolbar,
+      .toolbar {
         display: flex;
         align-items: center;
+        flex-wrap: wrap;
         gap: 12px;
         margin-bottom: 12px;
       }
@@ -134,6 +173,21 @@
       .account-toolbar button {
         width: auto;
         margin-top: 0;
+      }
+
+      .toolbar button,
+      .toolbar input,
+      .toolbar select {
+        width: auto;
+        margin-top: 0;
+      }
+
+      .toolbar input {
+        width: 150px;
+      }
+
+      .toolbar label {
+        margin: 0;
       }
 
       .order-history-toolbar input,
@@ -183,6 +237,21 @@
         text-align: left;
       }
 
+      .danger {
+        border-color: #b3261e;
+        color: #b3261e;
+      }
+
+      .compact-grid {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 10px;
+      }
+
+      .compact-grid label {
+        margin-top: 0;
+      }
+
       table {
         width: 100%;
         border-collapse: collapse;
@@ -221,7 +290,8 @@
 
       @media (max-width: 760px) {
         .grid,
-        .depth-grid {
+        .depth-grid,
+        .compact-grid {
           grid-template-columns: 1fr;
         }
 
@@ -233,12 +303,18 @@
   </head>
   <body>
     <main>
-      <h1>Electron Binance Spot 深度行情示例</h1>
+      <h1>Binance Spot 交易测试台</h1>
 
       <div class="warning">
         默认连接 Binance Spot Testnet。后台使用 REST 快照与 WebSocket 增量事件维护本地订单簿。
       </div>
-      <canvas  id="can" width="980px"  height="300px"></canvas>
+      <canvas id="can" width="980px" height="300px"></canvas>
+      <p id="chartOpenOrderStatus" class="chart-order-status">
+        <span class="open-order">鲜红色柱：自有未成交挂单</span>，等待账户订单数据
+      </p>
+      <p class="chart-order-status">
+        小键盘快捷键：1 = 卖出限价单（最新成交价 + 0.1），3 = 买入限价单（最新成交价 - 0.1），5 = 撤销账户全部未成交订单；数量固定为 0.001。
+      </p>
       <div class="grid">
         <section>
           <h2>运行状态</h2>
@@ -253,10 +329,6 @@
             <dd id="tradeHistoryEnvironment">读取中</dd>
             <dt>账户信息接口</dt>
             <dd id="accountEnvironment">读取中</dd>
-            <dt>行情 SOCKS5</dt>
-            <dd id="proxyStatus">读取中</dd>
-            <dt>交易 SOCKS5</dt>
-            <dd id="tradingProxyStatus">读取中</dd>
             <dt>交易密钥</dt>
             <dd id="credentials">读取中</dd>
             <dt>行情状态</dt>
@@ -267,6 +339,70 @@
             <dd id="depthConfig">读取中</dd>
           </dl>
           <button id="syncTimeButton">重新同步服务器时间</button>
+        </section>
+
+        <section class="full">
+          <h2>交易规则与行情</h2>
+          <p class="muted">查询当前环境的 exchangeInfo、最新价、最优买卖、均价、24 小时行情、最近成交、聚合成交和 K 线。</p>
+          <div class="toolbar">
+            <label for="overviewSymbol">交易对</label>
+            <input id="overviewSymbol" value="BTCUSDT" />
+            <label for="klineInterval">K线周期</label>
+            <select id="klineInterval">
+              <option value="1m">1m</option><option value="5m">5m</option>
+              <option value="15m">15m</option><option value="1h">1h</option>
+              <option value="1d">1d</option>
+            </select>
+            <button id="pingButton">测试连通性</button>
+            <button id="refreshRulesButton">刷新交易规则</button>
+            <button id="refreshOverviewButton">刷新行情</button>
+            <span id="overviewStatus">尚未加载</span>
+          </div>
+          <dl>
+            <dt>最新价</dt><dd id="overviewLastPrice">-</dd>
+            <dt>最优买 / 卖</dt><dd id="overviewBookTicker">-</dd>
+            <dt>平均价格</dt><dd id="overviewAveragePrice">-</dd>
+            <dt>24h 涨跌</dt><dd id="overviewChange">-</dd>
+            <dt>24h 高 / 低</dt><dd id="overviewHighLow">-</dd>
+          </dl>
+          <h3>交易过滤器</h3>
+          <div class="table-scroll">
+            <table><thead><tr><th>类型</th><th>规则</th></tr></thead><tbody id="filterRulesBody"><tr><td colspan="2">点击“刷新交易规则”加载数据</td></tr></tbody></table>
+          </div>
+          <h3>最近 K 线</h3>
+          <div class="table-scroll">
+            <table><thead><tr><th>开盘时间</th><th>开</th><th>高</th><th>低</th><th>收</th><th>成交量</th><th>成交笔数</th></tr></thead><tbody id="klineBody"><tr><td colspan="7">点击“刷新行情”加载数据</td></tr></tbody></table>
+          </div>
+          <h3>最近成交与聚合成交</h3>
+          <div class="table-scroll"><table><thead><tr><th>来源</th><th>成交 ID</th><th>价格</th><th>数量</th><th>时间</th><th>买方为 Maker</th></tr></thead><tbody id="publicTradesBody"><tr><td colspan="6">点击“刷新行情”加载数据</td></tr></tbody></table></div>
+        </section>
+
+        <section class="full">
+          <h2>当前挂单（待成交订单）</h2>
+          <p class="muted">通过 openOrders 查询真正处于 NEW 或 PARTIALLY_FILLED 状态的订单。</p>
+          <div class="toolbar">
+            <label for="openOrdersSymbol">交易对</label>
+            <input id="openOrdersSymbol" value="BTCUSDT" />
+            <button id="refreshOpenOrdersButton">刷新当前挂单</button>
+            <button id="cancelAllOpenOrdersButton" class="danger">撤销该交易对全部挂单</button>
+            <span id="openOrdersStatus">尚未加载</span>
+          </div>
+          <div class="table-scroll"><table class="order-history-table"><thead><tr><th>订单 ID</th><th>交易对</th><th>方向</th><th>类型</th><th>状态</th><th>价格</th><th>原始数量</th><th>已成交</th><th>更新时间</th></tr></thead><tbody id="openOrdersBody"><tr><td colspan="9">点击“刷新当前挂单”加载数据</td></tr></tbody></table></div>
+        </section>
+
+        <section class="full">
+          <h2>单笔订单查询与修改</h2>
+          <div class="toolbar">
+            <label for="queryOrderSymbol">交易对</label><input id="queryOrderSymbol" value="BTCUSDT" />
+            <label for="queryOrderId">订单 ID</label><input id="queryOrderId" placeholder="orderId" />
+            <label for="amendOrderQty">修改后数量</label><input id="amendOrderQty" placeholder="newQty" />
+            <label for="replaceOrderPrice">重报价格</label><input id="replaceOrderPrice" placeholder="new price" />
+            <button id="queryOrderButton">查询单笔订单</button>
+            <button id="amendOrderButton">减量改单并保留优先级</button>
+            <button id="cancelReplaceButton">撤单并重报 LIMIT</button>
+            <span id="queryOrderStatus">尚未查询</span>
+          </div>
+          <div class="table-scroll"><table class="order-history-table"><thead><tr><th>订单 ID</th><th>交易对</th><th>方向</th><th>类型</th><th>状态</th><th>价格</th><th>原始数量</th><th>已成交</th><th>更新时间</th></tr></thead><tbody id="queryOrderBody"><tr><td colspan="9">输入 orderId 后查询</td></tr></tbody></table></div>
         </section>
 
         <section class="full">
@@ -338,6 +474,58 @@
               </tbody>
             </table>
           </div>
+        </section>
+
+        <section class="full">
+          <h2>账户费率与下单限频</h2>
+          <p class="muted">显示指定交易对手续费率，以及账户在各时间周期的未成交订单计数。</p>
+          <div class="toolbar">
+            <label for="commissionSymbol">交易对</label>
+            <input id="commissionSymbol" value="BTCUSDT" />
+            <button id="refreshCommissionButton">刷新手续费率</button>
+            <button id="refreshRateLimitsButton">刷新下单限频</button>
+            <span id="riskStatus">尚未加载</span>
+          </div>
+          <div class="table-scroll"><table><thead><tr><th>类别 / 周期</th><th>Maker / 上限</th><th>Taker / 当前计数</th><th>Buyer</th><th>Seller</th></tr></thead><tbody id="riskBody"><tr><td colspan="5">点击按钮加载数据</td></tr></tbody></table></div>
+        </section>
+
+        <section class="full">
+          <h2>组合订单（OCO / OTO / OTOCO）</h2>
+          <p class="muted">查询组合订单历史和当前组合挂单。“工作单价格”用于 OTO/OTOCO；上方/下方价格用于 OCO 部分。BUY OCO 还需填写上方触发价，SELL OCO 需填写下方触发价。</p>
+          <div class="compact-grid">
+            <label>交易对<input id="ocoSymbol" value="BTCUSDT" /></label>
+            <label>方向<select id="ocoSide"><option value="SELL">SELL</option><option value="BUY">BUY</option></select></label>
+            <label>数量<input id="ocoQuantity" value="0.001" /></label>
+            <label>工作单价格（OTO/OTOCO）<input id="ocoWorkingPrice" placeholder="workingPrice" /></label>
+            <label>上方限价<input id="ocoAbovePrice" placeholder="abovePrice" /></label>
+            <label>上方触发价（BUY OCO）<input id="ocoAboveStopPrice" placeholder="aboveStopPrice" /></label>
+            <label>下方限价<input id="ocoBelowPrice" placeholder="belowPrice" /></label>
+            <label>下方触发价<input id="ocoBelowStopPrice" placeholder="belowStopPrice" /></label>
+          </div>
+          <div class="toolbar" style="margin-top: 12px">
+            <button id="placeOcoButton">创建 OCO</button>
+            <button id="placeOtoButton">创建 OTO</button>
+            <button id="placeOtocoButton">创建 OTOCO</button>
+            <button id="refreshAllOrderListsButton">刷新组合订单历史</button>
+            <button id="refreshOpenOrderListsButton">刷新当前组合挂单</button>
+            <label for="orderListId">组合订单 ID</label><input id="orderListId" placeholder="orderListId" />
+            <button id="queryOrderListButton">查询组合订单</button>
+            <button id="cancelOrderListButton" class="danger">撤销组合订单</button>
+            <span id="orderListsStatus">尚未加载</span>
+          </div>
+          <div class="table-scroll"><table><thead><tr><th>组合订单 ID</th><th>交易对</th><th>类型</th><th>列表状态</th><th>订单状态</th><th>子订单数</th><th>时间</th></tr></thead><tbody id="orderListsBody"><tr><td colspan="7">点击查询按钮加载数据</td></tr></tbody></table></div>
+        </section>
+
+        <section class="full">
+          <h2>实时账户事件</h2>
+          <p class="muted">通过 User Data Stream 实时接收 executionReport、outboundAccountPosition、balanceUpdate、listStatus 等事件。</p>
+          <div class="toolbar">
+            <button id="connectUserDataButton">连接账户事件</button>
+            <button id="disconnectUserDataButton">断开账户事件</button>
+            <button id="clearUserDataButton">清空事件</button>
+            <span id="userDataStatus">未连接</span>
+          </div>
+          <div class="table-scroll"><table><thead><tr><th>接收时间</th><th>事件类型</th><th>交易对 / 资产</th><th>状态</th><th>订单 ID</th><th>概要</th></tr></thead><tbody id="userDataBody"><tr><td colspan="6">连接后等待账户事件</td></tr></tbody></table></div>
         </section>
 
         <section>
@@ -430,15 +618,39 @@
           <select id="orderType">
             <option value="LIMIT">LIMIT</option>
             <option value="MARKET">MARKET</option>
+            <option value="LIMIT_MAKER">LIMIT_MAKER</option>
+            <option value="STOP_LOSS">STOP_LOSS</option>
+            <option value="STOP_LOSS_LIMIT">STOP_LOSS_LIMIT</option>
+            <option value="TAKE_PROFIT">TAKE_PROFIT</option>
+            <option value="TAKE_PROFIT_LIMIT">TAKE_PROFIT_LIMIT</option>
           </select>
 
           <label for="quantity">数量 quantity</label>
           <input id="quantity" value="0.001" />
 
           <label for="price">价格 price（LIMIT 必填）</label>
-          <input id="price" value="10000" />
+          <div class="price-input-row">
+            <input id="price" value="10000" />
+            <label class="latest-price-option" for="latestTradePriceToggle">
+              <input id="latestTradePriceToggle" type="checkbox" />
+              <span>最新成交价：</span>
+              <span id="latestTradePriceState">未选中</span>
+            </label>
+          </div>
 
-          <button id="placeOrderButton">提交委托</button>
+          <label for="stopPrice">触发价格 stopPrice（止盈止损）</label>
+          <input id="stopPrice" placeholder="可选" />
+
+          <label for="trailingDelta">追踪价差 trailingDelta（BIPS）</label>
+          <input id="trailingDelta" placeholder="追踪止盈止损可选" />
+
+          <label for="icebergQty">冰山数量 icebergQty（需 GTC）</label>
+          <input id="icebergQty" placeholder="限价类订单可选" />
+
+          <div class="buttons">
+            <button id="testOrderButton">仅测试参数</button>
+            <button id="placeOrderButton">提交真实委托</button>
+          </div>
         </section>
 
         <section>
