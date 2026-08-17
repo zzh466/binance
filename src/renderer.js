@@ -1743,6 +1743,7 @@ elements.orderType.addEventListener("change", () => {
   elements.icebergQty.disabled = !supportsIceberg;
 });
 const chartDom = document.querySelector('#can');
+
 const chart = new Chart(chartDom,980, 300, 0.01,{
     volumeScaleCount: 3,
     volumeScaleHeight: 25,
@@ -1757,6 +1758,21 @@ const chart = new Chart(chartDom,980, 300, 0.01,{
     calcBarType: 2
 
 });
+let resizeTimeout;
+window.onresize =(e)=>{
+    
+    let {innerWidth} =e.target;
+    const width = innerWidth - 80;
+    chartDom.width = width;
+    chartDom.style.width = width + 'px';
+    clearTimeout(resizeTimeout);
+    resizeTimeout = setTimeout(()=> {
+        chart.resize(  innerWidth - 80, 300);
+        if(chart.arg){
+            this.chart.render(chart.arg)
+        }      
+    }, 500)
+  }
 let chartSymbol = null;
 const latestTradePrices = new Map();
 const openOrdersByKey = new Map();
