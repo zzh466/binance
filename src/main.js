@@ -9,15 +9,47 @@ dotenv.config({
 });
 
 let mainWindow = null;
+const defaultTestnet = process.env.BINANCE_TESTNET !== "false";
 
-const client = new BinanceSpotClient({
-  apiKey: process.env.BINANCE_API_KEY || "",
-  apiSecret: process.env.BINANCE_API_SECRET || "",
-  testnet: process.env.BINANCE_TESTNET !== "false",
-  depthSpeed: process.env.BINANCE_DEPTH_SPEED || "100ms",
-  depthSnapshotLimit: process.env.BINANCE_DEPTH_SNAPSHOT_LIMIT || 1000,
-  depthDisplayLevels: process.env.BINANCE_DEPTH_DISPLAY_LEVELS || 5,
-});
+function getEnvironmentCredentials(testnet) {
+  const prefix = testnet ? "BINANCE_TESTNET" : "BINANCE_PRODUCTION";
+  const apiKey = process.env[`${prefix}_API_KEY`] || "";
+  const apiSecret = process.env[`${prefix}_API_SECRET`] || "";
+
+  if (apiKey && apiSecret) {
+    return { apiKey, apiSecret, source: prefix };
+  }
+
+  // 兼容原有配置：通用 Key 只用于 .env 中指定的默认环境，防止把
+  // Testnet Key 误发到正式环境（或反之）。
+  if (testnet === defaultTestnet) {
+    return {
+      apiKey: process.env.BINANCE_API_KEY || "",
+      apiSecret: process.env.BINANCE_API_SECRET || "",
+      source: "BINANCE_API",
+    };
+  }
+
+  return { apiKey: "", apiSecret: "", source: prefix };
+}
+
+function createBinanceClient(testnet) {
+  const credentials = getEnvironmentCredentials(testnet);
+  const nextClient = new BinanceSpotClient({
+    apiKey: credentials.apiKey,
+    apiSecret: credentials.apiSecret,
+    testnet,
+    depthSpeed: process.env.BINANCE_DEPTH_SPEED || "100ms",
+    depthSnapshotLimit: process.env.BINANCE_DEPTH_SNAPSHOT_LIMIT || 1000,
+    depthDisplayLevels: process.env.BINANCE_DEPTH_DISPLAY_LEVELS || 5,
+    preflightBalanceCheck:
+      process.env.BINANCE_PREFLIGHT_BALANCE_CHECK === "true",
+  });
+  nextClient.credentialsSource = credentials.source;
+  return nextClient;
+}
+
+let client = createBinanceClient(defaultTestnet);
 
 function createWindow() {
   mainWindow = new BrowserWindow({
@@ -36,8 +68,11 @@ function createWindow() {
 
   mainWindow.loadFile(path.join(__dirname, "index.html"));
   mainWindow.once("ready-to-show", () => mainWindow.show());
-  mainWindow.webContents.once("did-finish-load", () => {
-    connectUserDataInBackground();
+  mainWindow.webContents.on("did-finish-load", () => {
+    const activeClient = client;
+    if (activeClient.apiKey && activeClient.apiSecret) {
+      connectUserDataInBackground(activeClient);
+    }
   });
 
   mainWindow.on("closed", () => {
@@ -92,8 +127,9 @@ function showUserDataNotification(payload = {}) {
   notification.show();
 }
 
-function connectUserDataInBackground() {
-  client.connectUserData().catch((error) => {
+function connectUserDataInBackground(targetClient = client) {
+  targetClient.connectUserData().catch((error) => {
+    if (targetClient !== client) return;
     sendToRenderer("binance:user-data-error", {
       ...serializeError(error),
       time: Date.now(),
@@ -137,23 +173,67 @@ async function safeCall(action) {
   }
 }
 
+function getClientStatus() {
+  return {
+    testnet: client.testnet,
+    restBase: client.restBase,
+    tradingRestBase: client.tradingRestBase,
+    wsBase: client.wsBase,
+    wsApiBase: client.wsApiBase,
+    tradingWsApiBase: client.tradingWsApiBase,
+    hasApiKey: Boolean(client.apiKey),
+    hasApiSecret: Boolean(client.apiSecret),
+    credentialsSource: client.credentialsSource,
+    serverTimeOffsetMs: client.serverTimeOffsetMs,
+    tradingServerTimeOffsetMs: client.tradingServerTimeOffsetMs,
+    preflightBalanceCheck: client.preflightBalanceCheck,
+    depthSpeed: client.depthSpeed,
+    depthSnapshotLimit: client.depthSnapshotLimit,
+    depthDisplayLevels: client.depthDisplayLevels,
+  };
+}
+
+async function switchClientEnvironment(testnet) {
+  if (client.testnet === testnet) {
+    return { ...getClientStatus(), switched: false, reused: true };
+  }
+
+  const previousClient = client;
+  const nextClient = createBinanceClient(testnet);
+  bindClientEvents(nextClient);
+  client = nextClient;
+  previousClient.close();
+
+  let initializationWarning = null;
+  try {
+    await nextClient.initialize();
+  } catch (error) {
+    initializationWarning = serializeError(error);
+  }
+  if (nextClient.apiKey && nextClient.apiSecret) {
+    connectUserDataInBackground(nextClient);
+  }
+
+  return {
+    ...getClientStatus(),
+    switched: true,
+    reused: false,
+    initializationWarning,
+  };
+}
+
 function registerIpcHandlers() {
   ipcMain.handle("binance:get-status", async () => {
-    return safeCall(async () => ({
-      testnet: client.testnet,
-      restBase: client.restBase,
-      tradingRestBase: client.tradingRestBase,
-      wsBase: client.wsBase,
-      wsApiBase: client.wsApiBase,
-      tradingWsApiBase: client.tradingWsApiBase,
-      hasApiKey: Boolean(client.apiKey),
-      hasApiSecret: Boolean(client.apiSecret),
-      serverTimeOffsetMs: client.serverTimeOffsetMs,
-      tradingServerTimeOffsetMs: client.tradingServerTimeOffsetMs,
-      depthSpeed: client.depthSpeed,
-      depthSnapshotLimit: client.depthSnapshotLimit,
-      depthDisplayLevels: client.depthDisplayLevels,
-    }));
+    return safeCall(async () => getClientStatus());
+  });
+
+  ipcMain.handle("binance:switch-environment", async (_event, payload) => {
+    return safeCall(async () => {
+      if (typeof payload?.testnet !== "boolean") {
+        throw new TypeError("切换环境必须明确提供 testnet 布尔值。");
+      }
+      return switchClientEnvironment(payload.testnet);
+    });
   });
 
   ipcMain.handle("binance:sync-time", async () => {
@@ -274,34 +354,39 @@ function registerIpcHandlers() {
   });
 }
 
-client.on("depth-update", (data) => {
-  sendToRenderer("binance:depth-update", data);
-});
+function bindClientEvents(targetClient) {
+  targetClient.on("depth-update", (data) => {
+    if (targetClient === client) sendToRenderer("binance:depth-update", data);
+  });
 
-client.on("trade-update", (data) => {
-  sendToRenderer("binance:trade-update", data);
-});
+  targetClient.on("trade-update", (data) => {
+    if (targetClient === client) sendToRenderer("binance:trade-update", data);
+  });
 
-client.on("market-status", (data) => {
-  sendToRenderer("binance:market-status", data);
-});
+  targetClient.on("market-status", (data) => {
+    if (targetClient === client) sendToRenderer("binance:market-status", data);
+  });
 
-client.on("market-error", (data) => {
-  sendToRenderer("binance:market-error", data);
-});
+  targetClient.on("market-error", (data) => {
+    if (targetClient === client) sendToRenderer("binance:market-error", data);
+  });
 
-client.on("user-data-event", (data) => {
-  sendToRenderer("binance:user-data-event", data);
-  showUserDataNotification(data);
-});
+  targetClient.on("user-data-event", (data) => {
+    if (targetClient !== client) return;
+    sendToRenderer("binance:user-data-event", data);
+    showUserDataNotification(data);
+  });
 
-client.on("user-data-status", (data) => {
-  sendToRenderer("binance:user-data-status", data);
-});
+  targetClient.on("user-data-status", (data) => {
+    if (targetClient === client) sendToRenderer("binance:user-data-status", data);
+  });
 
-client.on("user-data-error", (data) => {
-  sendToRenderer("binance:user-data-error", data);
-});
+  targetClient.on("user-data-error", (data) => {
+    if (targetClient === client) sendToRenderer("binance:user-data-error", data);
+  });
+}
+
+bindClientEvents(client);
 
 registerIpcHandlers();
 

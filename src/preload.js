@@ -15,6 +15,8 @@ function subscribe(channel, callback) {
 
 contextBridge.exposeInMainWorld("binance", {
   getStatus: () => ipcRenderer.invoke("binance:get-status"),
+  switchEnvironment: (testnet) =>
+    ipcRenderer.invoke("binance:switch-environment", { testnet }),
   syncTime: () => ipcRenderer.invoke("binance:sync-time"),
   ping: () => ipcRenderer.invoke("binance:ping"),
   exchangeInfo: (options) =>

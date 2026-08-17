@@ -32,6 +32,72 @@
         margin-top: 0;
         font-size: 24px;
       }
+
+      .environment-switcher {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        margin: 0 0 14px;
+        padding: 10px 12px;
+        border: 1px solid color-mix(in srgb, CanvasText 28%, transparent);
+        border-radius: 8px;
+      }
+
+      .environment-switch {
+        position: relative;
+        display: inline-block;
+        width: 52px;
+        height: 28px;
+        margin: 0;
+      }
+
+      .environment-switch input {
+        width: 1px;
+        height: 1px;
+        min-height: 0;
+        margin: 0;
+        opacity: 0;
+      }
+
+      .environment-switch-slider {
+        position: absolute;
+        inset: 0;
+        cursor: pointer;
+        border-radius: 999px;
+        background: #1677ff;
+        transition: 160ms ease;
+      }
+
+      .environment-switch-slider::before {
+        content: "";
+        position: absolute;
+        width: 22px;
+        height: 22px;
+        left: 3px;
+        top: 3px;
+        border-radius: 50%;
+        background: white;
+        transition: 160ms ease;
+      }
+
+      .environment-switch input:checked + .environment-switch-slider {
+        background: #d71920;
+      }
+
+      .environment-switch input:checked + .environment-switch-slider::before {
+        transform: translateX(24px);
+      }
+
+      .environment-switch input:disabled + .environment-switch-slider {
+        cursor: wait;
+        opacity: 0.55;
+      }
+
+      .environment-switch-status {
+        margin-left: auto;
+        font-size: 13px;
+        font-weight: 700;
+      }
         #can {
       background-color: #000;
       position: relative;
@@ -48,6 +114,12 @@
         border: 1px solid #a87800;
         border-radius: 8px;
         margin-bottom: 18px;
+      }
+
+      .warning.production {
+        border-color: #d71920;
+        color: #d71920;
+        font-weight: 700;
       }
 
       .grid {
@@ -305,7 +377,18 @@
     <main>
       <h1>Binance Spot 交易测试台</h1>
 
-      <div class="warning">
+      <div class="environment-switcher">
+        <strong>环境切换</strong>
+        <span>测试环境</span>
+        <label class="environment-switch" title="关闭为 Testnet，打开为正式环境">
+          <input id="environmentSwitch" type="checkbox" role="switch" aria-label="切换 Binance 正式环境" />
+          <span class="environment-switch-slider"></span>
+        </label>
+        <span>正式环境</span>
+        <span id="environmentSwitchStatus" class="environment-switch-status">读取中</span>
+      </div>
+
+      <div id="environmentWarning" class="warning">
         默认连接 Binance Spot Testnet。后台使用 REST 快照与 WebSocket 增量事件维护本地订单簿。
       </div>
       <canvas id="can" width="980px" height="300px"></canvas>
@@ -666,7 +749,7 @@
 
         <section class="full">
           <h2>执行结果与错误</h2>
-          <p id="requestDuration" class="result-duration">接口耗时：- ms</p>
+          <p id="requestDuration" class="result-duration">端到端耗时：- ms</p>
           <pre id="output">等待操作</pre>
         </section>
       </div>

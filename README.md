@@ -15,6 +15,8 @@
 - 账户信息、成交历史、手续费率和下单限频。
 - OCO、OTO、OTOCO 创建；组合订单历史、当前组合挂单、单笔查询和撤销。
 - User Data Stream 实时接收订单、成交、余额和组合订单事件，断线自动重连。
+- 普通订单优先复用 User Data Stream 所在的 WebSocket API 持久连接，通过 `order.place` 报单；连接不可用时回退到 HTTPS Keep-Alive。
+- 报单和撤单只在收到 Binance 成功响应或 `executionReport` 后更新行情图，不使用本地乐观状态；确认后立即重绘。
 - 所有请求在“执行结果与错误”展示毫秒级耗时。
 
 ## 配置
@@ -27,13 +29,20 @@ cp .env.example .env
 
 ```dotenv
 BINANCE_TESTNET=true
-BINANCE_API_KEY=你的当前环境_API_Key
-BINANCE_API_SECRET=你的当前环境_API_Secret
+BINANCE_TESTNET_API_KEY=你的_Testnet_API_Key
+BINANCE_TESTNET_API_SECRET=你的_Testnet_API_Secret
+BINANCE_PRODUCTION_API_KEY=你的_正式环境_API_Key
+BINANCE_PRODUCTION_API_SECRET=你的_正式环境_API_Secret
+BINANCE_PREFLIGHT_BALANCE_CHECK=false
 ```
 
-`BINANCE_TESTNET=true` 时，REST、行情流、WebSocket API、下单和账户查询均连接 Spot Testnet；设置为 `false` 时全部连接正式环境。所有连接直接使用系统网络，因此 WireGuard 必须在操作系统层面处于可用状态。
+`BINANCE_TESTNET` 决定程序启动时的默认环境。页面最上方的“环境切换”开关可以在当前运行期间切换 Testnet 和正式环境：程序会关闭旧环境的 REST Keep-Alive、行情 WebSocket、账户事件和交易 WebSocket 连接，清空页面中的旧环境状态，再使用目标环境重连当前交易对。切换到正式环境前会弹出确认提示。
 
-Testnet 和正式环境的 API Key 不通用。切换环境时必须同步更换 Key/Secret。
+Testnet 和正式环境的 API Key 不通用，因此推荐分别配置 `BINANCE_TESTNET_API_KEY` / `BINANCE_TESTNET_API_SECRET` 与 `BINANCE_PRODUCTION_API_KEY` / `BINANCE_PRODUCTION_API_SECRET`。为兼容旧版，`BINANCE_API_KEY` 和 `BINANCE_API_SECRET` 仍可使用，但只会应用于 `BINANCE_TESTNET` 指定的启动默认环境，防止密钥被误发到另一个环境。未配置目标环境密钥时仍能查看公开行情，但不能查询私有账户、下单或撤单。
+
+所有连接直接使用系统网络，因此 WireGuard 必须在操作系统层面处于可用状态。页面切换只在当前程序运行期间生效；重新启动后仍以 `BINANCE_TESTNET` 的值作为默认环境。
+
+低延迟模式默认关闭逐笔余额预查，余额和动态价格过滤器仍由 Binance 撮合引擎在接单时校验。服务器时间在后台刷新，静态交易规则在连接行情时预热。若更看重提交前的中文余额提示，可将 `BINANCE_PREFLIGHT_BALANCE_CHECK` 设为 `true`，代价是每笔报单多一次账户查询。
 
 ## 运行与测试
 

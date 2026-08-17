@@ -102,6 +102,7 @@ class Chart {
         this.data = [];
         this.start = 0;
         this.currentPrice = undefined;
+        this.args = null;
         this.buyIndex = undefined;
         this.askIndex = undefined;
         this.lowerLimitindex = undefined;
@@ -790,6 +791,9 @@ class Chart {
 }
 
 const elements = {
+  environmentSwitch: document.querySelector("#environmentSwitch"),
+  environmentSwitchStatus: document.querySelector("#environmentSwitchStatus"),
+  environmentWarning: document.querySelector("#environmentWarning"),
   environment: document.querySelector("#environment"),
   tradingEnvironment: document.querySelector("#tradingEnvironment"),
   orderHistoryEnvironment: document.querySelector("#orderHistoryEnvironment"),
@@ -879,11 +883,14 @@ const elements = {
   output: document.querySelector("#output"),
 };
 
+let activeEnvironmentTestnet = true;
+let environmentSwitchBusy = false;
+
 function printResult(title, result) {
   const elapsedMs = Number(result?.elapsedMs);
   elements.requestDuration.textContent = Number.isFinite(elapsedMs)
-    ? `接口耗时：${elapsedMs.toFixed(3)} ms`
-    : "接口耗时：- ms";
+    ? `端到端耗时：${elapsedMs.toFixed(3)} ms`
+    : "端到端耗时：- ms";
   elements.output.textContent = `${title}\n${JSON.stringify(result, null, 2)}`;
 }
 
@@ -1246,6 +1253,18 @@ async function loadStatus() {
   }
 
   const status = result.data;
+  activeEnvironmentTestnet = Boolean(status.testnet);
+  elements.environmentSwitch.checked = !activeEnvironmentTestnet;
+  elements.environmentSwitchStatus.textContent = activeEnvironmentTestnet
+    ? "当前：Spot Testnet"
+    : "当前：Spot Production（真实资产）";
+  elements.environmentWarning.classList.toggle(
+    "production",
+    !activeEnvironmentTestnet
+  );
+  elements.environmentWarning.textContent = activeEnvironmentTestnet
+    ? "当前连接 Binance Spot Testnet。后台使用 REST 快照与 WebSocket 增量事件维护本地订单簿。"
+    : "当前连接 Binance Spot 正式环境：报单和撤单会影响真实资产，请确认交易对、价格和数量。";
   elements.environment.textContent = status.testnet
     ? "Spot Testnet"
     : "Spot Production";
@@ -1275,6 +1294,51 @@ async function loadStatus() {
   elements.depthConfig.textContent =
     `${status.depthSpeed} / 快照 ${status.depthSnapshotLimit} 档 / 显示 ${status.depthDisplayLevels} 档`;
 }
+
+elements.environmentSwitch.addEventListener("change", async () => {
+  if (environmentSwitchBusy) return;
+
+  const targetTestnet = !elements.environmentSwitch.checked;
+  if (
+    !targetTestnet &&
+    !window.confirm(
+      "确定切换到 Binance Spot 正式环境吗？正式环境的报单和撤单会影响真实资产。"
+    )
+  ) {
+    elements.environmentSwitch.checked = !activeEnvironmentTestnet;
+    return;
+  }
+
+  environmentSwitchBusy = true;
+  elements.environmentSwitch.disabled = true;
+  elements.environmentSwitchStatus.textContent = targetTestnet
+    ? "正在切换到 Testnet…"
+    : "正在切换到正式环境…";
+
+  let result;
+  try {
+    result = await window.binance.switchEnvironment(targetTestnet);
+  } catch (error) {
+    result = {
+      ok: false,
+      error: {
+        name: error?.name || "Error",
+        message: error?.message || "环境切换请求失败",
+      },
+    };
+  }
+  if (!result.ok) {
+    elements.environmentSwitch.checked = !activeEnvironmentTestnet;
+    elements.environmentSwitchStatus.textContent = "切换失败";
+    elements.environmentSwitch.disabled = false;
+    environmentSwitchBusy = false;
+    printResult("切换 Binance 环境失败", result);
+    return;
+  }
+
+  sessionStorage.setItem("binanceEnvironmentSwitchResult", JSON.stringify(result));
+  window.location.reload();
+});
 
 document
   .querySelector("#syncTimeButton")
@@ -1332,7 +1396,6 @@ document.querySelector("#cancelAllOpenOrdersButton").addEventListener("click", a
   elements.openOrdersStatus.textContent = result.ok ? `已撤销 ${result.data?.length || 0} 条` : formatError(result);
   if (result.ok) {
     for (const order of result.data || []) applyOpenOrderUpdate(order);
-    await refreshTrackedOpenOrders(symbol);
   }
 });
 
@@ -1403,6 +1466,7 @@ document
   .querySelector("#placeOrderButton")
   .addEventListener("click", async () => {
     const order = readOrderForm();
+    const submittedAt = Date.now();
     const result = await window.binance.placeOrder(order);
     printResult("下单结果", result);
 
@@ -1411,7 +1475,7 @@ document
       elements.queryOrderId.value = String(result.data.orderId);
       elements.cancelSymbol.value = result.data.symbol;
       elements.queryOrderSymbol.value = result.data.symbol;
-      applyOpenOrderUpdate(result.data);
+      applyConfirmedOrderResponse(result.data, submittedAt);
     }
   });
 
@@ -1423,10 +1487,11 @@ document.querySelector("#testOrderButton").addEventListener("click", async () =>
 document
   .querySelector("#cancelOrderButton")
   .addEventListener("click", async () => {
-    const result = await window.binance.cancelOrder({
+    const request = {
       symbol: elements.cancelSymbol.value.trim(),
       orderId: elements.orderId.value.trim(),
-    });
+    };
+    const result = await window.binance.cancelOrder(request);
 
     printResult("撤单结果", result);
     if (result.ok) applyOpenOrderUpdate(result.data);
@@ -1695,6 +1760,7 @@ const chart = new Chart(chartDom,980, 300, 0.01,{
 let chartSymbol = null;
 const latestTradePrices = new Map();
 const openOrdersByKey = new Map();
+const executionReportStatusByClientId = new Map();
 let numpadOrderBusy = false;
 let executionReportRefreshTimer = null;
 let executionReportRefreshSymbol = null;
@@ -1707,6 +1773,17 @@ function offsetTradePrice(price, offset) {
     1
   ));
   return (numericPrice + offset).toFixed(decimals);
+}
+
+function applyConfirmedOrderResponse(order, submittedAt) {
+  const clientOrderId = String(order?.clientOrderId || "");
+  const report = clientOrderId
+    ? executionReportStatusByClientId.get(clientOrderId)
+    : null;
+
+  // executionReport 已经是 Binance 的更新结果时，不再用较旧的报单响应覆盖它。
+  if (report && report.receivedAt >= submittedAt) return;
+  applyOpenOrderUpdate(order);
 }
 
 async function placeOrderFromNumpad(side) {
@@ -1729,14 +1806,16 @@ async function placeOrderFromNumpad(side) {
   elements.quantity.value = "0.001";
   elements.price.value = price;
 
-  const result = await window.binance.placeOrder({
+  const order = {
     symbol,
     side,
     type: "LIMIT",
     quantity: "0.001",
     price,
     timeInForce: "GTC",
-  });
+  };
+  const submittedAt = Date.now();
+  const result = await window.binance.placeOrder(order);
   printResult(
     side === "SELL" ? "小键盘 1 报空单结果" : "小键盘 3 报多单结果",
     result
@@ -1747,7 +1826,7 @@ async function placeOrderFromNumpad(side) {
     elements.queryOrderId.value = String(result.data.orderId ?? "");
     elements.cancelSymbol.value = result.data.symbol || symbol;
     elements.queryOrderSymbol.value = result.data.symbol || symbol;
-    applyOpenOrderUpdate(result.data);
+    applyConfirmedOrderResponse(result.data, submittedAt);
   }
 }
 
@@ -1791,7 +1870,6 @@ async function cancelAllOpenOrdersFromNumpad() {
     },
     ...(failed.length ? { error: { message: `${failed.length} 个交易对撤单失败。` } } : {}),
   });
-  await refreshTrackedOpenOrders();
 }
 
 document.addEventListener("keydown", async (event) => {
@@ -1852,6 +1930,7 @@ function normalizeOpenOrder(order, receivedAt = Date.now()) {
   const normalized = {
     symbol: String(order.symbol ?? order.s ?? "").toUpperCase(),
     orderId: order.orderId ?? order.i,
+    clientOrderId: order.clientOrderId ?? order.c ?? order.newClientOrderId ?? "",
     side: String(order.side ?? order.S ?? "").toUpperCase(),
     type: String(order.type ?? order.o ?? "").toUpperCase(),
     status: String(order.status ?? order.X ?? "").toUpperCase(),
@@ -1895,6 +1974,18 @@ function syncTrackedOpenOrders() {
   renderOrders(tableOrders, elements.openOrdersBody);
   elements.openOrdersStatus.textContent = `实时未成交 ${tableOrders.length} 笔`;
   updateChartOrderStatus();
+
+  // 不等待下一帧深度推送，订单状态变化后立即重绘当前行情画布。
+  if (chart.args?.LastPrice && chart.data.length) {
+    try {
+      chart.render(chart.args);
+    } catch (error) {
+      printResult("挂单即时绘制错误", {
+        ok: false,
+        error: { name: error.name, message: error.message },
+      });
+    }
+  }
 }
 
 function applyOpenOrderUpdate(order, receivedAt = Date.now()) {
@@ -2040,6 +2131,18 @@ window.binance.onMarketError((error) => {
 window.binance.onUserDataEvent((payload) => {
   prependUserDataEvent(payload);
   if (payload.event?.e === "executionReport") {
+    const clientOrderId = String(payload.event.c || "");
+    if (clientOrderId) {
+      executionReportStatusByClientId.set(clientOrderId, {
+        status: String(payload.event.X || payload.event.x || ""),
+        receivedAt: Number(payload.receivedAt || Date.now()),
+      });
+      if (executionReportStatusByClientId.size > 1_000) {
+        executionReportStatusByClientId.delete(
+          executionReportStatusByClientId.keys().next().value
+        );
+      }
+    }
     applyOpenOrderUpdate(payload.event, payload.receivedAt);
     scheduleExecutionReportRefresh(payload.event);
   }
@@ -2065,6 +2168,19 @@ window.binance.onUserDataError((error) => {
 
 async function initializeApp() {
   await loadStatus();
+
+  const switchResultText = sessionStorage.getItem(
+    "binanceEnvironmentSwitchResult"
+  );
+  if (switchResultText) {
+    sessionStorage.removeItem("binanceEnvironmentSwitchResult");
+    try {
+      const switchResult = JSON.parse(switchResultText);
+      printResult("切换 Binance 环境完成", switchResult);
+    } catch {
+      // 页面重载后的提示不是核心状态，解析失败时直接忽略。
+    }
+  }
 
   const symbol = elements.marketSymbol.value.trim().toUpperCase();
   elements.marketStatus.textContent = `connecting / ${symbol}`;

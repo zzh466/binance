@@ -20,6 +20,9 @@ const WS_API_BASE = {
 
 const DEPTH_SPEEDS = new Set(["100ms", "1000ms"]);
 const DEPTH_SNAPSHOT_LIMITS = new Set([100, 500, 1000, 5000]);
+const SERVER_TIME_CACHE_TTL_MS = 120_000;
+const SERVER_TIME_REFRESH_INTERVAL_MS = 30_000;
+const DYNAMIC_PRICE_MAX_AGE_MS = 10_000;
 
 function requestHttps(url, options = {}) {
   return new Promise((resolve, reject) => {
@@ -72,6 +75,7 @@ class BinanceSpotClient extends EventEmitter {
     depthSpeed = "100ms",
     depthSnapshotLimit = 1000,
     depthDisplayLevels = 10,
+    preflightBalanceCheck = false,
   } = {}) {
     super();
 
@@ -101,8 +105,20 @@ class BinanceSpotClient extends EventEmitter {
       Math.max(1, Math.floor(Number(depthDisplayLevels) || 10))
     );
 
+    this.preflightBalanceCheck = Boolean(preflightBalanceCheck);
+    this.httpsAgent = new https.Agent({
+      keepAlive: true,
+      keepAliveMsecs: 1_000,
+      maxSockets: 16,
+      maxFreeSockets: 8,
+      scheduling: "lifo",
+    });
+
     this.serverTimeOffsetMs = 0;
     this.tradingServerTimeOffsetMs = 0;
+    this.serverTimeCache = new Map();
+    this.serverTimeSyncPromises = new Map();
+    this.serverTimeRefreshTimer = null;
 
     this.marketSocket = null;
     this.marketSymbol = null;
@@ -119,15 +135,27 @@ class BinanceSpotClient extends EventEmitter {
     this.depthSyncVersion = 0;
 
     this.exchangeInfoCache = new Map();
+    this.averagePriceCache = new Map();
     this.userDataSocket = null;
     this.userDataManualClose = false;
     this.userDataReconnectTimer = null;
     this.userDataReconnectDelayMs = 1_000;
     this.userDataSubscriptionId = null;
+    this.wsApiPendingRequests = new Map();
   }
 
   async initialize() {
     await this.syncServerTime();
+    clearInterval(this.serverTimeRefreshTimer);
+    this.serverTimeRefreshTimer = setInterval(() => {
+      this.syncServerTimeForBase(this.tradingRestBase).catch((error) => {
+        this.emit("user-data-error", {
+          message: `后台服务器时间同步失败：${error.message}`,
+          time: Date.now(),
+        });
+      });
+    }, SERVER_TIME_REFRESH_INTERVAL_MS);
+    this.serverTimeRefreshTimer.unref?.();
   }
 
   async syncServerTime() {
@@ -139,30 +167,69 @@ class BinanceSpotClient extends EventEmitter {
   }
 
   async syncServerTimeForBase(baseUrl) {
-    const before = Date.now();
-    const result = await this.request("GET", "/v3/time", {}, false, baseUrl);
-    const after = Date.now();
-
-    const localMidpoint = Math.floor((before + after) / 2);
-    const offsetMs = Number(result.serverTime) - localMidpoint;
-
-    if (baseUrl === this.tradingRestBase) {
-      this.tradingServerTimeOffsetMs = offsetMs;
-    }
-    if (baseUrl === this.restBase) {
-      this.serverTimeOffsetMs = offsetMs;
+    const pendingSync = this.serverTimeSyncPromises.get(baseUrl);
+    if (pendingSync) {
+      return pendingSync;
     }
 
-    return {
-      serverTime: Number(result.serverTime),
-      localMidpoint,
-      offsetMs,
-      baseUrl,
-    };
+    const syncPromise = (async () => {
+      const before = Date.now();
+      const result = await this.request("GET", "/v3/time", {}, false, baseUrl);
+      const after = Date.now();
+
+      const localMidpoint = Math.floor((before + after) / 2);
+      const offsetMs = Number(result.serverTime) - localMidpoint;
+      const synchronized = {
+        serverTime: Number(result.serverTime),
+        localMidpoint,
+        offsetMs,
+        baseUrl,
+        synchronizedAt: after,
+        reused: false,
+      };
+
+      this.serverTimeCache.set(baseUrl, synchronized);
+      if (baseUrl === this.tradingRestBase) {
+        this.tradingServerTimeOffsetMs = offsetMs;
+      }
+      if (baseUrl === this.restBase) {
+        this.serverTimeOffsetMs = offsetMs;
+      }
+
+      return synchronized;
+    })();
+
+    this.serverTimeSyncPromises.set(baseUrl, syncPromise);
+    try {
+      return await syncPromise;
+    } finally {
+      if (this.serverTimeSyncPromises.get(baseUrl) === syncPromise) {
+        this.serverTimeSyncPromises.delete(baseUrl);
+      }
+    }
   }
 
-  getTimestamp() {
-    return Date.now() + this.tradingServerTimeOffsetMs;
+  async ensureServerTimeForBase(baseUrl) {
+    const cached = this.serverTimeCache.get(baseUrl);
+    const ageMs = cached ? Date.now() - cached.synchronizedAt : Infinity;
+
+    if (cached && ageMs < SERVER_TIME_CACHE_TTL_MS) {
+      return { ...cached, ageMs, reused: true };
+    }
+
+    return this.syncServerTimeForBase(baseUrl);
+  }
+
+  async ensureTradingServerTime() {
+    return this.ensureServerTimeForBase(this.tradingRestBase);
+  }
+
+  getTimestamp(baseUrl = this.tradingRestBase) {
+    const offsetMs = this.serverTimeCache.get(baseUrl)?.offsetMs ??
+      (baseUrl === this.tradingRestBase
+        ? this.tradingServerTimeOffsetMs
+        : this.serverTimeOffsetMs);
+    return Date.now() + offsetMs;
   }
 
   assertTradingCredentials() {
@@ -199,7 +266,7 @@ class BinanceSpotClient extends EventEmitter {
       this.assertTradingCredentials();
 
       normalized.recvWindow ??= "5000";
-      normalized.timestamp = String(this.getTimestamp());
+      normalized.timestamp = String(this.getTimestamp(baseUrl));
 
       const unsignedQuery = new URLSearchParams(normalized).toString();
       normalized.signature = crypto
@@ -225,6 +292,7 @@ class BinanceSpotClient extends EventEmitter {
         method,
         headers,
         timeout: 10_000,
+        agent: this.httpsAgent,
       });
     } catch (error) {
       throw new BinanceApiError(`请求 Binance 失败：${error.message}`, {
@@ -478,11 +546,16 @@ class BinanceSpotClient extends EventEmitter {
       if (original !== params.icebergQty) adjustments.push(`icebergQty: ${original} -> ${params.icebergQty}`);
     }
 
-    if (params.price) {
-      const average = await this.request("GET", "/v3/avgPrice", { symbol });
-      const referencePrice = Number(average.price);
-      const percentBySide = filters.PERCENT_PRICE_BY_SIDE;
-      const percentPrice = filters.PERCENT_PRICE;
+    const percentBySide = filters.PERCENT_PRICE_BY_SIDE;
+    const percentPrice = filters.PERCENT_PRICE;
+    const averagePrice = this.averagePriceCache.get(symbol);
+    const hasFreshAveragePrice = averagePrice &&
+      Date.now() - averagePrice.loadedAt <= DYNAMIC_PRICE_MAX_AGE_MS;
+
+    // 动态价格区间最终由撮合引擎原子校验。行情连接会持续缓存 avgPrice，
+    // 有新鲜缓存时才做本地预检，避免每笔委托前串行请求 /avgPrice。
+    if (params.price && (percentBySide || percentPrice) && hasFreshAveragePrice) {
+      const referencePrice = Number(averagePrice.price);
       if (percentBySide && referencePrice > 0) {
         const upper = referencePrice * Number(side === "BUY" ? percentBySide.bidMultiplierUp : percentBySide.askMultiplierUp);
         const lower = referencePrice * Number(side === "BUY" ? percentBySide.bidMultiplierDown : percentBySide.askMultiplierDown);
@@ -511,8 +584,30 @@ class BinanceSpotClient extends EventEmitter {
   async placeOrder(order, { testOnly = false } = {}) {
     const { params, adjustments, symbolInfo } = await this.prepareOrder(order);
     this.assertTradingCredentials();
-    await this.syncTradingServerTime();
-    await this.validateAvailableBalance(params, symbolInfo);
+    await this.ensureTradingServerTime();
+
+    if (this.preflightBalanceCheck) {
+      await this.validateAvailableBalance(params, symbolInfo);
+    }
+
+    const persistentSocket = this.getPersistentWsApiSocket(this.tradingWsApiBase);
+    if (persistentSocket) {
+      const signedParams = this.createSignedWsApiParams(params);
+      const result = await this.requestWsApiOnSocket(
+        persistentSocket,
+        testOnly ? "order.test" : "order.place",
+        signedParams,
+        { url: this.tradingWsApiBase }
+      );
+      return {
+        ...result,
+        testOnly,
+        adjustments,
+        transport: "websocket",
+        preflightBalanceCheck: this.preflightBalanceCheck,
+      };
+    }
+
     const result = await this.request(
       "POST",
       testOnly ? "/v3/order/test" : "/v3/order",
@@ -520,7 +615,13 @@ class BinanceSpotClient extends EventEmitter {
       true,
       this.tradingRestBase
     );
-    return { ...result, testOnly, adjustments };
+    return {
+      ...result,
+      testOnly,
+      adjustments,
+      transport: "https-keepalive",
+      preflightBalanceCheck: this.preflightBalanceCheck,
+    };
   }
 
   async validateAvailableBalance(params, symbolInfo) {
@@ -576,20 +677,32 @@ class BinanceSpotClient extends EventEmitter {
     }
 
     this.assertTradingCredentials();
-    await this.syncTradingServerTime();
+    await this.ensureTradingServerTime();
 
-    return this.request(
+    const persistentSocket = this.getPersistentWsApiSocket(this.tradingWsApiBase);
+    if (persistentSocket) {
+      const result = await this.requestWsApiOnSocket(
+        persistentSocket,
+        "order.cancel",
+        this.createSignedWsApiParams(params),
+        { url: this.tradingWsApiBase }
+      );
+      return { ...result, transport: "websocket" };
+    }
+
+    const result = await this.request(
       "DELETE",
       "/v3/order",
       params,
       true,
       this.tradingRestBase
     );
+    return { ...result, transport: "https-keepalive" };
   }
 
   async signedRest(method, path, params = {}) {
     this.assertTradingCredentials();
-    await this.syncTradingServerTime();
+    await this.ensureTradingServerTime();
     return this.request(
       method,
       path,
@@ -617,9 +730,29 @@ class BinanceSpotClient extends EventEmitter {
   }
 
   async cancelAllOpenOrders({ symbol }) {
-    return this.signedRest("DELETE", "/v3/openOrders", {
-      symbol: this.validateSymbol(symbol),
-    });
+    const params = { symbol: this.validateSymbol(symbol) };
+    this.assertTradingCredentials();
+    await this.ensureTradingServerTime();
+
+    const persistentSocket = this.getPersistentWsApiSocket(this.tradingWsApiBase);
+    if (persistentSocket) {
+      const result = await this.requestWsApiOnSocket(
+        persistentSocket,
+        "openOrders.cancelAll",
+        this.createSignedWsApiParams(params),
+        { url: this.tradingWsApiBase }
+      );
+      return result;
+    }
+
+    const result = await this.request(
+      "DELETE",
+      "/v3/openOrders",
+      params,
+      true,
+      this.tradingRestBase
+    );
+    return result;
   }
 
   async amendOrder({ symbol, orderId, origClientOrderId, newQty, newClientOrderId }) {
@@ -842,6 +975,106 @@ class BinanceSpotClient extends EventEmitter {
       .digest("hex");
   }
 
+  createSignedWsApiParams(params = {}) {
+    const signedParams = this.normalizeParams({
+      ...params,
+      recvWindow: params.recvWindow || 5_000,
+      apiKey: this.apiKey,
+      timestamp: this.getTimestamp(this.tradingRestBase),
+    });
+    signedParams.signature = this.createWsApiSignature(signedParams);
+    return signedParams;
+  }
+
+  getPersistentWsApiSocket(url = this.wsApiBase) {
+    if (
+      url === this.wsApiBase &&
+      this.userDataSocket?.readyState === WebSocket.OPEN &&
+      this.userDataSubscriptionId !== null
+    ) {
+      return this.userDataSocket;
+    }
+    return null;
+  }
+
+  requestWsApiOnSocket(socket, method, params, { url = this.wsApiBase } = {}) {
+    return new Promise((resolve, reject) => {
+      if (socket.readyState !== WebSocket.OPEN) {
+        reject(new BinanceApiError("Binance WebSocket API 持久连接不可用。", {
+          data: { method, url, readyState: socket.readyState },
+        }));
+        return;
+      }
+
+      const id = crypto.randomUUID();
+      const timeoutId = setTimeout(() => {
+        this.wsApiPendingRequests.delete(id);
+        reject(new BinanceApiError("Binance WebSocket API 请求超时。", {
+          data: { method, url },
+        }));
+      }, 15_000);
+
+      this.wsApiPendingRequests.set(id, {
+        socket,
+        method,
+        url,
+        timeoutId,
+        resolve,
+        reject,
+      });
+
+      try {
+        socket.send(JSON.stringify({ id, method, params }));
+      } catch (error) {
+        clearTimeout(timeoutId);
+        this.wsApiPendingRequests.delete(id);
+        reject(new BinanceApiError(
+          `Binance WebSocket API 请求发送失败：${error.message}`,
+          { data: { cause: error.name, method, url } }
+        ));
+      }
+    });
+  }
+
+  handleWsApiResponse(message, socket) {
+    const pending = this.wsApiPendingRequests.get(message?.id);
+    if (!pending || pending.socket !== socket) {
+      return false;
+    }
+
+    clearTimeout(pending.timeoutId);
+    this.wsApiPendingRequests.delete(message.id);
+
+    if (
+      message.error ||
+      (message.status !== undefined &&
+        (message.status < 200 || message.status >= 300))
+    ) {
+      const apiError = message.error || {};
+      pending.reject(new BinanceApiError(
+        apiError.msg || `Binance WebSocket API HTTP ${message.status}`,
+        {
+          status: message.status,
+          code: apiError.code,
+          data: message,
+        }
+      ));
+    } else {
+      pending.resolve(message.result);
+    }
+
+    return true;
+  }
+
+  rejectWsApiRequestsForSocket(socket, error) {
+    for (const [id, pending] of this.wsApiPendingRequests) {
+      if (pending.socket !== socket) continue;
+      clearTimeout(pending.timeoutId);
+      this.wsApiPendingRequests.delete(id);
+      pending.reject(error);
+    }
+  }
+
   requestWsApi(
     method,
     params,
@@ -849,6 +1082,11 @@ class BinanceSpotClient extends EventEmitter {
       url = this.wsApiBase,
     } = {}
   ) {
+
+    const persistentSocket = this.getPersistentWsApiSocket(url);
+    if (persistentSocket) {
+      return this.requestWsApiOnSocket(persistentSocket, method, params, { url });
+    }
 
     return new Promise((resolve, reject) => {
       let socket;
@@ -983,7 +1221,7 @@ class BinanceSpotClient extends EventEmitter {
     const normalizedSymbol = this.validateSymbol(symbol);
     this.assertTradingCredentials();
 
-    const { offsetMs } = await this.syncTradingServerTime();
+    const { offsetMs } = await this.ensureTradingServerTime();
     const params = this.normalizeParams({
       symbol: normalizedSymbol,
       orderId,
@@ -1013,7 +1251,7 @@ class BinanceSpotClient extends EventEmitter {
     this.assertTradingCredentials();
 
     const timeBase = this.tradingRestBase;
-    const { offsetMs } = await this.syncServerTimeForBase(timeBase);
+    const { offsetMs } = await this.ensureServerTimeForBase(timeBase);
     const params = this.normalizeParams({
       symbol: normalizedSymbol,
       orderId,
@@ -1034,7 +1272,7 @@ class BinanceSpotClient extends EventEmitter {
     this.assertTradingCredentials();
 
     const timeBase = this.tradingRestBase;
-    const { offsetMs } = await this.syncServerTimeForBase(timeBase);
+    const { offsetMs } = await this.ensureServerTimeForBase(timeBase);
     const params = {
       ...(omitZeroBalances === undefined
         ? {}
@@ -1052,7 +1290,7 @@ class BinanceSpotClient extends EventEmitter {
     this.assertTradingCredentials();
 
     const timeBase = this.tradingRestBase;
-    const { offsetMs } = await this.syncServerTimeForBase(timeBase);
+    const { offsetMs } = await this.ensureServerTimeForBase(timeBase);
     const params = this.normalizeParams({
       fromId,
       startTime,
@@ -1086,7 +1324,7 @@ class BinanceSpotClient extends EventEmitter {
   }
 
   async openUserDataSocket() {
-    const { offsetMs } = await this.syncTradingServerTime();
+    const { offsetMs } = await this.ensureTradingServerTime();
     const requestId = crypto.randomUUID();
     const params = this.normalizeParams({
       apiKey: this.apiKey,
@@ -1129,6 +1367,10 @@ class BinanceSpotClient extends EventEmitter {
             message: `账户事件解析失败：${error.message}`,
             time: Date.now(),
           });
+          return;
+        }
+
+        if (this.handleWsApiResponse(message, socket)) {
           return;
         }
 
@@ -1182,6 +1424,12 @@ class BinanceSpotClient extends EventEmitter {
 
       socket.on("close", (code, reasonBuffer) => {
         clearTimeout(timeoutId);
+        this.rejectWsApiRequestsForSocket(
+          socket,
+          new BinanceApiError("Binance WebSocket API 持久连接已关闭。", {
+            data: { code, reason: reasonBuffer?.toString() || "", url: this.wsApiBase },
+          })
+        );
         if (this.userDataSocket !== socket) return;
         this.userDataSocket = null;
         this.userDataSubscriptionId = null;
@@ -1219,6 +1467,10 @@ class BinanceSpotClient extends EventEmitter {
     if (this.userDataSocket) {
       const socket = this.userDataSocket;
       this.userDataSocket = null;
+      this.rejectWsApiRequestsForSocket(
+        socket,
+        new BinanceApiError("Binance WebSocket API 持久连接已断开。")
+      );
       if (socket.readyState === WebSocket.OPEN) {
         socket.close(1000, "client disconnect");
       } else {
@@ -1237,6 +1489,16 @@ class BinanceSpotClient extends EventEmitter {
     this.marketManualClose = false;
     this.marketReconnectDelayMs = 1_000;
     this.tradeReconnectDelayMs = 1_000;
+
+    // 页面加载行情后立即预热下单所需的静态交易规则，避免首次按键下单
+    // 才去等待 exchangeInfo。
+    this.exchangeInfo(normalizedSymbol).catch((error) => {
+      this.emit("market-error", {
+        message: `下单规则预热失败：${error.message}`,
+        symbol: normalizedSymbol,
+        time: Date.now(),
+      });
+    });
 
     this.openDepthSocket();
     this.openTradeSocket();
@@ -1269,6 +1531,11 @@ class BinanceSpotClient extends EventEmitter {
     socket.on("open", () => {
       if (this.tradeSocket === socket) {
         this.tradeReconnectDelayMs = 1_000;
+        socket.send(JSON.stringify({
+          method: "SUBSCRIBE",
+          params: [`${symbol.toLowerCase()}@avgPrice`],
+          id: Date.now(),
+        }));
       }
     });
 
@@ -1279,6 +1546,15 @@ class BinanceSpotClient extends EventEmitter {
 
       try {
         const message = JSON.parse(buffer.toString());
+
+        if (message.e === "avgPrice") {
+          this.averagePriceCache.set(symbol, {
+            price: String(message.w),
+            loadedAt: Date.now(),
+            eventTime: Number(message.E),
+          });
+          return;
+        }
 
         if (message.e !== "trade") {
           return;
@@ -1659,8 +1935,11 @@ class BinanceSpotClient extends EventEmitter {
   }
 
   close() {
+    clearInterval(this.serverTimeRefreshTimer);
+    this.serverTimeRefreshTimer = null;
     this.disconnectMarket();
     this.disconnectUserData();
+    this.httpsAgent.destroy();
     this.removeAllListeners();
   }
 }
