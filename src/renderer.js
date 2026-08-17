@@ -83,6 +83,7 @@ class Chart {
     }
      init(){
         const ctx= this.ctx;
+        
         this.count = Math.floor((this.width - 150) / (this.barWidth * 2) ) * 2;
         
         
@@ -214,6 +215,9 @@ class Chart {
         this.range = this.initRange()
         this.init();
         
+        if(!this.currentPrice){
+          this.currentPrice = this.args?.AskPrice1;
+        }
         this.initData(this.currentPrice);
         this.renderPrice()
     }
