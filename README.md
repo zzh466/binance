@@ -1,10 +1,11 @@
-# Electron Binance Spot 交易测试台
+# Electron Binance 统一交易测试台
 
-本工程通过 Electron 主进程直接连接 Binance Spot，Secret 不会暴露给渲染页面。东京出口由操作系统的 WireGuard 路由负责，工程不包含代理配置。
+本工程通过 Electron 主进程连接 Binance Spot 与 USDⓈ-M Futures，Secret 不会暴露给渲染页面。东京出口由操作系统的 WireGuard 路由负责，工程不包含代理配置。
 
 ## 已实现功能
 
 - REST 连通性和服务器时间同步。
+- 根据唯一的“全局合约”自动识别 Spot / USDⓈ-M，并将行情、普通下单、撤单和查询路由到对应市场；只存在于 Futures 的 `SKHYUSDT` 无需手动选择市场。
 - `exchangeInfo` 交易规则与过滤器展示。
 - 最新价、最优买卖、平均价、24 小时行情、最近成交、聚合成交和 K 线。
 - REST 深度快照 + WebSocket 增量维护本地订单簿。
@@ -14,9 +15,11 @@
 - 单笔撤单、全部撤单、当前挂单、单笔订单、全部订单、减量改单、撤单重报。
 - 账户信息、成交历史、手续费率和下单限频。
 - OCO、OTO、OTOCO 创建；组合订单历史、当前组合挂单、单笔查询和撤销。
-- User Data Stream 实时接收订单、成交、余额和组合订单事件，断线自动重连。
-- 普通订单优先复用 User Data Stream 所在的 WebSocket API 持久连接，通过 `order.place` 报单；连接不可用时回退到 HTTPS Keep-Alive。
+- Spot 与 USDⓈ-M User Data Stream 实时接收订单、成交和账户事件，永续订单事件会转换为页面统一使用的 `executionReport`，断线自动重连。
+- Spot 普通订单优先复用 User Data Stream 所在的 WebSocket API 持久连接，通过 `order.place` 报单；连接不可用时回退到 HTTPS Keep-Alive。USDⓈ-M 普通订单通过 Futures HTTPS Keep-Alive 提交。
 - 报单和撤单只在收到 Binance 成功响应或 `executionReport` 后更新行情图，不使用本地乐观状态；确认后立即重绘。
+- 页面顶部提供“系统 / 配置”菜单；“配置 → 快捷键”以列表维护按键、动作、方向、超价和手数，支持新增、编辑、删除与恢复默认。设置保存在本机的 `~/Library/Application Support/Binance统一交易台/shortcut-settings.json`。
+- 行情图上方只保留一个“全局合约”输入框；行情、下单、撤单、订单与成交查询、手续费和组合订单等功能统一读取该合约，点击“切换行情”或按 Enter 可重连行情。
 - 所有请求在“执行结果与错误”展示毫秒级耗时。
 
 ## 配置
@@ -33,12 +36,18 @@ BINANCE_TESTNET_API_KEY=你的_Testnet_API_Key
 BINANCE_TESTNET_API_SECRET=你的_Testnet_API_Secret
 BINANCE_PRODUCTION_API_KEY=你的_正式环境_API_Key
 BINANCE_PRODUCTION_API_SECRET=你的_正式环境_API_Secret
+BINANCE_TESTNET_FUTURES_API_KEY=你的_Futures_Testnet_API_Key
+BINANCE_TESTNET_FUTURES_API_SECRET=你的_Futures_Testnet_API_Secret
+BINANCE_PRODUCTION_FUTURES_API_KEY=你的_Futures_正式环境_API_Key
+BINANCE_PRODUCTION_FUTURES_API_SECRET=你的_Futures_正式环境_API_Secret
 BINANCE_PREFLIGHT_BALANCE_CHECK=false
 ```
 
-`BINANCE_TESTNET` 决定程序启动时的默认环境。页面最上方的“环境切换”开关可以在当前运行期间切换 Testnet 和正式环境：程序会关闭旧环境的 REST Keep-Alive、行情 WebSocket、账户事件和交易 WebSocket 连接，清空页面中的旧环境状态，再使用目标环境重连当前交易对。切换到正式环境前会弹出确认提示。
+`BINANCE_TESTNET` 决定程序启动时的默认环境。页面最上方的“环境切换”开关可以在当前运行期间切换 Testnet 和正式环境：程序会关闭旧环境的 Spot / USDⓈ-M 连接，清空页面中的旧环境状态，再自动识别并重连当前合约。切换到正式环境前会弹出确认提示。
 
-Testnet 和正式环境的 API Key 不通用，因此推荐分别配置 `BINANCE_TESTNET_API_KEY` / `BINANCE_TESTNET_API_SECRET` 与 `BINANCE_PRODUCTION_API_KEY` / `BINANCE_PRODUCTION_API_SECRET`。为兼容旧版，`BINANCE_API_KEY` 和 `BINANCE_API_SECRET` 仍可使用，但只会应用于 `BINANCE_TESTNET` 指定的启动默认环境，防止密钥被误发到另一个环境。未配置目标环境密钥时仍能查看公开行情，但不能查询私有账户、下单或撤单。
+Testnet 和正式环境的 API Key 不通用，因此推荐分别配置。USDⓈ-M Testnet 通常还需要单独申请 Futures Demo Key；未填写 Futures 专用变量时，程序会尝试复用同环境凭证。为兼容旧版，`BINANCE_API_KEY` 和 `BINANCE_API_SECRET` 仍可使用，但只会应用于 `BINANCE_TESTNET` 指定的启动默认环境。未配置目标市场密钥时仍能查看公开行情，但不能查询私有账户、下单或撤单。
+
+仅凭 `BTCUSDT` 这样的文本无法区分同名 Spot 与永续市场。为保持现有交易行为，symbol 同时存在于两个市场时默认选择 Spot；只存在于 USDⓈ-M 的 symbol 会自动选择 Futures。Futures Testnet 的合约列表不保证与正式环境一致，因此 `SKHYUSDT` 可能只能在正式环境查看。
 
 所有连接直接使用系统网络，因此 WireGuard 必须在操作系统层面处于可用状态。页面切换只在当前程序运行期间生效；重新启动后仍以 `BINANCE_TESTNET` 的值作为默认环境。
 
@@ -52,13 +61,26 @@ npm test
 npm start
 ```
 
-建议先点击“测试连通性”和“刷新交易规则”，再使用“仅测试参数”验证委托。`/api/v3/order/test` 成功不会生成订单，因此不会出现在订单历史和当前挂单中。
+## 生成 macOS 应用与三开
 
-“提交真实委托”、组合订单以及撤单操作即使在 Testnet 也会改变测试账户状态；正式环境则会涉及真实资产。正式环境使用前请为 API Key 设置 IP 白名单，只开放读取和现货交易权限，禁止提现权限。
+在 Apple Silicon Mac 上执行：
+
+```bash
+npm run build:mac
+```
+
+产物位于 `dist/mac-arm64/Binance统一交易台.app`，可直接双击运行。构建脚本不会把密钥封装进 `.app`，而是把当前 `.env` 以 `600` 权限放在应用旁边；移动应用时需要同时移动该 `.env`，或在目标目录按 `.env.example` 重新配置。
+
+启动第一份后，点击“系统 → 打开另外两份”，程序会再启动两个使用独立 Chromium 数据目录的实例，避免多实例锁冲突。三份实例共享外部 `.env` 和快捷键 JSON 配置，其他页面本地设置彼此独立。
+
+建议先点击“测试连通性”和“刷新交易规则”，再使用“仅测试参数”验证委托。Spot `/api/v3/order/test` 与 USDⓈ-M `/fapi/v1/order/test` 成功都不会生成订单，因此不会出现在订单历史和当前挂单中。
+
+“提交真实委托”、组合订单以及撤单操作即使在 Testnet 也会改变测试账户状态；正式环境则会涉及真实资产和永续仓位。正式环境使用前请为 API Key 设置 IP 白名单，只开放需要的读取、现货或 Futures 权限，禁止提现权限。
 
 ## 当前边界
 
-- 仅覆盖 Binance Spot；不包含 U 本位/币本位合约和杠杆账户。
+- USDⓈ-M 已覆盖行情、普通下单、测试下单、撤单、当前挂单、订单历史、成交历史、账户与手续费；OCO、OTO、OTOCO 仍为 Spot 专属功能。
+- 不包含 COIN-M、杠杆账户和持仓模式/杠杆倍数配置界面；永续下单沿用账户当前的持仓模式和杠杆设置。
 - 没有数据库持久化、跨进程审计日志和多账户管理。
 - 未实现 SOR、OPO/OPOCO、批量订单、FIX/SBE 等专业接口。
 - 页面提供 OCO/OTO/OTOCO 常用参数组合；更复杂的追踪止损、冰山及挂钩价格参数仍需扩展表单。

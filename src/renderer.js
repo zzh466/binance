@@ -808,7 +808,6 @@ const elements = {
   marketStatus: document.querySelector("#marketStatus"),
   timeOffset: document.querySelector("#timeOffset"),
   depthConfig: document.querySelector("#depthConfig"),
-  overviewSymbol: document.querySelector("#overviewSymbol"),
   klineInterval: document.querySelector("#klineInterval"),
   overviewStatus: document.querySelector("#overviewStatus"),
   overviewLastPrice: document.querySelector("#overviewLastPrice"),
@@ -819,22 +818,21 @@ const elements = {
   filterRulesBody: document.querySelector("#filterRulesBody"),
   klineBody: document.querySelector("#klineBody"),
   publicTradesBody: document.querySelector("#publicTradesBody"),
-  openOrdersSymbol: document.querySelector("#openOrdersSymbol"),
   openOrdersStatus: document.querySelector("#openOrdersStatus"),
   openOrdersBody: document.querySelector("#openOrdersBody"),
-  queryOrderSymbol: document.querySelector("#queryOrderSymbol"),
   queryOrderId: document.querySelector("#queryOrderId"),
   amendOrderQty: document.querySelector("#amendOrderQty"),
   replaceOrderPrice: document.querySelector("#replaceOrderPrice"),
   queryOrderStatus: document.querySelector("#queryOrderStatus"),
   queryOrderBody: document.querySelector("#queryOrderBody"),
-  marketSymbol: document.querySelector("#marketSymbol"),
+  chartSymbolInput: document.querySelector("#chartSymbolInput"),
+  switchChartSymbolButton: document.querySelector("#switchChartSymbolButton"),
+  chartSymbolSwitchStatus: document.querySelector("#chartSymbolSwitchStatus"),
   lastUpdateId: document.querySelector("#lastUpdateId"),
   receivedAt: document.querySelector("#receivedAt"),
   spread: document.querySelector("#spread"),
   bidRows: document.querySelector("#bidRows"),
   askRows: document.querySelector("#askRows"),
-  orderSymbol: document.querySelector("#orderSymbol"),
   side: document.querySelector("#side"),
   orderType: document.querySelector("#orderType"),
   quantity: document.querySelector("#quantity"),
@@ -844,15 +842,12 @@ const elements = {
   stopPrice: document.querySelector("#stopPrice"),
   trailingDelta: document.querySelector("#trailingDelta"),
   icebergQty: document.querySelector("#icebergQty"),
-  cancelSymbol: document.querySelector("#cancelSymbol"),
   orderId: document.querySelector("#orderId"),
-  orderHistorySymbol: document.querySelector("#orderHistorySymbol"),
   refreshOrderHistoryButton: document.querySelector(
     "#refreshOrderHistoryButton"
   ),
   orderHistoryStatus: document.querySelector("#orderHistoryStatus"),
   orderHistoryBody: document.querySelector("#orderHistoryBody"),
-  tradeHistorySymbol: document.querySelector("#tradeHistorySymbol"),
   refreshTradeHistoryButton: document.querySelector(
     "#refreshTradeHistoryButton"
   ),
@@ -867,10 +862,8 @@ const elements = {
   accountPermissions: document.querySelector("#accountPermissions"),
   accountUpdateTime: document.querySelector("#accountUpdateTime"),
   accountBalancesBody: document.querySelector("#accountBalancesBody"),
-  commissionSymbol: document.querySelector("#commissionSymbol"),
   riskStatus: document.querySelector("#riskStatus"),
   riskBody: document.querySelector("#riskBody"),
-  ocoSymbol: document.querySelector("#ocoSymbol"),
   ocoSide: document.querySelector("#ocoSide"),
   ocoQuantity: document.querySelector("#ocoQuantity"),
   ocoWorkingPrice: document.querySelector("#ocoWorkingPrice"),
@@ -1137,7 +1130,9 @@ function renderExchangeInfo(result) {
 function renderMarketOverview(data) {
   elements.overviewLastPrice.textContent = data.price?.price ?? "-";
   elements.overviewBookTicker.textContent = `${data.bookTicker?.bidPrice ?? "-"} / ${data.bookTicker?.askPrice ?? "-"}`;
-  elements.overviewAveragePrice.textContent = `${data.averagePrice?.price ?? "-"}（${data.averagePrice?.mins ?? "-"} 分钟）`;
+  elements.overviewAveragePrice.textContent = data.averagePrice?.label
+    ? `${data.averagePrice?.price ?? "-"}（${data.averagePrice.label}）`
+    : `${data.averagePrice?.price ?? "-"}（${data.averagePrice?.mins ?? "-"} 分钟）`;
   elements.overviewChange.textContent = `${data.ticker24hr?.priceChange ?? "-"} / ${data.ticker24hr?.priceChangePercent ?? "-"}%`;
   elements.overviewHighLow.textContent = `${data.ticker24hr?.highPrice ?? "-"} / ${data.ticker24hr?.lowPrice ?? "-"}`;
 
@@ -1232,10 +1227,20 @@ function prependUserDataEvent(payload) {
   }
 }
 
+function getSelectedSymbol() {
+  const symbol = elements.chartSymbolInput.value.trim().toUpperCase();
+  elements.chartSymbolInput.value = symbol;
+  return symbol;
+}
+
+function getMarketLabel(marketType) {
+  return marketType === "futures" ? "USDⓈ-M" : "Spot";
+}
+
 function readOrderForm() {
   const type = elements.orderType.value;
   return {
-    symbol: elements.orderSymbol.value.trim(),
+    symbol: getSelectedSymbol(),
     side: elements.side.value,
     type,
     quantity: elements.quantity.value.trim(),
@@ -1260,41 +1265,34 @@ async function loadStatus() {
   activeEnvironmentTestnet = Boolean(status.testnet);
   elements.environmentSwitch.checked = !activeEnvironmentTestnet;
   elements.environmentSwitchStatus.textContent = activeEnvironmentTestnet
-    ? "当前：Spot Testnet"
-    : "当前：Spot Production（真实资产）";
+    ? "当前：Binance Testnet"
+    : "当前：Binance Production（真实资产）";
   elements.environmentWarning.classList.toggle(
     "production",
     !activeEnvironmentTestnet
   );
   elements.environmentWarning.textContent = activeEnvironmentTestnet
-    ? "当前连接 Binance Spot Testnet。后台使用 REST 快照与 WebSocket 增量事件维护本地订单簿。"
-    : "当前连接 Binance Spot 正式环境：报单和撤单会影响真实资产，请确认交易对、价格和数量。";
+    ? "当前连接 Binance Testnet。输入合约后，后台自动识别 Spot 或 USDⓈ-M，并选择对应接口。"
+    : "当前连接 Binance 正式环境：后台会自动选择 Spot 或 USDⓈ-M；报单和撤单会影响真实资产，请确认合约、价格和数量。";
   elements.environment.textContent = status.testnet
-    ? "Spot Testnet"
-    : "Spot Production";
-  elements.tradingEnvironment.textContent = status.tradingRestBase.includes(
-    "testnet"
-  )
-    ? "Spot Testnet（下单/撤单）"
-    : "Spot Production（下单/撤单）";
-  elements.orderHistoryEnvironment.textContent = status.tradingWsApiBase.includes(
-    "testnet"
-  )
-    ? "Spot Testnet（allOrders）"
-    : "Spot Production（allOrders）";
-  elements.tradeHistoryEnvironment.textContent = status.wsApiBase.includes(
-    "testnet"
-  )
-    ? "Spot Testnet（myTrades）"
-    : "Spot Production（myTrades）";
-  elements.accountEnvironment.textContent = status.wsApiBase.includes(
-    "testnet"
-  )
-    ? "Spot Testnet（account.status）"
-    : "Spot Production（account.status）";
+    ? "Binance Testnet"
+    : "Binance Production";
+  elements.tradingEnvironment.textContent = "按全局合约自动路由";
+  elements.orderHistoryEnvironment.textContent = "按全局合约自动路由";
+  elements.tradeHistoryEnvironment.textContent = "按全局合约自动路由";
+  elements.accountEnvironment.textContent = "按全局合约自动路由";
+  const spotCredentialsReady = Boolean(
+    status.markets?.spot?.hasApiKey && status.markets?.spot?.hasApiSecret
+  );
+  const futuresCredentialsReady = Boolean(
+    status.markets?.futures?.hasApiKey && status.markets?.futures?.hasApiSecret
+  );
   elements.credentials.textContent =
-    status.hasApiKey && status.hasApiSecret ? "已配置" : "未配置";
-  elements.timeOffset.textContent = `${status.serverTimeOffsetMs} ms`;
+    `Spot ${spotCredentialsReady ? "已配置" : "未配置"} / ` +
+    `USDⓈ-M ${futuresCredentialsReady ? "已配置" : "未配置"}`;
+  elements.timeOffset.textContent =
+    `Spot ${status.markets?.spot?.serverTimeOffsetMs ?? 0} ms / ` +
+    `USDⓈ-M ${status.markets?.futures?.serverTimeOffsetMs ?? 0} ms`;
   elements.depthConfig.textContent =
     `${status.depthSpeed} / 快照 ${status.depthSnapshotLimit} 档 / 显示 ${status.depthDisplayLevels} 档`;
 }
@@ -1306,7 +1304,7 @@ elements.environmentSwitch.addEventListener("change", async () => {
   if (
     !targetTestnet &&
     !window.confirm(
-      "确定切换到 Binance Spot 正式环境吗？正式环境的报单和撤单会影响真实资产。"
+      "确定切换到 Binance 正式环境吗？程序会自动选择 Spot 或 USDⓈ-M，报单和撤单会影响真实资产。"
     )
   ) {
     elements.environmentSwitch.checked = !activeEnvironmentTestnet;
@@ -1347,16 +1345,17 @@ elements.environmentSwitch.addEventListener("change", async () => {
 document
   .querySelector("#syncTimeButton")
   .addEventListener("click", async () => {
-    const result = await window.binance.syncTime();
+    const result = await window.binance.syncTime({ symbol: getSelectedSymbol() });
     printResult("服务器时间同步", result);
 
     if (result.ok) {
-      elements.timeOffset.textContent = `${result.data.offsetMs} ms`;
+      elements.timeOffset.textContent =
+        `${getMarketLabel(result.data.marketType)} ${result.data.offsetMs} ms`;
     }
   });
 
 document.querySelector("#pingButton").addEventListener("click", async () => {
-  const result = await window.binance.ping();
+  const result = await window.binance.ping({ symbol: getSelectedSymbol() });
   printResult("Binance 连通性测试", result);
   elements.overviewStatus.textContent = result.ok ? "连接正常" : formatError(result);
 });
@@ -1364,7 +1363,7 @@ document.querySelector("#pingButton").addEventListener("click", async () => {
 document.querySelector("#refreshRulesButton").addEventListener("click", async () => {
   elements.overviewStatus.textContent = "加载交易规则中…";
   const result = await window.binance.exchangeInfo({
-    symbol: elements.overviewSymbol.value.trim(), forceRefresh: true,
+    symbol: getSelectedSymbol(), forceRefresh: true,
   });
   printResult("交易规则结果", result);
   elements.overviewStatus.textContent = result.ok ? "交易规则已加载" : formatError(result);
@@ -1374,7 +1373,7 @@ document.querySelector("#refreshRulesButton").addEventListener("click", async ()
 document.querySelector("#refreshOverviewButton").addEventListener("click", async () => {
   elements.overviewStatus.textContent = "加载行情中…";
   const result = await window.binance.marketOverview({
-    symbol: elements.overviewSymbol.value.trim(),
+    symbol: getSelectedSymbol(),
     interval: elements.klineInterval.value,
     limit: 50,
   });
@@ -1385,7 +1384,7 @@ document.querySelector("#refreshOverviewButton").addEventListener("click", async
 
 document.querySelector("#refreshOpenOrdersButton").addEventListener("click", async () => {
   elements.openOrdersStatus.textContent = "加载中…";
-  const result = await refreshTrackedOpenOrders(elements.openOrdersSymbol.value);
+  const result = await refreshTrackedOpenOrders(getSelectedSymbol());
   printResult("当前挂单结果", result);
   if (result.ok) {
     elements.openOrdersStatus.textContent = `当前挂单 ${result.data?.length || 0} 条`;
@@ -1393,7 +1392,7 @@ document.querySelector("#refreshOpenOrdersButton").addEventListener("click", asy
 });
 
 document.querySelector("#cancelAllOpenOrdersButton").addEventListener("click", async () => {
-  const symbol = elements.openOrdersSymbol.value.trim();
+  const symbol = getSelectedSymbol();
   if (!window.confirm(`确定撤销 ${symbol} 的全部当前挂单吗？`)) return;
   const result = await window.binance.cancelAllOpenOrders({ symbol });
   printResult("撤销全部挂单结果", result);
@@ -1405,7 +1404,7 @@ document.querySelector("#cancelAllOpenOrdersButton").addEventListener("click", a
 
 document.querySelector("#queryOrderButton").addEventListener("click", async () => {
   const result = await window.binance.queryOrder({
-    symbol: elements.queryOrderSymbol.value.trim(), orderId: elements.queryOrderId.value.trim(),
+    symbol: getSelectedSymbol(), orderId: elements.queryOrderId.value.trim(),
   });
   printResult("单笔订单结果", result);
   elements.queryOrderStatus.textContent = result.ok ? `状态：${result.data.status}` : formatError(result);
@@ -1414,7 +1413,7 @@ document.querySelector("#queryOrderButton").addEventListener("click", async () =
 
 document.querySelector("#amendOrderButton").addEventListener("click", async () => {
   const result = await window.binance.amendOrder({
-    symbol: elements.queryOrderSymbol.value.trim(), orderId: elements.queryOrderId.value.trim(),
+    symbol: getSelectedSymbol(), orderId: elements.queryOrderId.value.trim(),
     newQty: elements.amendOrderQty.value.trim(),
   });
   printResult("减量改单结果", result);
@@ -1423,7 +1422,7 @@ document.querySelector("#amendOrderButton").addEventListener("click", async () =
 
 document.querySelector("#cancelReplaceButton").addEventListener("click", async () => {
   const current = await window.binance.queryOrder({
-    symbol: elements.queryOrderSymbol.value.trim(), orderId: elements.queryOrderId.value.trim(),
+    symbol: getSelectedSymbol(), orderId: elements.queryOrderId.value.trim(),
   });
   if (!current.ok) {
     printResult("撤单重报前查询失败", current);
@@ -1440,24 +1439,73 @@ document.querySelector("#cancelReplaceButton").addEventListener("click", async (
   elements.queryOrderStatus.textContent = result.ok ? "撤单重报完成" : formatError(result);
 });
 
-document
-  .querySelector("#connectMarketButton")
-  .addEventListener("click", async () => {
-    const symbol = elements.marketSymbol.value.trim().toUpperCase();
-    elements.orderSymbol.value = symbol;
-    elements.cancelSymbol.value = symbol;
-    elements.orderHistorySymbol.value = symbol;
-    elements.tradeHistorySymbol.value = symbol;
-    elements.overviewSymbol.value = symbol;
-    elements.openOrdersSymbol.value = symbol;
-    elements.queryOrderSymbol.value = symbol;
-    elements.commissionSymbol.value = symbol;
-    elements.ocoSymbol.value = symbol;
+function synchronizeSymbolInput(symbol) {
+  elements.chartSymbolInput.value = symbol;
+}
 
+async function connectMarketSymbol(rawSymbol, { showResult = true } = {}) {
+  const symbol = String(rawSymbol || "").trim().toUpperCase();
+  if (!/^[A-Z0-9]{5,24}$/.test(symbol)) {
+    const result = {
+      ok: false,
+      error: { message: "请输入有效的 Binance 交易对，例如 BTCUSDT。" },
+    };
+    elements.chartSymbolSwitchStatus.textContent = result.error.message;
+    if (showResult) printResult("切换行情失败", result);
+    return result;
+  }
+
+  elements.chartSymbolInput.value = symbol;
+  elements.switchChartSymbolButton.disabled = true;
+  elements.chartSymbolSwitchStatus.textContent = `正在验证：${symbol}`;
+
+  try {
+    const validation = await window.binance.exchangeInfo({ symbol });
+    if (!validation.ok) {
+      elements.chartSymbolSwitchStatus.textContent = formatError(validation);
+      if (showResult) printResult("切换行情失败", validation);
+      return validation;
+    }
+
+    synchronizeSymbolInput(symbol);
+    const marketLabel = getMarketLabel(validation.data?.marketType);
+    elements.chartSymbolSwitchStatus.textContent =
+      `正在连接：${symbol} / ${marketLabel}`;
+    elements.marketStatus.textContent = `connecting / ${symbol}`;
     const result = await window.binance.connectDepth(symbol);
-    printResult("连接增量深度请求", result);
-    if (result.ok) await refreshTrackedOpenOrders(symbol);
-  });
+    if (showResult) printResult("切换行情请求", result);
+    if (!result.ok) {
+      elements.chartSymbolSwitchStatus.textContent = formatError(result);
+      return result;
+    }
+
+    elements.chartSymbolSwitchStatus.textContent =
+      `连接中：${symbol} / ${marketLabel}`;
+    refreshTrackedOpenOrders(symbol).catch((error) => {
+      printResult("切换行情后同步挂单失败", {
+        ok: false,
+        error: { name: error.name, message: error.message },
+      });
+    });
+    return result;
+  } finally {
+    elements.switchChartSymbolButton.disabled = false;
+  }
+}
+
+document.querySelector("#connectMarketButton").addEventListener("click", () => {
+  connectMarketSymbol(getSelectedSymbol());
+});
+
+elements.switchChartSymbolButton.addEventListener("click", () => {
+  connectMarketSymbol(elements.chartSymbolInput.value);
+});
+
+elements.chartSymbolInput.addEventListener("keydown", (event) => {
+  if (event.key !== "Enter") return;
+  event.preventDefault();
+  connectMarketSymbol(elements.chartSymbolInput.value);
+});
 
 document
   .querySelector("#disconnectMarketButton")
@@ -1477,8 +1525,6 @@ document
     if (result.ok && result.data.orderId !== undefined) {
       elements.orderId.value = String(result.data.orderId);
       elements.queryOrderId.value = String(result.data.orderId);
-      elements.cancelSymbol.value = result.data.symbol;
-      elements.queryOrderSymbol.value = result.data.symbol;
       applyConfirmedOrderResponse(result.data, submittedAt);
     }
   });
@@ -1492,7 +1538,7 @@ document
   .querySelector("#cancelOrderButton")
   .addEventListener("click", async () => {
     const request = {
-      symbol: elements.cancelSymbol.value.trim(),
+      symbol: getSelectedSymbol(),
       orderId: elements.orderId.value.trim(),
     };
     const result = await window.binance.cancelOrder(request);
@@ -1529,7 +1575,7 @@ async function refreshOrderHistory(symbol, { showResult = true } = {}) {
 }
 
 elements.refreshOrderHistoryButton.addEventListener("click", () => {
-  refreshOrderHistory(elements.orderHistorySymbol.value.trim());
+  refreshOrderHistory(getSelectedSymbol());
 });
 
 async function refreshTradeHistory(symbol, { showResult = true } = {}) {
@@ -1560,7 +1606,7 @@ async function refreshTradeHistory(symbol, { showResult = true } = {}) {
 }
 
 elements.refreshTradeHistoryButton.addEventListener("click", () => {
-  refreshTradeHistory(elements.tradeHistorySymbol.value.trim());
+  refreshTradeHistory(getSelectedSymbol());
 });
 
 elements.refreshAccountButton.addEventListener("click", async () => {
@@ -1569,6 +1615,7 @@ elements.refreshAccountButton.addEventListener("click", async () => {
 
   try {
     const result = await window.binance.accountStatus({
+      symbol: getSelectedSymbol(),
       omitZeroBalances: true,
     });
     printResult("账户信息结果", result);
@@ -1596,7 +1643,7 @@ elements.refreshAccountButton.addEventListener("click", async () => {
 document.querySelector("#refreshCommissionButton").addEventListener("click", async () => {
   elements.riskStatus.textContent = "加载手续费率中…";
   const result = await window.binance.accountCommission({
-    symbol: elements.commissionSymbol.value.trim(),
+    symbol: getSelectedSymbol(),
   });
   printResult("账户手续费率结果", result);
   if (!result.ok) {
@@ -1614,7 +1661,9 @@ document.querySelector("#refreshCommissionButton").addEventListener("click", asy
 
 document.querySelector("#refreshRateLimitsButton").addEventListener("click", async () => {
   elements.riskStatus.textContent = "加载下单限频中…";
-  const result = await window.binance.accountRateLimits();
+  const result = await window.binance.accountRateLimits({
+    symbol: getSelectedSymbol(),
+  });
   printResult("账户下单限频结果", result);
   if (!result.ok) {
     elements.riskStatus.textContent = formatError(result);
@@ -1628,7 +1677,7 @@ document.querySelector("#refreshRateLimitsButton").addEventListener("click", asy
 
 function readOcoForm() {
   return {
-    symbol: elements.ocoSymbol.value.trim(), side: elements.ocoSide.value,
+    symbol: getSelectedSymbol(), side: elements.ocoSide.value,
     quantity: elements.ocoQuantity.value.trim(), workingPrice: elements.ocoWorkingPrice.value.trim(),
     abovePrice: elements.ocoAbovePrice.value.trim(), aboveStopPrice: elements.ocoAboveStopPrice.value.trim(),
     belowPrice: elements.ocoBelowPrice.value.trim(), belowStopPrice: elements.ocoBelowStopPrice.value.trim(),
@@ -1686,21 +1735,27 @@ document.querySelector("#placeOtocoButton").addEventListener("click", async () =
 });
 
 document.querySelector("#refreshAllOrderListsButton").addEventListener("click", async () => {
-  const result = await window.binance.allOrderLists({ limit: 100 });
+  const result = await window.binance.allOrderLists({
+    symbol: getSelectedSymbol(), limit: 100,
+  });
   printResult("组合订单历史结果", result);
   elements.orderListsStatus.textContent = result.ok ? `已加载 ${result.data?.length || 0} 条` : formatError(result);
   if (result.ok) renderOrderLists(result.data);
 });
 
 document.querySelector("#refreshOpenOrderListsButton").addEventListener("click", async () => {
-  const result = await window.binance.openOrderLists();
+  const result = await window.binance.openOrderLists({
+    symbol: getSelectedSymbol(),
+  });
   printResult("当前组合挂单结果", result);
   elements.orderListsStatus.textContent = result.ok ? `当前组合挂单 ${result.data?.length || 0} 条` : formatError(result);
   if (result.ok) renderOrderLists(result.data);
 });
 
 document.querySelector("#queryOrderListButton").addEventListener("click", async () => {
-  const result = await window.binance.queryOrderList({ orderListId: elements.orderListId.value.trim() });
+  const result = await window.binance.queryOrderList({
+    symbol: getSelectedSymbol(), orderListId: elements.orderListId.value.trim(),
+  });
   printResult("组合订单查询结果", result);
   elements.orderListsStatus.textContent = result.ok ? "组合订单已加载" : formatError(result);
   if (result.ok) renderOrderLists(result.data);
@@ -1709,7 +1764,7 @@ document.querySelector("#queryOrderListButton").addEventListener("click", async 
 document.querySelector("#cancelOrderListButton").addEventListener("click", async () => {
   if (!window.confirm(`确定撤销组合订单 ${elements.orderListId.value.trim()} 吗？`)) return;
   const result = await window.binance.cancelOrderList({
-    symbol: elements.ocoSymbol.value.trim(), orderListId: elements.orderListId.value.trim(),
+    symbol: getSelectedSymbol(), orderListId: elements.orderListId.value.trim(),
   });
   printResult("撤销组合订单结果", result);
   elements.orderListsStatus.textContent = result.ok ? "组合订单已撤销" : formatError(result);
@@ -1718,7 +1773,9 @@ document.querySelector("#cancelOrderListButton").addEventListener("click", async
 
 document.querySelector("#connectUserDataButton").addEventListener("click", async () => {
   elements.userDataStatus.textContent = "连接中…";
-  const result = await window.binance.connectUserData();
+  const result = await window.binance.connectUserData({
+    symbol: getSelectedSymbol(),
+  });
   printResult("连接实时账户事件", result);
   elements.userDataStatus.textContent = result.ok
     ? `已连接 / subscriptionId=${result.data.subscriptionId}`
@@ -1762,34 +1819,404 @@ const chart = new Chart(chartDom,980, 300, 0.01,{
     calcBarType: 2
 
 });
-let resizeTimeout;
-window.onresize =(e)=>{
-    
-    let {innerWidth} =e.target;
-    const width = innerWidth - 80;
-    chartDom.width = width;
-    chartDom.style.width = width + 'px';
-    clearTimeout(resizeTimeout);
-    resizeTimeout = setTimeout(()=> {
-        chart.resize(  innerWidth - 80, 300);
-        if(chart.arg){
-            this.chart.render(chart.arg)
-        }      
-    }, 500)
+const SHORTCUT_STORAGE_KEY = "binanceShortcutSettingsV2";
+const LEGACY_SHORTCUT_STORAGE_KEY = "binanceShortcutSettingsV1";
+const COLORBLIND_STORAGE_KEY = "binanceColorblindModeV1";
+const shortcutApi = window.ShortcutSettings;
+const shortcutDialog = document.querySelector("#shortcutDialog");
+const shortcutEditorDialog = document.querySelector("#shortcutEditorDialog");
+const shortcutEditorForm = document.querySelector("#shortcutEditorForm");
+const shortcutEditorTitle = document.querySelector("#shortcutEditorTitle");
+const shortcutEditorFields = {
+  key: document.querySelector("#shortcutEditorKey"),
+  action: document.querySelector("#shortcutEditorAction"),
+  direction: document.querySelector("#shortcutEditorDirection"),
+  priceOffset: document.querySelector("#shortcutEditorPriceOffset"),
+  quantity: document.querySelector("#shortcutEditorQuantity"),
+};
+let shortcutSettings = shortcutApi.cloneDefaults();
+let editingShortcutId = null;
+let shortcutEditorMode = "edit";
+let colorblindMode = loadBooleanSetting(COLORBLIND_STORAGE_KEY);
+
+function loadBooleanSetting(key) {
+  try {
+    return localStorage.getItem(key) === "true";
+  } catch {
+    return false;
   }
+}
+
+function loadLegacyShortcutSettings() {
+  try {
+    const storedText = localStorage.getItem(SHORTCUT_STORAGE_KEY);
+    if (storedText !== null) {
+      const result = shortcutApi.validate(JSON.parse(storedText));
+      if (result.valid) return result.settings;
+    }
+
+    const legacyText = localStorage.getItem(LEGACY_SHORTCUT_STORAGE_KEY);
+    const legacySettings = legacyText ? JSON.parse(legacyText) : null;
+    const migrated = shortcutApi.validate(
+      shortcutApi.migrateLegacySettings(legacySettings)
+    );
+    if (migrated.valid) return migrated.settings;
+  } catch {
+    // 旧版 localStorage 无效时由主进程创建默认 JSON 配置。
+  }
+  return null;
+}
+
+async function initializeShortcutSettings() {
+  const result = await window.binance.loadShortcutSettings(
+    loadLegacyShortcutSettings()
+  );
+  if (!result.ok) {
+    shortcutSettings = shortcutApi.cloneDefaults();
+    updateShortcutSummary();
+    printResult("读取快捷键配置失败", result);
+    return;
+  }
+
+  shortcutSettings = result.data.settings;
+  updateShortcutSummary();
+}
+
+async function saveShortcutSettings(settings) {
+  const result = await window.binance.saveShortcutSettings(settings);
+  if (!result.ok) {
+    printResult("保存快捷键配置失败", result);
+    return null;
+  }
+  return result.data.settings;
+}
+
+function updateShortcutSummary() {
+  const descriptions = shortcutSettings.map((shortcut) => {
+    const key = shortcutApi.getKeyLabel(shortcut.key);
+    if (shortcut.action === shortcutApi.ACTION_CANCEL_ALL) {
+      return `${key} = 撤销全部未成交订单`;
+    }
+    return [
+      `${key} = 下${shortcutApi.getDirectionLabel(shortcut.direction)}单`,
+      `超价 ${shortcutApi.formatPriceOffset(shortcut.priceOffset)}`,
+      `手数 ${shortcut.quantity}`,
+    ].join(" / ");
+  });
+  document.querySelector("#shortcutSummary").textContent =
+    descriptions.length ? `快捷键：${descriptions.join("，")}。` : "快捷键：当前没有已启用规则。";
+}
+
+function appendShortcutCell(row, value) {
+  const cell = document.createElement("td");
+  cell.textContent = value;
+  row.append(cell);
+  return cell;
+}
+
+function renderShortcutTable() {
+  const body = document.querySelector("#shortcutTableBody");
+  body.replaceChildren();
+  if (!shortcutSettings.length) {
+    const row = document.createElement("tr");
+    const cell = appendShortcutCell(row, "当前没有快捷键，点击“恢复默认”可重新创建默认规则。");
+    cell.colSpan = 6;
+    cell.className = "shortcut-empty";
+    body.append(row);
+    return;
+  }
+
+  for (const shortcut of shortcutSettings) {
+    const isOrder = shortcut.action === shortcutApi.ACTION_ORDER;
+    const row = document.createElement("tr");
+    appendShortcutCell(row, shortcutApi.getKeyLabel(shortcut.key));
+    appendShortcutCell(row, shortcutApi.getActionLabel(shortcut.action));
+    appendShortcutCell(
+      row,
+      isOrder ? shortcutApi.getDirectionLabel(shortcut.direction) : "-"
+    );
+    appendShortcutCell(
+      row,
+      isOrder ? shortcutApi.formatPriceOffset(shortcut.priceOffset) : "-"
+    );
+    appendShortcutCell(row, isOrder ? shortcut.quantity : "-");
+
+    const operationCell = document.createElement("td");
+    operationCell.className = "shortcut-operation";
+    const editButton = document.createElement("button");
+    editButton.type = "button";
+    editButton.textContent = "编辑";
+    editButton.addEventListener("click", () => openShortcutEditor(shortcut.id));
+    const deleteButton = document.createElement("button");
+    deleteButton.type = "button";
+    deleteButton.className = "danger";
+    deleteButton.textContent = "删除";
+    deleteButton.addEventListener("click", () => deleteShortcut(shortcut.id));
+    operationCell.append(editButton, deleteButton);
+    row.append(operationCell);
+    body.append(row);
+  }
+}
+
+function updateShortcutEditorFields() {
+  const isOrder =
+    shortcutEditorFields.action.value === shortcutApi.ACTION_ORDER;
+  shortcutEditorFields.direction.disabled = !isOrder;
+  shortcutEditorFields.priceOffset.disabled = !isOrder;
+  shortcutEditorFields.quantity.disabled = !isOrder;
+}
+
+function populateShortcutEditor(shortcut) {
+  shortcutEditorFields.key.value = shortcut.key;
+  shortcutEditorFields.action.value = shortcut.action;
+  shortcutEditorFields.direction.value =
+    shortcut.direction || shortcutApi.DIRECTION_SHORT;
+  shortcutEditorFields.priceOffset.value = shortcut.priceOffset ?? "";
+  shortcutEditorFields.quantity.value = shortcut.quantity || "";
+  document.querySelector("#shortcutEditorError").textContent = "";
+  updateShortcutEditorFields();
+}
+
+function openShortcutCreator() {
+  const usedKeys = new Set(shortcutSettings.map(({ key }) => key));
+  const availableKey = shortcutApi.AVAILABLE_KEYS.find(
+    ({ code }) => !usedKeys.has(code)
+  );
+  if (!availableKey) {
+    window.alert("小键盘 0–9 均已配置，请先删除或修改一个现有快捷键。");
+    return;
+  }
+
+  shortcutEditorMode = "create";
+  editingShortcutId = null;
+  shortcutEditorTitle.textContent = "快捷键新增窗口";
+  populateShortcutEditor({
+    key: availableKey.code,
+    action: shortcutApi.ACTION_ORDER,
+    direction: shortcutApi.DIRECTION_SHORT,
+    priceOffset: 0.1,
+    quantity: "0.001",
+  });
+  shortcutEditorDialog.showModal();
+}
+
+function openShortcutEditor(shortcutId) {
+  const shortcut = shortcutSettings.find(({ id }) => id === shortcutId);
+  if (!shortcut) return;
+  shortcutEditorMode = "edit";
+  editingShortcutId = shortcutId;
+  shortcutEditorTitle.textContent = "快捷键编辑窗口";
+  populateShortcutEditor(shortcut);
+  shortcutEditorDialog.showModal();
+}
+
+async function deleteShortcut(shortcutId) {
+  const deleted = shortcutSettings.find(({ id }) => id === shortcutId);
+  const candidate = shortcutSettings.filter(({ id }) => id !== shortcutId);
+  const savedSettings = await saveShortcutSettings(candidate);
+  if (!savedSettings) return;
+  shortcutSettings = savedSettings;
+  renderShortcutTable();
+  updateShortcutSummary();
+  printResult("快捷键已删除", {
+    ok: true,
+    data: deleted
+      ? { shortcut: shortcutApi.getKeyLabel(deleted.key) }
+      : { shortcutId },
+  });
+}
+
+function closeTitleMenus(except = null) {
+  for (const menu of document.querySelectorAll("[data-title-menu]")) {
+    if (menu !== except) menu.open = false;
+  }
+}
+
+for (const { code, label } of shortcutApi.AVAILABLE_KEYS) {
+  const option = document.createElement("option");
+  option.value = code;
+  option.textContent = label;
+  shortcutEditorFields.key.append(option);
+}
+
+for (const menu of document.querySelectorAll("[data-title-menu]")) {
+  menu.addEventListener("toggle", () => {
+    if (menu.open) closeTitleMenus(menu);
+  });
+}
+
+document.addEventListener("pointerdown", (event) => {
+  if (!event.target.closest("[data-title-menu]")) closeTitleMenus();
+});
+
+document.querySelector("#openThreeInstancesMenuItem").addEventListener("click", async () => {
+  closeTitleMenus();
+  const result = await window.binance.openAdditionalInstances(2);
+  printResult("打开另外两份程序", result);
+});
+
+document.querySelector("#reloadMenuItem").addEventListener("click", () => {
+  closeTitleMenus();
+  window.location.reload();
+});
+
+document.querySelector("#aboutMenuItem").addEventListener("click", () => {
+  closeTitleMenus();
+  window.alert("Binance 统一交易测试台\n支持自动识别 Spot / USDⓈ-M、Testnet / 正式环境、行情展示和快捷交易。" );
+});
+
+document.querySelector("#shortcutMenuItem").addEventListener("click", () => {
+  closeTitleMenus();
+  renderShortcutTable();
+  shortcutDialog.showModal();
+});
+
+document.querySelector("#addShortcutButton").addEventListener("click", () => {
+  openShortcutCreator();
+});
+
+document.querySelector("#contractReminderMenuItem").addEventListener("click", () => {
+  closeTitleMenus();
+  window.alert("“提醒合约参数”配置入口已建立，具体提醒参数可在后续继续补充。" );
+});
+
+document.querySelector("#resetShortcutsButton").addEventListener("click", async () => {
+  const savedSettings = await saveShortcutSettings(shortcutApi.cloneDefaults());
+  if (!savedSettings) return;
+  shortcutSettings = savedSettings;
+  renderShortcutTable();
+  updateShortcutSummary();
+  printResult("快捷键已恢复默认", { ok: true, data: shortcutSettings });
+});
+
+document.querySelector("#closeShortcutsButton").addEventListener("click", () => {
+  shortcutDialog.close();
+});
+
+shortcutEditorFields.action.addEventListener("change", updateShortcutEditorFields);
+
+document.querySelector("#cancelShortcutEditorButton").addEventListener("click", () => {
+  shortcutEditorDialog.close();
+});
+
+shortcutEditorForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const isCreating = shortcutEditorMode === "create";
+  const existing = isCreating
+    ? null
+    : shortcutSettings.find(({ id }) => id === editingShortcutId);
+  if (!isCreating && !existing) {
+    shortcutEditorDialog.close();
+    return;
+  }
+
+  const action = shortcutEditorFields.action.value;
+  const priceOffsetText = shortcutEditorFields.priceOffset.value.trim();
+  let createdId = `shortcut-${Date.now()}`;
+  let suffix = 1;
+  while (shortcutSettings.some(({ id }) => id === createdId)) {
+    createdId = `shortcut-${Date.now()}-${suffix}`;
+    suffix += 1;
+  }
+  const edited = {
+    ...(existing || { id: createdId }),
+    key: shortcutEditorFields.key.value,
+    action,
+    direction: action === shortcutApi.ACTION_ORDER
+      ? shortcutEditorFields.direction.value
+      : "",
+    priceOffset: action === shortcutApi.ACTION_ORDER
+      ? (priceOffsetText === "" ? Number.NaN : Number(priceOffsetText))
+      : null,
+    quantity: action === shortcutApi.ACTION_ORDER
+      ? shortcutEditorFields.quantity.value.trim()
+      : "",
+  };
+  const candidate = isCreating
+    ? [...shortcutSettings, edited]
+    : shortcutSettings.map((shortcut) =>
+      shortcut.id === editingShortcutId ? edited : shortcut
+    );
+  const result = shortcutApi.validate(candidate);
+  if (!result.valid) {
+    document.querySelector("#shortcutEditorError").textContent =
+      result.errors.join(" ");
+    return;
+  }
+
+  const savedSettings = await saveShortcutSettings(result.settings);
+  if (!savedSettings) return;
+  shortcutSettings = savedSettings;
+  const savedShortcut = shortcutSettings.find(({ id }) => id === edited.id);
+  renderShortcutTable();
+  updateShortcutSummary();
+  shortcutEditorDialog.close();
+  printResult(isCreating ? "快捷键已新增" : "快捷键设置已保存", {
+    ok: true,
+    data: savedShortcut,
+  });
+});
+
+shortcutEditorDialog.addEventListener("close", () => {
+  editingShortcutId = null;
+  shortcutEditorMode = "edit";
+  shortcutEditorTitle.textContent = "快捷键编辑窗口";
+  document.querySelector("#shortcutEditorError").textContent = "";
+});
+
+function applyColorblindMode(enabled, { persist = true } = {}) {
+  colorblindMode = Boolean(enabled);
+  document.body.classList.toggle("colorblind-mode", colorblindMode);
+  const menuItem = document.querySelector("#colorblindMenuItem");
+  menuItem.setAttribute("aria-checked", String(colorblindMode));
+  document.querySelector("#colorblindMenuState").textContent =
+    colorblindMode ? "已开启" : "未开启";
+  chart.setColor(colorblindMode);
+  if (chart.args?.LastPrice && chart.data.length) chart.render(chart.args);
+
+  if (persist) {
+    try {
+      localStorage.setItem(COLORBLIND_STORAGE_KEY, String(colorblindMode));
+    } catch {
+      // 外观设置保存失败不影响当前会话。
+    }
+  }
+}
+
+document.querySelector("#colorblindMenuItem").addEventListener("click", () => {
+  closeTitleMenus();
+  applyColorblindMode(!colorblindMode);
+});
+
+updateShortcutSummary();
+applyColorblindMode(colorblindMode, { persist: false });
+let resizeTimeout;
+    window.onresize = (event) => {
+        const width = Math.max(240, event.target.innerWidth - 80);
+        chartDom.width = width;
+        chartDom.style.width = `${width}px`;
+        clearTimeout(resizeTimeout);
+        resizeTimeout = setTimeout(() => {
+            chart.resize(width, 300);
+            if (chart.args?.LastPrice && chart.data.length) {
+                chart.render(chart.args);
+            }
+        }, 200);
+    }
 let chartSymbol = null;
+let chartMarketType = null;
 const latestTradePrices = new Map();
 const openOrdersByKey = new Map();
 const executionReportStatusByClientId = new Map();
 let numpadOrderBusy = false;
 let executionReportRefreshTimer = null;
-let executionReportRefreshSymbol = null;
 
 function offsetTradePrice(price, offset) {
   const numericPrice = Number(price);
   if (!Number.isFinite(numericPrice)) return null;
   const decimals = Math.min(12, Math.max(
     (String(price).split(".")[1] || "").length,
+    (String(offset).split(".")[1] || "").length,
     1
   ));
   return (numericPrice + offset).toFixed(decimals);
@@ -1806,62 +2233,69 @@ function applyConfirmedOrderResponse(order, submittedAt) {
   applyOpenOrderUpdate(order);
 }
 
-async function placeOrderFromNumpad(side) {
-  const symbol = String(chartSymbol || elements.marketSymbol.value || "").toUpperCase();
+async function placeOrderFromNumpad(shortcut) {
+  const symbol = getSelectedSymbol();
   const latestPrice = latestTradePrices.get(symbol);
-  const offset = side === "SELL" ? 0.1 : -0.1;
-  const price = offsetTradePrice(latestPrice, offset);
+  const side = shortcut.direction === shortcutApi.DIRECTION_SHORT
+    ? "SELL"
+    : "BUY";
+  const price = offsetTradePrice(latestPrice, shortcut.priceOffset);
+  const shortcutLabel = shortcutApi.getKeyLabel(shortcut.key);
 
   if (!latestPrice || !price || Number(price) <= 0) {
-    printResult("小键盘报单失败", {
+    printResult(`${shortcutLabel} 快捷键报单失败`, {
       ok: false,
       error: { message: `${symbol || "当前交易对"} 尚未收到最新成交价。` },
     });
     return;
   }
 
-  elements.orderSymbol.value = symbol;
   elements.side.value = side;
   elements.orderType.value = "LIMIT";
-  elements.quantity.value = "0.001";
+  elements.quantity.value = shortcut.quantity;
   elements.price.value = price;
 
   const order = {
     symbol,
     side,
     type: "LIMIT",
-    quantity: "0.001",
+    quantity: shortcut.quantity,
     price,
     timeInForce: "GTC",
   };
   const submittedAt = Date.now();
   const result = await window.binance.placeOrder(order);
   printResult(
-    side === "SELL" ? "小键盘 1 报空单结果" : "小键盘 3 报多单结果",
+    `${shortcutLabel} 报${shortcutApi.getDirectionLabel(shortcut.direction)}单结果`,
     result
   );
 
   if (result.ok) {
     elements.orderId.value = String(result.data.orderId ?? "");
     elements.queryOrderId.value = String(result.data.orderId ?? "");
-    elements.cancelSymbol.value = result.data.symbol || symbol;
-    elements.queryOrderSymbol.value = result.data.symbol || symbol;
     applyConfirmedOrderResponse(result.data, submittedAt);
   }
 }
 
-async function cancelAllOpenOrdersFromNumpad() {
+async function cancelAllOpenOrdersFromNumpad(shortcut) {
+  const shortcutLabel = shortcutApi.getKeyLabel(shortcut.key);
   const openResult = await window.binance.openOrders({});
   if (!openResult.ok) {
-    printResult("小键盘 5 查询全部未成交订单失败", openResult);
+    printResult(`${shortcutLabel} 查询全部未成交订单失败`, openResult);
     return;
   }
 
-  const symbols = [...new Set(
-    (openResult.data || []).map((order) => String(order.symbol || "").toUpperCase()).filter(Boolean)
-  )];
-  if (!symbols.length) {
-    printResult("小键盘 5 撤销全部未成交订单", {
+  const targets = [...new Map(
+    (openResult.data || [])
+      .map((order) => ({
+        symbol: String(order.symbol || "").toUpperCase(),
+        marketType: order.marketType,
+      }))
+      .filter((target) => target.symbol)
+      .map((target) => [`${target.marketType || "auto"}:${target.symbol}`, target])
+  ).values()];
+  if (!targets.length) {
+    printResult(`${shortcutLabel} 撤销全部未成交订单`, {
       ok: true,
       data: { canceledOrderCount: 0, symbols: [] },
     });
@@ -1869,19 +2303,19 @@ async function cancelAllOpenOrdersFromNumpad() {
   }
 
   const cancellations = [];
-  for (const symbol of symbols) {
-    const result = await window.binance.cancelAllOpenOrders({ symbol });
-    cancellations.push({ symbol, ...result });
+  for (const target of targets) {
+    const result = await window.binance.cancelAllOpenOrders(target);
+    cancellations.push({ ...target, ...result });
     if (result.ok) {
       for (const order of result.data || []) applyOpenOrderUpdate(order);
     }
   }
 
   const failed = cancellations.filter((result) => !result.ok);
-  printResult("小键盘 5 撤销全部未成交订单结果", {
+  printResult(`${shortcutLabel} 撤销全部未成交订单结果`, {
     ok: failed.length === 0,
     data: {
-      symbols,
+      symbols: targets.map((target) => target.symbol),
       canceledOrderCount: cancellations.reduce(
         (count, result) => count + (Array.isArray(result.data) ? result.data.length : 0),
         0
@@ -1893,8 +2327,13 @@ async function cancelAllOpenOrdersFromNumpad() {
 }
 
 document.addEventListener("keydown", async (event) => {
+  const shortcutDialogOpen = shortcutDialog.open || shortcutEditorDialog.open;
+  const editingTarget = event.target instanceof Element && Boolean(
+    event.target.closest("input, select, textarea, button, [contenteditable='true']")
+  );
+  const shortcut = shortcutApi.getShortcutForCode(event.code, shortcutSettings);
   if (event.repeat || event.ctrlKey || event.altKey || event.metaKey ||
-      !["Numpad1", "Numpad3", "Numpad5"].includes(event.code)) {
+      event.shiftKey || shortcutDialogOpen || editingTarget || !shortcut) {
     return;
   }
 
@@ -1909,9 +2348,12 @@ document.addEventListener("keydown", async (event) => {
 
   numpadOrderBusy = true;
   try {
-    if (event.code === "Numpad1") await placeOrderFromNumpad("SELL");
-    if (event.code === "Numpad3") await placeOrderFromNumpad("BUY");
-    if (event.code === "Numpad5") await cancelAllOpenOrdersFromNumpad();
+    if (shortcut.action === shortcutApi.ACTION_ORDER) {
+      await placeOrderFromNumpad(shortcut);
+    }
+    if (shortcut.action === shortcutApi.ACTION_CANCEL_ALL) {
+      await cancelAllOpenOrdersFromNumpad(shortcut);
+    }
   } catch (error) {
     printResult("小键盘订单操作异常", {
       ok: false,
@@ -1922,14 +2364,11 @@ document.addEventListener("keydown", async (event) => {
   }
 });
 
-function scheduleExecutionReportRefresh(event) {
-  executionReportRefreshSymbol = String(event.s || "").toUpperCase();
+function scheduleExecutionReportRefresh() {
   clearTimeout(executionReportRefreshTimer);
   executionReportRefreshTimer = setTimeout(() => {
-    const symbol = executionReportRefreshSymbol;
+    const symbol = getSelectedSymbol();
     if (!symbol) return;
-    elements.orderHistorySymbol.value = symbol;
-    elements.tradeHistorySymbol.value = symbol;
     Promise.all([
       refreshOrderHistory(symbol, { showResult: false }),
       refreshTradeHistory(symbol, { showResult: false }),
@@ -1943,11 +2382,12 @@ function scheduleExecutionReportRefresh(event) {
 }
 
 function openOrderKey(order) {
-  return `${order.symbol}:${order.orderId}`;
+  return `${order.marketType || "auto"}:${order.symbol}:${order.orderId}`;
 }
 
 function normalizeOpenOrder(order, receivedAt = Date.now()) {
   const normalized = {
+    marketType: order.marketType || null,
     symbol: String(order.symbol ?? order.s ?? "").toUpperCase(),
     orderId: order.orderId ?? order.i,
     clientOrderId: order.clientOrderId ?? order.c ?? order.newClientOrderId ?? "",
@@ -1981,16 +2421,23 @@ function updateChartOrderStatus() {
 }
 
 function syncTrackedOpenOrders() {
-  const symbol = String(chartSymbol || elements.marketSymbol.value || "").toUpperCase();
+  const symbol = getSelectedSymbol();
   const orders = [...openOrdersByKey.values()]
-    .filter((order) => order.symbol === symbol && isOpenOrder(order));
+    .filter((order) =>
+      order.symbol === symbol &&
+      (!chartMarketType || !order.marketType || order.marketType === chartMarketType) &&
+      isOpenOrder(order)
+    );
 
   chart.placeOrder = orders;
   chart.totalPlaceOrderCount = orders.length;
 
-  const tableSymbol = elements.openOrdersSymbol.value.trim().toUpperCase();
   const tableOrders = [...openOrdersByKey.values()]
-    .filter((order) => order.symbol === tableSymbol && isOpenOrder(order));
+    .filter((order) =>
+      order.symbol === symbol &&
+      (!chartMarketType || !order.marketType || order.marketType === chartMarketType) &&
+      isOpenOrder(order)
+    );
   renderOrders(tableOrders, elements.openOrdersBody);
   elements.openOrdersStatus.textContent = `实时未成交 ${tableOrders.length} 笔`;
   updateChartOrderStatus();
@@ -2021,14 +2468,18 @@ function applyOpenOrderUpdate(order, receivedAt = Date.now()) {
   syncTrackedOpenOrders();
 }
 
-async function refreshTrackedOpenOrders(symbol = elements.marketSymbol.value) {
+async function refreshTrackedOpenOrders(symbol = getSelectedSymbol()) {
   const normalizedSymbol = String(symbol || "").trim().toUpperCase();
   const snapshotStartedAt = Date.now();
   const result = await window.binance.openOrders({ symbol: normalizedSymbol });
   if (!result.ok) return result;
 
   for (const [key, order] of openOrdersByKey) {
-    if (order.symbol === normalizedSymbol && order.receivedAt <= snapshotStartedAt) {
+    if (
+      order.symbol === normalizedSymbol &&
+      (!chartMarketType || !order.marketType || order.marketType === chartMarketType) &&
+      order.receivedAt <= snapshotStartedAt
+    ) {
       openOrdersByKey.delete(key);
     }
   }
@@ -2043,7 +2494,7 @@ async function refreshTrackedOpenOrders(symbol = elements.marketSymbol.value) {
 }
 
 function fillLatestTradePrice() {
-  const symbol = elements.orderSymbol.value.trim().toUpperCase();
+  const symbol = getSelectedSymbol();
   const price = latestTradePrices.get(symbol);
 
   if (elements.latestTradePriceToggle.checked && price) {
@@ -2058,7 +2509,7 @@ elements.latestTradePriceToggle.addEventListener("change", () => {
   fillLatestTradePrice();
 });
 
-elements.orderSymbol.addEventListener("change", fillLatestTradePrice);
+elements.chartSymbolInput.addEventListener("change", fillLatestTradePrice);
 
 window.binance.onTradeUpdate((trade) => {
   const symbol = String(trade.symbol || "").toUpperCase();
@@ -2111,6 +2562,7 @@ window.binance.onDepthUpdate((depth) => {
       ? "-"
       : String(spread);
 
+  if (depth.marketType) chartMarketType = depth.marketType;
   if (depth.symbol && chartSymbol !== depth.symbol) {
     chart.reset();
     chartSymbol = depth.symbol;
@@ -2132,9 +2584,12 @@ window.binance.onDepthUpdate((depth) => {
 });
 
 window.binance.onMarketStatus((status) => {
+  const marketLabel = getMarketLabel(status.marketType);
+  if (status.symbol && status.marketType) chartMarketType = status.marketType;
   elements.marketStatus.textContent = [
     status.status,
     status.symbol || "",
+    status.symbol ? marketLabel : "",
     status.lastUpdateId !== undefined
       ? `updateId=${status.lastUpdateId}`
       : "",
@@ -2142,15 +2597,29 @@ window.binance.onMarketStatus((status) => {
   ]
     .filter(Boolean)
     .join(" / ");
+  if (status.symbol) {
+    elements.chartSymbolSwitchStatus.textContent =
+      status.status === "connected"
+        ? `当前：${status.symbol} / ${marketLabel}`
+        : `${status.status}：${status.symbol} / ${marketLabel}`;
+  }
 });
 
 window.binance.onMarketError((error) => {
+  if (!error.symbol || error.symbol === elements.chartSymbolInput.value.trim().toUpperCase()) {
+    elements.chartSymbolSwitchStatus.textContent =
+      `${error.symbol || "行情"}：${error.message || "连接失败"}`;
+  }
   printResult("行情连接错误", error);
 });
 
 window.binance.onUserDataEvent((payload) => {
   prependUserDataEvent(payload);
   if (payload.event?.e === "executionReport") {
+    const routedEvent = {
+      ...payload.event,
+      marketType: payload.marketType || payload.event.marketType,
+    };
     const clientOrderId = String(payload.event.c || "");
     if (clientOrderId) {
       executionReportStatusByClientId.set(clientOrderId, {
@@ -2163,7 +2632,7 @@ window.binance.onUserDataEvent((payload) => {
         );
       }
     }
-    applyOpenOrderUpdate(payload.event, payload.receivedAt);
+    applyOpenOrderUpdate(routedEvent, payload.receivedAt);
     scheduleExecutionReportRefresh(payload.event);
   }
 });
@@ -2171,6 +2640,7 @@ window.binance.onUserDataEvent((payload) => {
 window.binance.onUserDataStatus((status) => {
   elements.userDataStatus.textContent = [
     status.status,
+    getMarketLabel(status.marketType),
     status.subscriptionId !== undefined ? `subscriptionId=${status.subscriptionId}` : "",
     status.code !== undefined ? `code=${status.code}` : "",
   ].filter(Boolean).join(" / ");
@@ -2187,6 +2657,7 @@ window.binance.onUserDataError((error) => {
 });
 
 async function initializeApp() {
+  await initializeShortcutSettings();
   await loadStatus();
 
   const switchResultText = sessionStorage.getItem(
@@ -2202,9 +2673,8 @@ async function initializeApp() {
     }
   }
 
-  const symbol = elements.marketSymbol.value.trim().toUpperCase();
-  elements.marketStatus.textContent = `connecting / ${symbol}`;
-  const result = await window.binance.connectDepth(symbol);
+  const symbol = elements.chartSymbolInput.value.trim().toUpperCase();
+  const result = await connectMarketSymbol(symbol, { showResult: false });
 
   if (!result.ok) {
     printResult("自动连接增量深度失败", result);

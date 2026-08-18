@@ -106,6 +106,45 @@ class LocalOrderBook {
     };
   }
 
+  applyFuturesEvent(event) {
+    if (this.lastUpdateId === null) {
+      return { applied: false, reason: "not-initialized" };
+    }
+
+    const firstUpdateId = Number(event.U);
+    const finalUpdateId = Number(event.u);
+    const previousFinalUpdateId = Number(event.pu);
+    if (
+      !Number.isSafeInteger(firstUpdateId) ||
+      !Number.isSafeInteger(finalUpdateId) ||
+      !Number.isSafeInteger(previousFinalUpdateId)
+    ) {
+      throw new TypeError(
+        `非法的永续深度更新序号：U=${event.U}, u=${event.u}, pu=${event.pu}`
+      );
+    }
+
+    if (finalUpdateId <= this.lastUpdateId) {
+      return { applied: false, reason: "stale" };
+    }
+
+    const overlapsSnapshot =
+      firstUpdateId <= this.lastUpdateId && this.lastUpdateId <= finalUpdateId;
+    if (!overlapsSnapshot && previousFinalUpdateId !== this.lastUpdateId) {
+      return {
+        applied: false,
+        reason: "sequence-gap",
+        expectedPreviousFinalUpdateId: this.lastUpdateId,
+        actualPreviousFinalUpdateId: previousFinalUpdateId,
+      };
+    }
+
+    for (const level of event.b || []) this.setPriceLevel(this.bids, level);
+    for (const level of event.a || []) this.setPriceLevel(this.asks, level);
+    this.lastUpdateId = finalUpdateId;
+    return { applied: true, reason: "applied" };
+  }
+
   getTopLevels(limit = 10) {
     const normalizedLimit = Math.max(1, Math.floor(Number(limit) || 10));
 

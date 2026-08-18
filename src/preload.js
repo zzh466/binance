@@ -14,11 +14,19 @@ function subscribe(channel, callback) {
 }
 
 contextBridge.exposeInMainWorld("binance", {
+  openAdditionalInstances: (count = 2) =>
+    ipcRenderer.invoke("app:open-additional-instances", { count }),
+  loadShortcutSettings: (fallbackSettings) =>
+    ipcRenderer.invoke("app:load-shortcut-settings", { fallbackSettings }),
+  saveShortcutSettings: (settings) =>
+    ipcRenderer.invoke("app:save-shortcut-settings", { settings }),
   getStatus: () => ipcRenderer.invoke("binance:get-status"),
   switchEnvironment: (testnet) =>
     ipcRenderer.invoke("binance:switch-environment", { testnet }),
-  syncTime: () => ipcRenderer.invoke("binance:sync-time"),
-  ping: () => ipcRenderer.invoke("binance:ping"),
+  syncTime: (options) =>
+    ipcRenderer.invoke("binance:sync-time", options || {}),
+  ping: (options) =>
+    ipcRenderer.invoke("binance:ping", options || {}),
   exchangeInfo: (options) =>
     ipcRenderer.invoke("binance:exchange-info", options || {}),
   marketOverview: (options) =>
@@ -53,14 +61,14 @@ contextBridge.exposeInMainWorld("binance", {
     ipcRenderer.invoke("binance:my-trades", options || {}),
   accountStatus: (options) =>
     ipcRenderer.invoke("binance:account-status", options || {}),
-  accountRateLimits: () =>
-    ipcRenderer.invoke("binance:account-rate-limits"),
+  accountRateLimits: (options) =>
+    ipcRenderer.invoke("binance:account-rate-limits", options || {}),
   accountCommission: (options) =>
     ipcRenderer.invoke("binance:account-commission", options || {}),
   queryOrderList: (options) =>
     ipcRenderer.invoke("binance:query-order-list", options || {}),
-  openOrderLists: () =>
-    ipcRenderer.invoke("binance:open-order-lists"),
+  openOrderLists: (options) =>
+    ipcRenderer.invoke("binance:open-order-lists", options || {}),
   placeOco: (options) =>
     ipcRenderer.invoke("binance:place-oco", options || {}),
   placeOto: (options) =>
@@ -69,8 +77,8 @@ contextBridge.exposeInMainWorld("binance", {
     ipcRenderer.invoke("binance:place-otoco", options || {}),
   cancelOrderList: (options) =>
     ipcRenderer.invoke("binance:cancel-order-list", options || {}),
-  connectUserData: () =>
-    ipcRenderer.invoke("binance:connect-user-data"),
+  connectUserData: (options) =>
+    ipcRenderer.invoke("binance:connect-user-data", options || {}),
   disconnectUserData: () =>
     ipcRenderer.invoke("binance:disconnect-user-data"),
 

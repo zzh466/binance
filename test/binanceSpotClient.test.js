@@ -18,6 +18,56 @@ test("交易地址随环境切换", () => {
   assert.doesNotMatch(production.tradingRestBase, /testnet/);
 });
 
+test("正式环境公共行情使用 Binance Vision，交易仍使用正式交易域名", () => {
+  const production = createClient(false);
+
+  assert.equal(production.restBase, "https://data-api.binance.vision/api");
+  assert.equal(production.wsBase, "wss://data-stream.binance.vision/ws");
+  assert.equal(production.tradingRestBase, "https://api.binance.com/api");
+  assert.equal(
+    production.tradingWsApiBase,
+    "wss://ws-api.binance.com:443/ws-api/v3"
+  );
+});
+
+test("深度快照按 lastUpdateId + 1 衔接首条增量", async () => {
+  const client = createClient(false);
+  const socket = {};
+  client.marketSocket = socket;
+  client.marketSymbol = "BTCUSDT";
+  client.marketManualClose = false;
+  client.depthEventBuffer = [
+    {
+      U: 90,
+      u: 99,
+      b: [],
+      a: [],
+    },
+    {
+      U: 101,
+      u: 102,
+      b: [["50000", "1"]],
+      a: [["50001", "2"]],
+    },
+  ];
+  client.request = async () => ({
+    lastUpdateId: 100,
+    bids: [["49999", "3"]],
+    asks: [["50002", "4"]],
+  });
+
+  await client.synchronizeDepthSnapshot(socket, "BTCUSDT");
+
+  assert.equal(client.depthReady, true);
+  assert.equal(client.orderBook.lastUpdateId, 102);
+  assert.deepEqual(client.orderBook.getTopLevels(1), {
+    bids: [{ price: "50000", quantity: "1" }],
+    asks: [{ price: "50001", quantity: "2" }],
+  });
+  client.marketSocket = null;
+  client.close();
+});
+
 test("prepareOrder 按交易过滤器对价格和数量向下对齐", async () => {
   const client = createClient();
   client.exchangeInfo = async () => ({

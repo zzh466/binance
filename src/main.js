@@ -1,15 +1,50 @@
 const path = require("node:path");
+const fs = require("node:fs");
+const { spawn } = require("node:child_process");
 const { performance } = require("node:perf_hooks");
 const { app, BrowserWindow, ipcMain, Notification } = require("electron");
 const dotenv = require("dotenv");
-const { BinanceSpotClient } = require("./binance/binanceSpotClient");
+const { BinanceUnifiedClient } = require("./binance/binanceUnifiedClient");
+const {
+  readShortcutConfig,
+  writeShortcutConfig,
+} = require("./shortcutConfigStore");
 
-dotenv.config({
-  path: path.join(__dirname, "..", ".env"),
-});
+function loadEnvironmentFile() {
+  const candidates = [
+    process.env.BINANCE_ENV_FILE,
+    path.join(__dirname, "..", ".env"),
+    app.isPackaged
+      ? path.resolve(process.resourcesPath, "../../..", ".env")
+      : null,
+    path.join(app.getPath("appData"), "Binance统一交易台", ".env"),
+  ].filter(Boolean);
+  const envPath = candidates.find((candidate) => fs.existsSync(candidate));
+  if (envPath) dotenv.config({ path: envPath });
+  return envPath || null;
+}
+
+const loadedEnvironmentPath = loadEnvironmentFile();
+const instanceArgument = process.argv.find((argument) =>
+  argument.startsWith("--binance-instance=")
+);
+const instanceId = instanceArgument
+  ? instanceArgument.slice("--binance-instance=".length).replace(/[^a-zA-Z0-9_-]/g, "")
+  : "";
+if (instanceId) {
+  app.setPath(
+    "userData",
+    path.join(app.getPath("appData"), "Binance统一交易台", `instance-${instanceId}`)
+  );
+}
 
 let mainWindow = null;
 const defaultTestnet = process.env.BINANCE_TESTNET !== "false";
+const shortcutConfigPath = path.join(
+  app.getPath("appData"),
+  "Binance统一交易台",
+  "shortcut-settings.json"
+);
 
 function getEnvironmentCredentials(testnet) {
   const prefix = testnet ? "BINANCE_TESTNET" : "BINANCE_PRODUCTION";
@@ -33,11 +68,29 @@ function getEnvironmentCredentials(testnet) {
   return { apiKey: "", apiSecret: "", source: prefix };
 }
 
+function getFuturesCredentials(testnet) {
+  const prefix = testnet ? "BINANCE_TESTNET" : "BINANCE_PRODUCTION";
+  const apiKey = process.env[`${prefix}_FUTURES_API_KEY`] || "";
+  const apiSecret = process.env[`${prefix}_FUTURES_API_SECRET`] || "";
+  if (apiKey && apiSecret) {
+    return { apiKey, apiSecret, source: `${prefix}_FUTURES` };
+  }
+
+  const shared = getEnvironmentCredentials(testnet);
+  return {
+    ...shared,
+    source: shared.apiKey && shared.apiSecret
+      ? `${shared.source}（与现货共用）`
+      : `${prefix}_FUTURES`,
+  };
+}
+
 function createBinanceClient(testnet) {
-  const credentials = getEnvironmentCredentials(testnet);
-  const nextClient = new BinanceSpotClient({
-    apiKey: credentials.apiKey,
-    apiSecret: credentials.apiSecret,
+  const spotCredentials = getEnvironmentCredentials(testnet);
+  const futuresCredentials = getFuturesCredentials(testnet);
+  return new BinanceUnifiedClient({
+    spotCredentials,
+    futuresCredentials,
     testnet,
     depthSpeed: process.env.BINANCE_DEPTH_SPEED || "100ms",
     depthSnapshotLimit: process.env.BINANCE_DEPTH_SNAPSHOT_LIMIT || 1000,
@@ -45,18 +98,56 @@ function createBinanceClient(testnet) {
     preflightBalanceCheck:
       process.env.BINANCE_PREFLIGHT_BALANCE_CHECK === "true",
   });
-  nextClient.credentialsSource = credentials.source;
-  return nextClient;
 }
 
 let client = createBinanceClient(defaultTestnet);
+
+function openAdditionalInstances(count = 2) {
+  const normalizedCount = Math.min(2, Math.max(1, Number(count) || 2));
+  const launchGroup = `${Date.now()}-${process.pid}`;
+  const launched = [];
+
+  for (let index = 1; index <= normalizedCount; index += 1) {
+    const childInstanceId = `${launchGroup}-${index}`;
+    let command;
+    let args;
+
+    if (app.isPackaged && process.platform === "darwin") {
+      const appBundlePath = path.resolve(path.dirname(process.execPath), "../..");
+      command = "/usr/bin/open";
+      args = [
+        "-n",
+        appBundlePath,
+        "--args",
+        `--binance-instance=${childInstanceId}`,
+      ];
+    } else {
+      command = process.execPath;
+      args = [app.getAppPath(), `--binance-instance=${childInstanceId}`];
+    }
+
+    const child = spawn(command, args, {
+      detached: true,
+      stdio: "ignore",
+      env: {
+        ...process.env,
+        ...(loadedEnvironmentPath
+          ? { BINANCE_ENV_FILE: loadedEnvironmentPath }
+          : {}),
+      },
+    });
+    child.unref();
+    launched.push(childInstanceId);
+  }
+
+  return { launchedCount: launched.length, instances: launched };
+}
 
 function createWindow() {
   mainWindow = new BrowserWindow({
     width: 1080,
     height: 820,
-    minWidth: 900,
-    minHeight: 680,
+    resizable: true,
     show: false,
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),
@@ -190,6 +281,27 @@ function getClientStatus() {
     depthSpeed: client.depthSpeed,
     depthSnapshotLimit: client.depthSnapshotLimit,
     depthDisplayLevels: client.depthDisplayLevels,
+    activeMarketType: client.activeMarketType,
+    activeSymbol: client.activeSymbol,
+    markets: {
+      spot: {
+        restBase: client.spot.restBase,
+        wsBase: client.spot.wsBase,
+        wsApiBase: client.spot.wsApiBase,
+        hasApiKey: Boolean(client.spot.apiKey),
+        hasApiSecret: Boolean(client.spot.apiSecret),
+        credentialsSource: client.spot.credentialsSource,
+        serverTimeOffsetMs: client.spot.serverTimeOffsetMs,
+      },
+      futures: {
+        restBase: client.futures.restBase,
+        wsBase: client.futures.wsBase,
+        hasApiKey: Boolean(client.futures.apiKey),
+        hasApiSecret: Boolean(client.futures.apiSecret),
+        credentialsSource: client.futures.credentialsSource,
+        serverTimeOffsetMs: client.futures.serverTimeOffsetMs,
+      },
+    },
   };
 }
 
@@ -223,8 +335,28 @@ async function switchClientEnvironment(testnet) {
 }
 
 function registerIpcHandlers() {
+  ipcMain.handle("app:load-shortcut-settings", async (_event, payload) => {
+    return safeCall(async () => ({
+      settings: readShortcutConfig(shortcutConfigPath, {
+        fallbackSettings: payload?.fallbackSettings,
+      }),
+      configPath: shortcutConfigPath,
+    }));
+  });
+
+  ipcMain.handle("app:save-shortcut-settings", async (_event, payload) => {
+    return safeCall(async () => ({
+      settings: writeShortcutConfig(shortcutConfigPath, payload?.settings),
+      configPath: shortcutConfigPath,
+    }));
+  });
+
   ipcMain.handle("binance:get-status", async () => {
     return safeCall(async () => getClientStatus());
+  });
+
+  ipcMain.handle("app:open-additional-instances", async (_event, payload) => {
+    return safeCall(async () => openAdditionalInstances(payload?.count));
   });
 
   ipcMain.handle("binance:switch-environment", async (_event, payload) => {
@@ -236,12 +368,12 @@ function registerIpcHandlers() {
     });
   });
 
-  ipcMain.handle("binance:sync-time", async () => {
-    return safeCall(() => client.syncServerTime());
+  ipcMain.handle("binance:sync-time", async (_event, payload) => {
+    return safeCall(() => client.syncServerTime(payload?.symbol));
   });
 
-  ipcMain.handle("binance:ping", async () => {
-    return safeCall(() => client.ping());
+  ipcMain.handle("binance:ping", async (_event, payload) => {
+    return safeCall(() => client.ping(payload?.symbol));
   });
 
   ipcMain.handle("binance:exchange-info", async (_event, payload) => {
@@ -313,8 +445,8 @@ function registerIpcHandlers() {
     return safeCall(() => client.accountStatus(payload || {}));
   });
 
-  ipcMain.handle("binance:account-rate-limits", async () => {
-    return safeCall(() => client.accountRateLimits());
+  ipcMain.handle("binance:account-rate-limits", async (_event, payload) => {
+    return safeCall(() => client.accountRateLimits(payload || {}));
   });
 
   ipcMain.handle("binance:account-commission", async (_event, payload) => {
@@ -325,8 +457,8 @@ function registerIpcHandlers() {
     return safeCall(() => client.queryOrderList(payload || {}));
   });
 
-  ipcMain.handle("binance:open-order-lists", async () => {
-    return safeCall(() => client.openOrderLists());
+  ipcMain.handle("binance:open-order-lists", async (_event, payload) => {
+    return safeCall(() => client.openOrderLists(payload || {}));
   });
 
   ipcMain.handle("binance:place-oco", async (_event, payload) => {
@@ -345,8 +477,8 @@ function registerIpcHandlers() {
     return safeCall(() => client.cancelOrderList(payload || {}));
   });
 
-  ipcMain.handle("binance:connect-user-data", async () => {
-    return safeCall(() => client.connectUserData());
+  ipcMain.handle("binance:connect-user-data", async (_event, payload) => {
+    return safeCall(() => client.connectUserData(payload || {}));
   });
 
   ipcMain.handle("binance:disconnect-user-data", async () => {

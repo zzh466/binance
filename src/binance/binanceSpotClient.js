@@ -5,12 +5,17 @@ const WebSocket = require("ws");
 const { LocalOrderBook } = require("./localOrderBook");
 const REST_BASE = {
   testnet: "https://testnet.binance.vision/api",
+  production: "https://data-api.binance.vision/api",
+};
+
+const TRADING_REST_BASE = {
+  testnet: REST_BASE.testnet,
   production: "https://api.binance.com/api",
 };
 
 const WS_BASE = {
   testnet: "wss://stream.testnet.binance.vision/ws",
-  production: "wss://stream.binance.com:9443/ws",
+  production: "wss://data-stream.binance.vision/ws",
 };
 
 const WS_API_BASE = {
@@ -82,14 +87,21 @@ class BinanceSpotClient extends EventEmitter {
     this.apiKey = apiKey.trim();
     this.apiSecret = apiSecret.trim();
     this.testnet = Boolean(testnet);
+    this.marketType = "spot";
 
     this.restBase = this.testnet ? REST_BASE.testnet : REST_BASE.production;
-    this.tradingRestBase = this.restBase;
+    this.tradingRestBase = this.testnet
+      ? TRADING_REST_BASE.testnet
+      : TRADING_REST_BASE.production;
     this.wsBase = this.testnet ? WS_BASE.testnet : WS_BASE.production;
     this.wsApiBase = this.testnet
       ? WS_API_BASE.testnet
       : WS_API_BASE.production;
     this.tradingWsApiBase = this.wsApiBase;
+    this.timePath = "/v3/time";
+    this.pingPath = "/v3/ping";
+    this.depthPath = "/v3/depth";
+    this.supportsAveragePriceStream = true;
 
     this.depthSpeed = DEPTH_SPEEDS.has(depthSpeed) ? depthSpeed : "100ms";
 
@@ -106,6 +118,9 @@ class BinanceSpotClient extends EventEmitter {
     );
 
     this.preflightBalanceCheck = Boolean(preflightBalanceCheck);
+    this.publicHttpsAgent = null;
+    this.publicHostHeader = null;
+    this.marketWebSocketOptions = null;
     this.httpsAgent = new https.Agent({
       keepAlive: true,
       keepAliveMsecs: 1_000,
@@ -148,7 +163,7 @@ class BinanceSpotClient extends EventEmitter {
     await this.syncServerTime();
     clearInterval(this.serverTimeRefreshTimer);
     this.serverTimeRefreshTimer = setInterval(() => {
-      this.syncServerTimeForBase(this.tradingRestBase).catch((error) => {
+      this.syncServerTimeForBase(this.restBase).catch((error) => {
         this.emit("user-data-error", {
           message: `后台服务器时间同步失败：${error.message}`,
           time: Date.now(),
@@ -174,7 +189,7 @@ class BinanceSpotClient extends EventEmitter {
 
     const syncPromise = (async () => {
       const before = Date.now();
-      const result = await this.request("GET", "/v3/time", {}, false, baseUrl);
+      const result = await this.request("GET", this.timePath, {}, false, baseUrl);
       const after = Date.now();
 
       const localMidpoint = Math.floor((before + after) / 2);
@@ -286,13 +301,20 @@ class BinanceSpotClient extends EventEmitter {
       headers["X-MBX-APIKEY"] = this.apiKey;
     }
 
+    const isPublicBase = baseUrl === this.restBase;
+    if (isPublicBase && this.publicHostHeader) {
+      headers.Host = this.publicHostHeader;
+    }
+
     let response;
     try {
       response = await requestHttps(url, {
         method,
         headers,
         timeout: 10_000,
-        agent: this.httpsAgent,
+        agent: isPublicBase && this.publicHttpsAgent
+          ? this.publicHttpsAgent
+          : this.httpsAgent,
       });
     } catch (error) {
       throw new BinanceApiError(`请求 Binance 失败：${error.message}`, {
@@ -334,8 +356,12 @@ class BinanceSpotClient extends EventEmitter {
   }
 
   async ping() {
-    await this.request("GET", "/v3/ping");
-    return { connected: true, environment: this.testnet ? "testnet" : "production" };
+    await this.request("GET", this.pingPath);
+    return {
+      connected: true,
+      environment: this.testnet ? "testnet" : "production",
+      marketType: this.marketType,
+    };
   }
 
   async exchangeInfo(symbol, { forceRefresh = false } = {}) {
@@ -1525,17 +1551,19 @@ class BinanceSpotClient extends EventEmitter {
 
     const symbol = this.marketSymbol;
     const url = `${this.wsBase}/${symbol.toLowerCase()}@trade`;
-    const socket = new WebSocket(url);
+    const socket = this.createMarketWebSocket(url);
     this.tradeSocket = socket;
 
     socket.on("open", () => {
       if (this.tradeSocket === socket) {
         this.tradeReconnectDelayMs = 1_000;
-        socket.send(JSON.stringify({
-          method: "SUBSCRIBE",
-          params: [`${symbol.toLowerCase()}@avgPrice`],
-          id: Date.now(),
-        }));
+        if (this.supportsAveragePriceStream) {
+          socket.send(JSON.stringify({
+            method: "SUBSCRIBE",
+            params: [`${symbol.toLowerCase()}@avgPrice`],
+            id: Date.now(),
+          }));
+        }
       }
     });
 
@@ -1560,7 +1588,16 @@ class BinanceSpotClient extends EventEmitter {
           return;
         }
 
+        if (!this.supportsAveragePriceStream) {
+          this.averagePriceCache.set(symbol, {
+            price: String(message.p),
+            loadedAt: Date.now(),
+            eventTime: Number(message.E),
+          });
+        }
+
         this.emit("trade-update", {
+          marketType: this.marketType,
           symbol: message.s || symbol,
           price: String(message.p),
           quantity: String(message.q),
@@ -1605,7 +1642,7 @@ class BinanceSpotClient extends EventEmitter {
     const symbol = this.marketSymbol;
     const streamName = `${symbol.toLowerCase()}@depth@${this.depthSpeed}`;
     const url = `${this.wsBase}/${streamName}`;
-    const socket = new WebSocket(url);
+    const socket = this.createMarketWebSocket(url);
 
     this.marketSocket = socket;
     this.resetDepthState();
@@ -1618,6 +1655,7 @@ class BinanceSpotClient extends EventEmitter {
       this.marketReconnectDelayMs = 1_000;
       this.emit("market-status", {
         status: "synchronizing",
+        marketType: this.marketType,
         symbol,
         url,
         time: Date.now(),
@@ -1692,6 +1730,10 @@ class BinanceSpotClient extends EventEmitter {
     });
   }
 
+  createMarketWebSocket(url) {
+    return new WebSocket(url, this.marketWebSocketOptions || undefined);
+  }
+
   handleDepthEvent(socket, event) {
     if (this.marketSocket !== socket) {
       return;
@@ -1711,7 +1753,7 @@ class BinanceSpotClient extends EventEmitter {
 
     let result;
     try {
-      result = this.orderBook.applyEvent(event);
+      result = this.applyDepthEventToOrderBook(event);
     } catch (error) {
     
       this.handleDepthSynchronizationFailure(socket, error);
@@ -1731,7 +1773,7 @@ class BinanceSpotClient extends EventEmitter {
     const syncVersion = this.depthSyncVersion;
 
     for (let attempt = 1; attempt <= 8; attempt += 1) {
-      const snapshot = await this.request("GET", "/v3/depth", {
+      const snapshot = await this.request("GET", this.depthPath, {
         symbol,
         limit: this.depthSnapshotLimit,
       });
@@ -1758,10 +1800,7 @@ class BinanceSpotClient extends EventEmitter {
       const firstApplicableEvent = applicableEvents[0];
       if (
         firstApplicableEvent &&
-        !(
-          Number(firstApplicableEvent.U) <= snapshotUpdateId &&
-          snapshotUpdateId <= Number(firstApplicableEvent.u)
-        )
+        !this.isFirstDepthEventApplicable(firstApplicableEvent, snapshotUpdateId)
       ) {
         continue;
       }
@@ -1774,7 +1813,7 @@ class BinanceSpotClient extends EventEmitter {
       });
 
       for (const event of applicableEvents) {
-        const result = this.orderBook.applyEvent(event);
+        const result = this.applyDepthEventToOrderBook(event);
 
         if (result.reason === "sequence-gap") {
           throw new BinanceApiError("深度快照与增量事件之间存在序号缺口。", {
@@ -1788,6 +1827,7 @@ class BinanceSpotClient extends EventEmitter {
 
       this.emit("market-status", {
         status: "connected",
+        marketType: this.marketType,
         symbol,
         lastUpdateId: this.orderBook.lastUpdateId,
         snapshotLimit: this.depthSnapshotLimit,
@@ -1815,6 +1855,15 @@ class BinanceSpotClient extends EventEmitter {
     );
   }
 
+  isFirstDepthEventApplicable(event, snapshotUpdateId) {
+    const nextUpdateId = snapshotUpdateId + 1;
+    return Number(event.U) <= nextUpdateId && nextUpdateId <= Number(event.u);
+  }
+
+  applyDepthEventToOrderBook(event) {
+    return this.orderBook.applyEvent(event);
+  }
+
   resynchronizeDepth(socket, event, gapDetails) {
     if (this.marketSocket !== socket) {
       return;
@@ -1827,6 +1876,7 @@ class BinanceSpotClient extends EventEmitter {
 
     this.emit("market-status", {
       status: "resynchronizing",
+      marketType: this.marketType,
       symbol: this.marketSymbol,
       reason: "sequence-gap",
       details: gapDetails,
@@ -1857,6 +1907,7 @@ class BinanceSpotClient extends EventEmitter {
     const top = this.orderBook.getTopLevels(this.depthDisplayLevels);
 
     this.emit("depth-update", {
+      marketType: this.marketType,
       symbol: this.marketSymbol,
       lastUpdateId: this.orderBook.lastUpdateId,
       firstUpdateId: sourceEvent ? Number(sourceEvent.U) : null,
@@ -1927,6 +1978,7 @@ class BinanceSpotClient extends EventEmitter {
 
     this.emit("market-status", {
       status: "disconnected",
+      marketType: this.marketType,
       symbol: this.marketSymbol,
       time: Date.now(),
     });
@@ -1939,6 +1991,9 @@ class BinanceSpotClient extends EventEmitter {
     this.serverTimeRefreshTimer = null;
     this.disconnectMarket();
     this.disconnectUserData();
+    if (this.publicHttpsAgent && this.publicHttpsAgent !== this.httpsAgent) {
+      this.publicHttpsAgent.destroy();
+    }
     this.httpsAgent.destroy();
     this.removeAllListeners();
   }

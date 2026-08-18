@@ -1,11 +1,13 @@
 {
-  "name": "electron-binance-spot-demo",
+  "name": "binance-unified-trading-console",
+  "productName": "Binance统一交易台",
   "version": "1.0.0",
   "private": true,
-  "description": "Electron main-process Binance Spot market data and trading demo",
+  "description": "Electron Binance Spot and USD-M Futures unified trading console",
   "main": "src/main.js",
   "scripts": {
     "start": "electron .",
+    "build:mac": "zsh scripts/build-mac-app.sh",
     "test": "node --test"
   },
   "dependencies": {
