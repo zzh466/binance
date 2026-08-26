@@ -285,6 +285,7 @@ function getClientStatus() {
         restBase: client.spot.restBase,
         wsBase: client.spot.wsBase,
         wsApiBase: client.spot.wsApiBase,
+        tradingWebSocket: client.spot.getTradingWebSocketStatus(),
         hasApiKey: Boolean(client.spot.apiKey),
         hasApiSecret: Boolean(client.spot.apiSecret),
         credentialsSource: client.spot.credentialsSource,
@@ -293,6 +294,8 @@ function getClientStatus() {
       futures: {
         restBase: client.futures.restBase,
         wsBase: client.futures.wsBase,
+        wsApiBase: client.futures.wsApiBase,
+        tradingWebSocket: client.futures.getTradingWebSocketStatus(),
         publicMarketTransport: client.futures.publicMarketTransport,
         hasApiKey: Boolean(client.futures.apiKey),
         hasApiSecret: Boolean(client.futures.apiSecret),

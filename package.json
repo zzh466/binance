@@ -8,6 +8,10 @@
   "scripts": {
     "start": "electron .",
     "build:mac": "zsh scripts/build-mac-app.sh",
+    "build:win": "electron-builder --win --x64",
+    "build:win:arm64": "electron-builder --win --arm64",
+    "build:win:all": "electron-builder --win --x64 --arm64",
+    "build:win:dir": "electron-builder --win --x64 --dir",
     "test": "node --test"
   },
   "dependencies": {
@@ -15,9 +19,46 @@
     "ws": "^8.21.1"
   },
   "devDependencies": {
-    "electron": "^43.2.0"
+    "electron": "^43.2.0",
+    "electron-builder": "^26.15.3"
   },
   "keywords": [],
   "author": "",
-  "license": "ISC"
+  "license": "ISC",
+  "build": {
+    "appId": "com.zzh466.binance.unified-trading",
+    "productName": "Binance统一交易台",
+    "asar": true,
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "src/**/*",
+      "package.json"
+    ],
+    "extraFiles": [
+      {
+        "from": ".env.example",
+        "to": ".env.example"
+      }
+    ],
+    "win": {
+      "executableName": "Binance统一交易台",
+      "target": [
+        "nsis",
+        "zip"
+      ],
+      "artifactName": "${productName}-${version}-Windows-${arch}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowElevation": true,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": "always",
+      "createStartMenuShortcut": true,
+      "shortcutName": "Binance统一交易台",
+      "deleteAppDataOnUninstall": false
+    }
+  }
 }

@@ -28,6 +28,9 @@ const DEPTH_SNAPSHOT_LIMITS = new Set([100, 500, 1000, 5000]);
 const SERVER_TIME_CACHE_TTL_MS = 120_000;
 const SERVER_TIME_REFRESH_INTERVAL_MS = 30_000;
 const DYNAMIC_PRICE_MAX_AGE_MS = 10_000;
+const WS_API_REQUEST_TIMEOUT_MS = 5_000;
+const WS_API_CONNECT_TIMEOUT_MS = 10_000;
+const WS_API_HEARTBEAT_INTERVAL_MS = 20_000;
 
 function requestHttps(url, options = {}) {
   return new Promise((resolve, reject) => {
@@ -156,6 +159,13 @@ class BinanceSpotClient extends EventEmitter {
     this.userDataReconnectTimer = null;
     this.userDataReconnectDelayMs = 1_000;
     this.userDataSubscriptionId = null;
+    this.tradingWsApiSocket = null;
+    this.tradingWsApiConnectionPromise = null;
+    this.tradingWsApiManualClose = false;
+    this.tradingWsApiReconnectTimer = null;
+    this.tradingWsApiReconnectDelayMs = 1_000;
+    this.tradingWsApiHeartbeatTimer = null;
+    this.tradingWsApiHeartbeatAlive = true;
     this.wsApiPendingRequests = new Map();
   }
 
@@ -171,6 +181,8 @@ class BinanceSpotClient extends EventEmitter {
       });
     }, SERVER_TIME_REFRESH_INTERVAL_MS);
     this.serverTimeRefreshTimer.unref?.();
+
+    this.startTradingWebSocketInBackground();
   }
 
   async syncServerTime() {
@@ -616,36 +628,25 @@ class BinanceSpotClient extends EventEmitter {
       await this.validateAvailableBalance(params, symbolInfo);
     }
 
-    const persistentSocket = this.getPersistentWsApiSocket(this.tradingWsApiBase);
-    if (persistentSocket) {
-      const signedParams = this.createSignedWsApiParams(params);
-      const result = await this.requestWsApiOnSocket(
-        persistentSocket,
+    const { result, transport, fallbackReason } =
+      await this.requestWsApiWithRestFallback(
         testOnly ? "order.test" : "order.place",
-        signedParams,
-        { url: this.tradingWsApiBase }
+        params,
+        () => this.request(
+          "POST",
+          testOnly ? "/v3/order/test" : "/v3/order",
+          params,
+          true,
+          this.tradingRestBase
+        ),
+        { retrySafe: testOnly }
       );
-      return {
-        ...result,
-        testOnly,
-        adjustments,
-        transport: "websocket",
-        preflightBalanceCheck: this.preflightBalanceCheck,
-      };
-    }
-
-    const result = await this.request(
-      "POST",
-      testOnly ? "/v3/order/test" : "/v3/order",
-      params,
-      true,
-      this.tradingRestBase
-    );
     return {
       ...result,
       testOnly,
       adjustments,
-      transport: "https-keepalive",
+      transport,
+      ...(fallbackReason ? { fallbackReason } : {}),
       preflightBalanceCheck: this.preflightBalanceCheck,
     };
   }
@@ -705,25 +706,23 @@ class BinanceSpotClient extends EventEmitter {
     this.assertTradingCredentials();
     await this.ensureTradingServerTime();
 
-    const persistentSocket = this.getPersistentWsApiSocket(this.tradingWsApiBase);
-    if (persistentSocket) {
-      const result = await this.requestWsApiOnSocket(
-        persistentSocket,
+    const { result, transport, fallbackReason } =
+      await this.requestWsApiWithRestFallback(
         "order.cancel",
-        this.createSignedWsApiParams(params),
-        { url: this.tradingWsApiBase }
+        params,
+        () => this.request(
+          "DELETE",
+          "/v3/order",
+          params,
+          true,
+          this.tradingRestBase
+        )
       );
-      return { ...result, transport: "websocket" };
-    }
-
-    const result = await this.request(
-      "DELETE",
-      "/v3/order",
-      params,
-      true,
-      this.tradingRestBase
-    );
-    return { ...result, transport: "https-keepalive" };
+    return {
+      ...result,
+      transport,
+      ...(fallbackReason ? { fallbackReason } : {}),
+    };
   }
 
   async signedRest(method, path, params = {}) {
@@ -738,11 +737,33 @@ class BinanceSpotClient extends EventEmitter {
     );
   }
 
+  async signedWsOrRest(
+    wsMethod,
+    restMethod,
+    restPath,
+    params = {},
+    options = {}
+  ) {
+    const { result } = await this.requestWsApiWithRestFallback(
+      wsMethod,
+      params,
+      () => this.request(
+        restMethod,
+        restPath,
+        params,
+        true,
+        this.tradingRestBase
+      ),
+      options
+    );
+    return result;
+  }
+
   async queryOrder({ symbol, orderId, origClientOrderId }) {
     if (!orderId && !origClientOrderId) {
       throw new BinanceApiError("查询单笔订单必须提供 orderId 或 origClientOrderId。");
     }
-    return this.signedRest("GET", "/v3/order", {
+    return this.signedWsOrRest("order.status", "GET", "/v3/order", {
       symbol: this.validateSymbol(symbol),
       orderId,
       origClientOrderId,
@@ -750,7 +771,7 @@ class BinanceSpotClient extends EventEmitter {
   }
 
   async openOrders({ symbol } = {}) {
-    return this.signedRest("GET", "/v3/openOrders", {
+    return this.signedWsOrRest("openOrders.status", "GET", "/v3/openOrders", {
       symbol: symbol ? this.validateSymbol(symbol) : undefined,
     });
   }
@@ -760,23 +781,16 @@ class BinanceSpotClient extends EventEmitter {
     this.assertTradingCredentials();
     await this.ensureTradingServerTime();
 
-    const persistentSocket = this.getPersistentWsApiSocket(this.tradingWsApiBase);
-    if (persistentSocket) {
-      const result = await this.requestWsApiOnSocket(
-        persistentSocket,
-        "openOrders.cancelAll",
-        this.createSignedWsApiParams(params),
-        { url: this.tradingWsApiBase }
-      );
-      return result;
-    }
-
-    const result = await this.request(
-      "DELETE",
-      "/v3/openOrders",
+    const { result } = await this.requestWsApiWithRestFallback(
+      "openOrders.cancelAll",
       params,
-      true,
-      this.tradingRestBase
+      () => this.request(
+        "DELETE",
+        "/v3/openOrders",
+        params,
+        true,
+        this.tradingRestBase
+      )
     );
     return result;
   }
@@ -794,13 +808,19 @@ class BinanceSpotClient extends EventEmitter {
     const alignedQty = lotSize
       ? this.alignToStep(newQty, lotSize.stepSize)
       : String(newQty);
-    return this.signedRest("PUT", "/v3/order/amend/keepPriority", {
-      symbol: this.validateSymbol(symbol),
-      orderId,
-      origClientOrderId,
-      newQty: alignedQty,
-      newClientOrderId,
-    });
+    return this.signedWsOrRest(
+      "order.amend.keepPriority",
+      "PUT",
+      "/v3/order/amend/keepPriority",
+      {
+        symbol: this.validateSymbol(symbol),
+        orderId,
+        origClientOrderId,
+        newQty: alignedQty,
+        newClientOrderId,
+      },
+      { retrySafe: false }
+    );
   }
 
   async cancelReplace({
@@ -812,45 +832,65 @@ class BinanceSpotClient extends EventEmitter {
     if (!cancelOrderId && !cancelOrigClientOrderId) {
       throw new BinanceApiError("撤单重报必须提供原订单 ID。");
     }
-    const { params, adjustments } = await this.prepareOrder(order);
-    const result = await this.signedRest("POST", "/v3/order/cancelReplace", {
-      ...params,
+    const { params: preparedParams, adjustments } = await this.prepareOrder(order);
+    const params = {
+      ...preparedParams,
       cancelReplaceMode,
       cancelOrderId,
       cancelOrigClientOrderId,
-    });
+    };
+    const result = await this.signedWsOrRest(
+      "order.cancelReplace",
+      "POST",
+      "/v3/order/cancelReplace",
+      params,
+      { retrySafe: false }
+    );
     return { ...result, adjustments };
   }
 
   async accountRateLimits() {
-    return this.signedRest("GET", "/v3/rateLimit/order");
+    return this.signedWsOrRest(
+      "account.rateLimits.orders",
+      "GET",
+      "/v3/rateLimit/order"
+    );
   }
 
   async accountCommission({ symbol }) {
-    return this.signedRest("GET", "/v3/account/commission", {
-      symbol: this.validateSymbol(symbol),
-    });
+    return this.signedWsOrRest(
+      "account.commission",
+      "GET",
+      "/v3/account/commission",
+      {
+        symbol: this.validateSymbol(symbol),
+      }
+    );
   }
 
   async queryOrderList({ orderListId, origClientOrderId }) {
     if (!orderListId && !origClientOrderId) {
       throw new BinanceApiError("查询组合订单必须提供 orderListId 或 origClientOrderId。");
     }
-    return this.signedRest("GET", "/v3/orderList", {
+    return this.signedWsOrRest("orderList.status", "GET", "/v3/orderList", {
       orderListId,
       origClientOrderId,
     });
   }
 
   async openOrderLists() {
-    return this.signedRest("GET", "/v3/openOrderList");
+    return this.signedWsOrRest(
+      "openOrderLists.status",
+      "GET",
+      "/v3/openOrderList"
+    );
   }
 
   async cancelOrderList({ symbol, orderListId, listClientOrderId }) {
     if (!orderListId && !listClientOrderId) {
       throw new BinanceApiError("撤销组合订单必须提供 orderListId 或 listClientOrderId。");
     }
-    return this.signedRest("DELETE", "/v3/orderList", {
+    return this.signedWsOrRest("orderList.cancel", "DELETE", "/v3/orderList", {
       symbol: this.validateSymbol(symbol),
       orderListId,
       listClientOrderId,
@@ -909,13 +949,19 @@ class BinanceSpotClient extends EventEmitter {
           belowPrice: alignPrice(belowPrice),
         };
 
-    return this.signedRest("POST", "/v3/orderList/oco", {
-      symbol: this.validateSymbol(symbol),
-      side: normalizedSide,
-      quantity: alignedQuantity,
-      ...sideSpecificParams,
-      newOrderRespType: "RESULT",
-    });
+    return this.signedWsOrRest(
+      "orderList.place.oco",
+      "POST",
+      "/v3/orderList/oco",
+      {
+        symbol: this.validateSymbol(symbol),
+        side: normalizedSide,
+        quantity: alignedQuantity,
+        ...sideSpecificParams,
+        newOrderRespType: "RESULT",
+      },
+      { retrySafe: false }
+    );
   }
 
   async placeOto({
@@ -934,20 +980,26 @@ class BinanceSpotClient extends EventEmitter {
     const filters = Object.fromEntries((info.symbol?.filters || []).map((filter) => [filter.filterType, filter]));
     const alignPrice = (value) => filters.PRICE_FILTER ? this.alignToStep(value, filters.PRICE_FILTER.tickSize) : String(value);
     const alignQty = (value) => filters.LOT_SIZE ? this.alignToStep(value, filters.LOT_SIZE.stepSize) : String(value);
-    return this.signedRest("POST", "/v3/orderList/oto", {
-      symbol: this.validateSymbol(symbol),
-      workingType: "LIMIT",
-      workingSide: String(workingSide).toUpperCase(),
-      workingPrice: alignPrice(workingPrice),
-      workingQuantity: alignQty(workingQuantity),
-      workingTimeInForce: "GTC",
-      pendingType: "LIMIT",
-      pendingSide: String(pendingSide).toUpperCase(),
-      pendingPrice: alignPrice(pendingPrice),
-      pendingQuantity: alignQty(pendingQuantity),
-      pendingTimeInForce: "GTC",
-      newOrderRespType: "RESULT",
-    });
+    return this.signedWsOrRest(
+      "orderList.place.oto",
+      "POST",
+      "/v3/orderList/oto",
+      {
+        symbol: this.validateSymbol(symbol),
+        workingType: "LIMIT",
+        workingSide: String(workingSide).toUpperCase(),
+        workingPrice: alignPrice(workingPrice),
+        workingQuantity: alignQty(workingQuantity),
+        workingTimeInForce: "GTC",
+        pendingType: "LIMIT",
+        pendingSide: String(pendingSide).toUpperCase(),
+        pendingPrice: alignPrice(pendingPrice),
+        pendingQuantity: alignQty(pendingQuantity),
+        pendingTimeInForce: "GTC",
+        newOrderRespType: "RESULT",
+      },
+      { retrySafe: false }
+    );
   }
 
   async placeOtoco({
@@ -969,23 +1021,29 @@ class BinanceSpotClient extends EventEmitter {
     const filters = Object.fromEntries((info.symbol?.filters || []).map((filter) => [filter.filterType, filter]));
     const alignPrice = (value) => filters.PRICE_FILTER ? this.alignToStep(value, filters.PRICE_FILTER.tickSize) : String(value);
     const alignQty = (value) => filters.LOT_SIZE ? this.alignToStep(value, filters.LOT_SIZE.stepSize) : String(value);
-    return this.signedRest("POST", "/v3/orderList/otoco", {
-      symbol: this.validateSymbol(symbol),
-      workingType: "LIMIT",
-      workingSide: String(workingSide).toUpperCase(),
-      workingPrice: alignPrice(workingPrice),
-      workingQuantity: alignQty(workingQuantity),
-      workingTimeInForce: "GTC",
-      pendingSide: String(pendingSide).toUpperCase(),
-      pendingQuantity: alignQty(pendingQuantity),
-      pendingAboveType: "LIMIT_MAKER",
-      pendingAbovePrice: alignPrice(pendingAbovePrice),
-      pendingBelowType: "STOP_LOSS_LIMIT",
-      pendingBelowPrice: alignPrice(pendingBelowPrice),
-      pendingBelowStopPrice: alignPrice(pendingBelowStopPrice),
-      pendingBelowTimeInForce: "GTC",
-      newOrderRespType: "RESULT",
-    });
+    return this.signedWsOrRest(
+      "orderList.place.otoco",
+      "POST",
+      "/v3/orderList/otoco",
+      {
+        symbol: this.validateSymbol(symbol),
+        workingType: "LIMIT",
+        workingSide: String(workingSide).toUpperCase(),
+        workingPrice: alignPrice(workingPrice),
+        workingQuantity: alignQty(workingQuantity),
+        workingTimeInForce: "GTC",
+        pendingSide: String(pendingSide).toUpperCase(),
+        pendingQuantity: alignQty(pendingQuantity),
+        pendingAboveType: "LIMIT_MAKER",
+        pendingAbovePrice: alignPrice(pendingAbovePrice),
+        pendingBelowType: "STOP_LOSS_LIMIT",
+        pendingBelowPrice: alignPrice(pendingBelowPrice),
+        pendingBelowStopPrice: alignPrice(pendingBelowStopPrice),
+        pendingBelowTimeInForce: "GTC",
+        newOrderRespType: "RESULT",
+      },
+      { retrySafe: false }
+    );
   }
 
   createWsApiSignature(params) {
@@ -1012,51 +1070,351 @@ class BinanceSpotClient extends EventEmitter {
     return signedParams;
   }
 
+  createWsTransportError(message, details = {}) {
+    return new BinanceApiError(message, {
+      data: {
+        transport: "websocket",
+        transportFailure: true,
+        ...details,
+      },
+    });
+  }
+
+  isWsTransportError(error) {
+    return error?.data?.transport === "websocket" &&
+      error?.data?.transportFailure === true;
+  }
+
+  startTradingWebSocketInBackground() {
+    if (!this.apiKey || !this.apiSecret || !this.tradingWsApiBase) return;
+    this.tradingWsApiManualClose = false;
+    this.connectTradingWebSocket().catch((error) => {
+      this.lastTradingWsApiError = {
+        message: error.message,
+        time: Date.now(),
+      };
+    });
+  }
+
+  connectTradingWebSocket() {
+    if (!this.tradingWsApiBase) {
+      return Promise.reject(this.createWsTransportError(
+        "当前市场不支持 Binance WebSocket API。",
+        { requestSent: false }
+      ));
+    }
+    if (this.tradingWsApiSocket?.readyState === WebSocket.OPEN) {
+      return Promise.resolve({
+        connected: true,
+        reused: true,
+        url: this.tradingWsApiBase,
+      });
+    }
+    if (this.tradingWsApiConnectionPromise) {
+      return this.tradingWsApiConnectionPromise;
+    }
+
+    clearTimeout(this.tradingWsApiReconnectTimer);
+    this.tradingWsApiReconnectTimer = null;
+    this.tradingWsApiManualClose = false;
+    const connectionPromise = this.openTradingWebSocket();
+    this.tradingWsApiConnectionPromise = connectionPromise;
+    connectionPromise.finally(() => {
+      if (this.tradingWsApiConnectionPromise === connectionPromise) {
+        this.tradingWsApiConnectionPromise = null;
+      }
+    }).catch(() => {});
+    return connectionPromise;
+  }
+
+  openTradingWebSocket() {
+    return new Promise((resolve, reject) => {
+      const url = this.tradingWsApiBase;
+      let socket;
+      let opened = false;
+      let settled = false;
+      let lastError = null;
+
+      const settle = (callback, value) => {
+        if (settled) return;
+        settled = true;
+        callback(value);
+      };
+
+      try {
+        socket = new WebSocket(url);
+      } catch (error) {
+        reject(this.createWsTransportError(
+          `Binance WebSocket API 连接失败：${error.message}`,
+          { cause: error.name, url, requestSent: false }
+        ));
+        return;
+      }
+
+      this.tradingWsApiSocket = socket;
+      const connectTimeoutId = setTimeout(() => {
+        if (opened) return;
+        const error = this.createWsTransportError(
+          "Binance WebSocket API 连接超时。",
+          { url, requestSent: false }
+        );
+        settle(reject, error);
+        socket.terminate();
+      }, WS_API_CONNECT_TIMEOUT_MS);
+
+      socket.on("open", () => {
+        opened = true;
+        clearTimeout(connectTimeoutId);
+        this.tradingWsApiReconnectDelayMs = 1_000;
+        this.lastTradingWsApiError = null;
+        this.startTradingWebSocketHeartbeat(socket);
+        settle(resolve, { connected: true, reused: false, url });
+      });
+
+      socket.on("message", (buffer) => {
+        let message;
+        try {
+          message = JSON.parse(buffer.toString());
+        } catch {
+          return;
+        }
+        if (message?.event?.e === "serverShutdown") {
+          socket.close(1012, "server shutdown");
+          return;
+        }
+        this.handleWsApiResponse(message, socket);
+      });
+
+      socket.on("pong", () => {
+        if (this.tradingWsApiSocket === socket) {
+          this.tradingWsApiHeartbeatAlive = true;
+        }
+      });
+
+      socket.on("error", (error) => {
+        lastError = error;
+        if (!opened) {
+          clearTimeout(connectTimeoutId);
+          settle(reject, this.createWsTransportError(
+            `Binance WebSocket API 连接失败：${error.message}`,
+            { cause: error.name, url, requestSent: false }
+          ));
+        }
+      });
+
+      socket.on("close", (code, reasonBuffer) => {
+        clearTimeout(connectTimeoutId);
+        const wasCurrentSocket = this.tradingWsApiSocket === socket;
+        if (wasCurrentSocket) this.stopTradingWebSocketHeartbeat();
+        const reason = reasonBuffer?.toString() || "";
+        const error = this.createWsTransportError(
+          opened
+            ? "Binance WebSocket API 持久连接已关闭。"
+            : `Binance WebSocket API 连接失败：${lastError?.message || reason || code}`,
+          { code, reason, url, requestSent: false }
+        );
+        if (!opened) settle(reject, error);
+        this.rejectWsApiRequestsForSocket(socket, error);
+        if (wasCurrentSocket) {
+          this.tradingWsApiSocket = null;
+        }
+        if (wasCurrentSocket && !this.tradingWsApiManualClose) {
+          this.scheduleTradingWebSocketReconnect();
+        }
+      });
+    });
+  }
+
+  startTradingWebSocketHeartbeat(socket) {
+    this.stopTradingWebSocketHeartbeat();
+    this.tradingWsApiHeartbeatAlive = true;
+    this.tradingWsApiHeartbeatTimer = setInterval(() => {
+      if (
+        this.tradingWsApiSocket !== socket ||
+        socket.readyState !== WebSocket.OPEN
+      ) {
+        return;
+      }
+      if (!this.tradingWsApiHeartbeatAlive) {
+        socket.terminate();
+        return;
+      }
+      this.tradingWsApiHeartbeatAlive = false;
+      try {
+        socket.ping();
+      } catch {
+        socket.terminate();
+      }
+    }, WS_API_HEARTBEAT_INTERVAL_MS);
+    this.tradingWsApiHeartbeatTimer.unref?.();
+  }
+
+  stopTradingWebSocketHeartbeat() {
+    clearInterval(this.tradingWsApiHeartbeatTimer);
+    this.tradingWsApiHeartbeatTimer = null;
+  }
+
+  scheduleTradingWebSocketReconnect() {
+    if (this.tradingWsApiManualClose || !this.tradingWsApiBase) return;
+    clearTimeout(this.tradingWsApiReconnectTimer);
+    const delay = this.tradingWsApiReconnectDelayMs;
+    this.tradingWsApiReconnectDelayMs = Math.min(delay * 2, 30_000);
+    this.tradingWsApiReconnectTimer = setTimeout(() => {
+      this.connectTradingWebSocket().catch(() => {});
+    }, delay);
+    this.tradingWsApiReconnectTimer.unref?.();
+  }
+
+  disconnectTradingWebSocket(manual = true) {
+    this.tradingWsApiManualClose = manual;
+    clearTimeout(this.tradingWsApiReconnectTimer);
+    this.tradingWsApiReconnectTimer = null;
+    this.stopTradingWebSocketHeartbeat();
+    const socket = this.tradingWsApiSocket;
+    this.tradingWsApiSocket = null;
+    if (!socket) return { disconnected: true };
+
+    this.rejectWsApiRequestsForSocket(
+      socket,
+      this.createWsTransportError(
+        "Binance WebSocket API 持久连接已断开。",
+        { requestSent: false }
+      )
+    );
+    if (socket.readyState === WebSocket.OPEN) {
+      socket.close(1000, "client disconnect");
+    } else {
+      socket.terminate();
+    }
+    return { disconnected: true };
+  }
+
+  getTradingWebSocketStatus() {
+    const readyState = this.tradingWsApiSocket?.readyState;
+    const statusByReadyState = {
+      [WebSocket.CONNECTING]: "connecting",
+      [WebSocket.OPEN]: "connected",
+      [WebSocket.CLOSING]: "closing",
+      [WebSocket.CLOSED]: "disconnected",
+    };
+    return {
+      status: statusByReadyState[readyState] || "disconnected",
+      url: this.tradingWsApiBase,
+      reconnectDelayMs: this.tradingWsApiReconnectDelayMs,
+      lastError: this.lastTradingWsApiError || null,
+    };
+  }
+
   getPersistentWsApiSocket(url = this.wsApiBase) {
     if (
-      url === this.wsApiBase &&
-      this.userDataSocket?.readyState === WebSocket.OPEN &&
-      this.userDataSubscriptionId !== null
+      url === this.tradingWsApiBase &&
+      this.tradingWsApiSocket?.readyState === WebSocket.OPEN
     ) {
-      return this.userDataSocket;
+      return this.tradingWsApiSocket;
     }
     return null;
+  }
+
+  async requestWsApiWithRestFallback(
+    method,
+    params,
+    restFallback,
+    { retrySafe = true } = {}
+  ) {
+    this.assertTradingCredentials();
+    await this.ensureTradingServerTime();
+    const socket = this.getPersistentWsApiSocket(this.tradingWsApiBase);
+
+    if (!socket) {
+      this.startTradingWebSocketInBackground();
+      return {
+        result: await restFallback(),
+        transport: "https-keepalive",
+        fallbackReason: "websocket-not-connected",
+      };
+    }
+
+    try {
+      return {
+        result: await this.requestWsApiOnSocket(
+          socket,
+          method,
+          this.createSignedWsApiParams(params),
+          { url: this.tradingWsApiBase }
+        ),
+        transport: "websocket",
+      };
+    } catch (error) {
+      if (!this.isWsTransportError(error)) throw error;
+      if (
+        this.tradingWsApiSocket === socket &&
+        socket.readyState === WebSocket.OPEN
+      ) {
+        socket.terminate();
+      }
+      this.startTradingWebSocketInBackground();
+      if (!retrySafe && error.data?.requestSent) {
+        throw new BinanceApiError(
+          `${error.message} 请求可能已经到达 Binance，为避免重复操作未自动改用 HTTP。请通过订单状态确认结果。`,
+          {
+            data: {
+              ...error.data,
+              executionStatus: "UNKNOWN",
+              method,
+            },
+          }
+        );
+      }
+      return {
+        result: await restFallback(),
+        transport: "https-keepalive-fallback",
+        fallbackReason: error.message,
+      };
+    }
   }
 
   requestWsApiOnSocket(socket, method, params, { url = this.wsApiBase } = {}) {
     return new Promise((resolve, reject) => {
       if (socket.readyState !== WebSocket.OPEN) {
-        reject(new BinanceApiError("Binance WebSocket API 持久连接不可用。", {
-          data: { method, url, readyState: socket.readyState },
-        }));
+        reject(this.createWsTransportError(
+          "Binance WebSocket API 持久连接不可用。",
+          { method, url, readyState: socket.readyState, requestSent: false }
+        ));
         return;
       }
 
       const id = crypto.randomUUID();
       const timeoutId = setTimeout(() => {
+        const pending = this.wsApiPendingRequests.get(id);
+        if (!pending) return;
         this.wsApiPendingRequests.delete(id);
-        reject(new BinanceApiError("Binance WebSocket API 请求超时。", {
-          data: { method, url },
-        }));
-      }, 15_000);
+        reject(this.createWsTransportError(
+          "Binance WebSocket API 请求超时。",
+          { method, url, requestSent: pending.requestSent }
+        ));
+        if (this.tradingWsApiSocket === socket) socket.terminate();
+      }, WS_API_REQUEST_TIMEOUT_MS);
 
-      this.wsApiPendingRequests.set(id, {
+      const pending = {
         socket,
         method,
         url,
         timeoutId,
+        requestSent: false,
         resolve,
         reject,
-      });
+      };
+      this.wsApiPendingRequests.set(id, pending);
 
       try {
         socket.send(JSON.stringify({ id, method, params }));
+        pending.requestSent = true;
       } catch (error) {
         clearTimeout(timeoutId);
         this.wsApiPendingRequests.delete(id);
-        reject(new BinanceApiError(
+        reject(this.createWsTransportError(
           `Binance WebSocket API 请求发送失败：${error.message}`,
-          { data: { cause: error.name, method, url } }
+          { cause: error.name, method, url, requestSent: false }
         ));
       }
     });
@@ -1097,171 +1455,21 @@ class BinanceSpotClient extends EventEmitter {
       if (pending.socket !== socket) continue;
       clearTimeout(pending.timeoutId);
       this.wsApiPendingRequests.delete(id);
-      pending.reject(error);
+      pending.reject(this.createWsTransportError(error.message, {
+        ...error.data,
+        method: pending.method,
+        requestSent: pending.requestSent,
+      }));
     }
-  }
-
-  requestWsApi(
-    method,
-    params,
-    {
-      url = this.wsApiBase,
-    } = {}
-  ) {
-
-    const persistentSocket = this.getPersistentWsApiSocket(url);
-    if (persistentSocket) {
-      return this.requestWsApiOnSocket(persistentSocket, method, params, { url });
-    }
-
-    return new Promise((resolve, reject) => {
-      let socket;
-      let settled = false;
-      let timeoutId;
-
-      const finish = (callback, value) => {
-        if (settled) {
-          return;
-        }
-
-        settled = true;
-        clearTimeout(timeoutId);
-
-        if (socket) {
-          if (socket.readyState === WebSocket.OPEN) {
-            socket.close(1000, "request complete");
-          } else if (socket.readyState === WebSocket.CONNECTING) {
-            socket.terminate();
-          }
-        }
-
-        callback(value);
-      };
-
-      try {
-        socket = new WebSocket(url);
-      } catch (error) {
-        finish(
-          reject,
-          new BinanceApiError(`Binance WebSocket API 连接失败：${error.message}`, {
-            data: { cause: error.name, url },
-          })
-        );
-        return;
-      }
-
-      timeoutId = setTimeout(() => {
-        finish(
-          reject,
-          new BinanceApiError("Binance WebSocket API 请求超时。", {
-            data: { method, url },
-          })
-        );
-      }, 15_000);
-
-      socket.on("open", () => {
-        try {
-          socket.send(
-            JSON.stringify({
-              id: crypto.randomUUID(),
-              method,
-              params,
-            })
-          );
-        } catch (error) {
-          finish(
-            reject,
-            new BinanceApiError(
-              `Binance WebSocket API 请求发送失败：${error.message}`,
-              { data: { cause: error.name, url } }
-            )
-          );
-        }
-      });
-
-      socket.on("message", (buffer) => {
-        let message;
-
-        try {
-          message = JSON.parse(buffer.toString());
-        } catch (error) {
-          finish(
-            reject,
-            new BinanceApiError(
-              `Binance WebSocket API 响应解析失败：${error.message}`,
-              { data: { cause: error.name, url } }
-            )
-          );
-          return;
-        }
-
-        if (
-          message.error ||
-          (message.status !== undefined &&
-            (message.status < 200 || message.status >= 300))
-        ) {
-          const apiError = message.error || {};
-          finish(
-            reject,
-            new BinanceApiError(
-              apiError.msg || `Binance WebSocket API HTTP ${message.status}`,
-              {
-                status: message.status,
-                code: apiError.code,
-                data: message,
-              }
-            )
-          );
-          return;
-        }
-
-        finish(resolve, message.result);
-      });
-
-      socket.on("error", (error) => {
-        finish(
-          reject,
-          new BinanceApiError(`请求 Binance WebSocket API 失败：${error.message}`, {
-            data: { cause: error.name, url },
-          })
-        );
-      });
-
-      socket.on("close", (code, reasonBuffer) => {
-        if (settled) {
-          return;
-        }
-
-        const reason = reasonBuffer?.toString() || "";
-        finish(
-          reject,
-          new BinanceApiError("Binance WebSocket API 连接已关闭。", {
-            data: { code, reason, url },
-          })
-        );
-      });
-    });
   }
 
   async allOrders({ symbol, orderId, startTime, endTime, limit = 100 } = {}) {
-    const normalizedSymbol = this.validateSymbol(symbol);
-    this.assertTradingCredentials();
-
-    const { offsetMs } = await this.ensureTradingServerTime();
-    const params = this.normalizeParams({
-      symbol: normalizedSymbol,
+    return this.signedWsOrRest("allOrders", "GET", "/v3/allOrders", {
+      symbol: this.validateSymbol(symbol),
       orderId,
       startTime,
       endTime,
       limit,
-      recvWindow: 5_000,
-      apiKey: this.apiKey,
-      timestamp: Date.now() + offsetMs,
-    });
-
-    params.signature = this.createWsApiSignature(params);
-    return this.requestWsApi("allOrders", params, {
-      url: this.tradingWsApiBase,
     });
   }
 
@@ -1273,62 +1481,36 @@ class BinanceSpotClient extends EventEmitter {
     fromId,
     limit = 100,
   } = {}) {
-    const normalizedSymbol = this.validateSymbol(symbol);
-    this.assertTradingCredentials();
-
-    const timeBase = this.tradingRestBase;
-    const { offsetMs } = await this.ensureServerTimeForBase(timeBase);
-    const params = this.normalizeParams({
-      symbol: normalizedSymbol,
+    return this.signedWsOrRest("myTrades", "GET", "/v3/myTrades", {
+      symbol: this.validateSymbol(symbol),
       orderId,
       startTime,
       endTime,
       fromId,
       limit,
-      recvWindow: 5_000,
-      apiKey: this.apiKey,
-      timestamp: Date.now() + offsetMs,
     });
-
-    params.signature = this.createWsApiSignature(params);
-    return this.requestWsApi("myTrades", params);
   }
 
   async accountStatus({ omitZeroBalances } = {}) {
-    this.assertTradingCredentials();
-
-    const timeBase = this.tradingRestBase;
-    const { offsetMs } = await this.ensureServerTimeForBase(timeBase);
-    const params = {
+    return this.signedWsOrRest("account.status", "GET", "/v3/account", {
       ...(omitZeroBalances === undefined
         ? {}
         : { omitZeroBalances: Boolean(omitZeroBalances) }),
-      recvWindow: "5000",
-      apiKey: this.apiKey,
-      timestamp: String(Date.now() + offsetMs),
-    };
-
-    params.signature = this.createWsApiSignature(params);
-    return this.requestWsApi("account.status", params);
+    });
   }
 
   async allOrderLists({ fromId, startTime, endTime, limit = 100 } = {}) {
-    this.assertTradingCredentials();
-
-    const timeBase = this.tradingRestBase;
-    const { offsetMs } = await this.ensureServerTimeForBase(timeBase);
-    const params = this.normalizeParams({
-      fromId,
-      startTime,
-      endTime,
-      limit,
-      recvWindow: 5_000,
-      apiKey: this.apiKey,
-      timestamp: Date.now() + offsetMs,
-    });
-
-    params.signature = this.createWsApiSignature(params);
-    return this.requestWsApi("allOrderLists", params);
+    return this.signedWsOrRest(
+      "allOrderLists",
+      "GET",
+      "/v3/allOrderList",
+      {
+        fromId,
+        startTime,
+        endTime,
+        limit,
+      }
+    );
   }
 
   async connectUserData() {
@@ -1991,6 +2173,7 @@ class BinanceSpotClient extends EventEmitter {
     this.serverTimeRefreshTimer = null;
     this.disconnectMarket();
     this.disconnectUserData();
+    this.disconnectTradingWebSocket();
     if (this.publicHttpsAgent && this.publicHttpsAgent !== this.httpsAgent) {
       this.publicHttpsAgent.destroy();
     }

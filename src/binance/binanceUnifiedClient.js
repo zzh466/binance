@@ -138,7 +138,11 @@ class BinanceUnifiedClient extends EventEmitter {
   }
 
   async initialize() {
-    return this.spot.initialize();
+    const result = await this.spot.initialize();
+    if (this.futures.apiKey && this.futures.apiSecret) {
+      this.initializeFuturesInBackground();
+    }
+    return result;
   }
 
   initializeFuturesInBackground() {

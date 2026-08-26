@@ -1,7 +1,10 @@
 const assert = require("node:assert/strict");
 const test = require("node:test");
 const { BinanceApiError } = require("../src/binance/binanceSpotClient");
-const { BinanceUsdMClient } = require("../src/binance/binanceUsdMClient");
+const {
+  BinanceUsdMClient,
+  FUTURES_WS_API_BASE,
+} = require("../src/binance/binanceUsdMClient");
 const {
   BinanceUnifiedClient,
   MARKET_FUTURES,
@@ -33,6 +36,16 @@ function futuresSymbol(symbol = "SKHYUSDT") {
   };
 }
 
+function seedTradingTime(client) {
+  client.serverTimeCache.set(client.tradingRestBase, {
+    serverTime: Date.now(),
+    localMidpoint: Date.now(),
+    offsetMs: 0,
+    baseUrl: client.tradingRestBase,
+    synchronizedAt: Date.now(),
+  });
+}
+
 test("USDⓈ-M exchangeInfo 从 Futures 列表中解析指定合约", async () => {
   const client = new BinanceUsdMClient({ testnet: false });
   client.request = async (method, path) => {
@@ -48,17 +61,32 @@ test("USDⓈ-M exchangeInfo 从 Futures 列表中解析指定合约", async () =
   client.close();
 });
 
-test("永续下单复用统一表单并映射 Spot 风格止损限价类型", async () => {
+test("永续下单通过 WebSocket 并映射 Spot 风格止损限价类型", async () => {
   const client = new BinanceUsdMClient({
     apiKey: "future-key",
     apiSecret: "future-secret",
   });
   client.exchangeInfo = async () => ({ symbol: futuresSymbol() });
+  seedTradingTime(client);
   let submitted;
-  client.signedRest = async (method, path, params) => {
-    submitted = { method, path, params };
-    return { symbol: params.symbol, orderId: 7, status: "NEW" };
+  const socket = {
+    readyState: 1,
+    send(payload) {
+      submitted = JSON.parse(payload);
+      setImmediate(() => client.handleWsApiResponse({
+        id: submitted.id,
+        status: 200,
+        result: { symbol: submitted.params.symbol, orderId: 7, status: "NEW" },
+      }, socket));
+    },
+    close() {
+      this.readyState = 3;
+    },
+    terminate() {
+      this.readyState = 3;
+    },
   };
+  client.tradingWsApiSocket = socket;
 
   const result = await client.placeOrder({
     symbol: "SKHYUSDT",
@@ -70,11 +98,103 @@ test("永续下单复用统一表单并映射 Spot 风格止损限价类型", as
     timeInForce: "GTC",
   });
 
-  assert.equal(submitted.path, "/fapi/v1/order");
+  assert.equal(submitted.method, "order.place");
   assert.equal(submitted.params.type, "STOP");
   assert.equal(submitted.params.quantity, "0.031");
   assert.equal(submitted.params.price, "200.1");
   assert.equal(result.marketType, MARKET_FUTURES);
+  assert.equal(result.transport, "websocket");
+  client.close();
+});
+
+test("USDⓈ-M 正式和测试环境使用各自官方 WebSocket API", () => {
+  const production = new BinanceUsdMClient({ testnet: false });
+  const testnet = new BinanceUsdMClient({ testnet: true });
+  assert.equal(production.tradingWsApiBase, FUTURES_WS_API_BASE.production);
+  assert.equal(testnet.tradingWsApiBase, FUTURES_WS_API_BASE.testnet);
+  production.close();
+  testnet.close();
+});
+
+for (const platform of ["darwin", "win32"]) {
+  test(`${platform} WebSocket 失效后安全查询自动降级到 HTTP`, async () => {
+    const client = new BinanceUsdMClient({
+      apiKey: "future-key",
+      apiSecret: "future-secret",
+      platform,
+    });
+    seedTradingTime(client);
+    client.tradingWsApiSocket = {
+      readyState: 1,
+      close() {},
+      terminate() {},
+    };
+    client.requestWsApiOnSocket = async () => {
+      throw client.createWsTransportError("连接已失效。", {
+        requestSent: true,
+      });
+    };
+    let reconnectRequested = false;
+    client.startTradingWebSocketInBackground = () => {
+      reconnectRequested = true;
+    };
+    let submitted;
+    client.request = async (method, path, params, signed, baseUrl) => {
+      submitted = { method, path, params, signed, baseUrl };
+      return { symbol: params.symbol, orderId: 9, status: "NEW" };
+    };
+
+    const result = await client.queryOrder({
+      symbol: "BTCUSDT",
+      orderId: 9,
+    });
+
+    assert.equal(result.orderId, 9);
+    assert.equal(submitted.method, "GET");
+    assert.equal(submitted.path, "/fapi/v1/order");
+    assert.equal(submitted.signed, true);
+    assert.equal(submitted.baseUrl, client.tradingRestBase);
+    assert.equal(reconnectRequested, true);
+    client.tradingWsApiSocket = null;
+    client.close();
+  });
+}
+
+test("真实下单已写入 WebSocket 后响应丢失时不会用 HTTP 重复报单", async () => {
+  const client = new BinanceUsdMClient({
+    apiKey: "future-key",
+    apiSecret: "future-secret",
+  });
+  seedTradingTime(client);
+  client.exchangeInfo = async () => ({ symbol: futuresSymbol() });
+  client.tradingWsApiSocket = {
+    readyState: 1,
+    close() {},
+    terminate() {},
+  };
+  client.requestWsApiOnSocket = async () => {
+    throw client.createWsTransportError("连接在发送后关闭。", {
+      requestSent: true,
+    });
+  };
+  let httpOrderCount = 0;
+  client.request = async () => {
+    httpOrderCount += 1;
+    return {};
+  };
+
+  await assert.rejects(
+    client.placeOrder({
+      symbol: "SKHYUSDT",
+      side: "BUY",
+      type: "LIMIT",
+      quantity: "0.1",
+      price: "200",
+    }),
+    (error) => error.data?.executionStatus === "UNKNOWN"
+  );
+  assert.equal(httpOrderCount, 0);
+  client.tradingWsApiSocket = null;
   client.close();
 });
 

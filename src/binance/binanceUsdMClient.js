@@ -16,8 +16,13 @@ const FUTURES_REST_BASE = {
 };
 
 const FUTURES_WS_BASE = {
-  testnet: "wss://fstream.binancefuture.com/ws",
+  testnet: "wss://demo-fstream.binance.com/ws",
   production: "wss://fstream.binance.com/ws",
+};
+
+const FUTURES_WS_API_BASE = {
+  testnet: "wss://testnet.binancefuture.com/ws-fapi/v1",
+  production: "wss://ws-fapi.binance.com/ws-fapi/v1",
 };
 
 const FUTURES_DOH_ENDPOINT = "https://doh.pub/dns-query";
@@ -147,8 +152,10 @@ class BinanceUsdMClient extends BinanceSpotClient {
     this.wsBase = this.testnet
       ? FUTURES_WS_BASE.testnet
       : FUTURES_WS_BASE.production;
-    this.wsApiBase = null;
-    this.tradingWsApiBase = null;
+    this.wsApiBase = this.testnet
+      ? FUTURES_WS_API_BASE.testnet
+      : FUTURES_WS_API_BASE.production;
+    this.tradingWsApiBase = this.wsApiBase;
     this.timePath = "/fapi/v1/time";
     this.pingPath = "/fapi/v1/ping";
     this.depthPath = "/fapi/v1/depth";
@@ -435,6 +442,15 @@ class BinanceUsdMClient extends BinanceSpotClient {
     }
   }
 
+  createSignedWsApiParams(params = {}) {
+    const signedParams = super.createSignedWsApiParams(params);
+    delete signedParams.signature;
+    signedParams.recvWindow = Number(signedParams.recvWindow);
+    signedParams.timestamp = Number(signedParams.timestamp);
+    signedParams.signature = this.createWsApiSignature(signedParams);
+    return signedParams;
+  }
+
   async exchangeInfo(symbol, { forceRefresh = false } = {}) {
     const normalizedSymbol = this.validateSymbol(symbol);
     const cached = this.exchangeInfoCache.get(normalizedSymbol);
@@ -651,17 +667,34 @@ class BinanceUsdMClient extends BinanceSpotClient {
 
   async placeOrder(order, { testOnly = false } = {}) {
     const { params, adjustments } = await this.prepareOrder(order);
-    const result = await this.signedRest(
-      "POST",
-      testOnly ? "/fapi/v1/order/test" : "/fapi/v1/order",
-      params
-    );
+    let result;
+    let transport;
+    let fallbackReason;
+    if (testOnly) {
+      result = await this.signedRest("POST", "/fapi/v1/order/test", params);
+      transport = "https-keepalive";
+    } else {
+      ({ result, transport, fallbackReason } =
+        await this.requestWsApiWithRestFallback(
+          "order.place",
+          params,
+          () => this.request(
+            "POST",
+            "/fapi/v1/order",
+            params,
+            true,
+            this.tradingRestBase
+          ),
+          { retrySafe: false }
+        ));
+    }
     return {
       ...result,
       marketType: this.marketType,
       testOnly,
       adjustments,
-      transport: "https-keepalive",
+      transport,
+      ...(fallbackReason ? { fallbackReason } : {}),
       preflightBalanceCheck: false,
     };
   }
@@ -670,19 +703,36 @@ class BinanceUsdMClient extends BinanceSpotClient {
     if (!orderId && !origClientOrderId) {
       throw new BinanceApiError("撤单必须提供 orderId 或 origClientOrderId。");
     }
-    const result = await this.signedRest("DELETE", "/fapi/v1/order", {
+    const params = {
       symbol: this.validateSymbol(symbol),
       orderId,
       origClientOrderId,
-    });
-    return { ...result, marketType: this.marketType, transport: "https-keepalive" };
+    };
+    const { result, transport, fallbackReason } =
+      await this.requestWsApiWithRestFallback(
+        "order.cancel",
+        params,
+        () => this.request(
+          "DELETE",
+          "/fapi/v1/order",
+          params,
+          true,
+          this.tradingRestBase
+        )
+      );
+    return {
+      ...result,
+      marketType: this.marketType,
+      transport,
+      ...(fallbackReason ? { fallbackReason } : {}),
+    };
   }
 
   async queryOrder({ symbol, orderId, origClientOrderId }) {
     if (!orderId && !origClientOrderId) {
       throw new BinanceApiError("查询单笔订单必须提供 orderId 或 origClientOrderId。");
     }
-    return this.signedRest("GET", "/fapi/v1/order", {
+    return this.signedWsOrRest("order.status", "GET", "/fapi/v1/order", {
       symbol: this.validateSymbol(symbol),
       orderId,
       origClientOrderId,
@@ -724,14 +774,20 @@ class BinanceUsdMClient extends BinanceSpotClient {
     const quantity = lotSize
       ? this.alignToStep(newQty, lotSize.stepSize)
       : String(newQty);
-    return this.signedRest("PUT", "/fapi/v1/order", {
-      symbol: this.validateSymbol(symbol),
-      orderId,
-      origClientOrderId,
-      side: current.side,
-      quantity,
-      price: current.price,
-    });
+    return this.signedWsOrRest(
+      "order.modify",
+      "PUT",
+      "/fapi/v1/order",
+      {
+        symbol: this.validateSymbol(symbol),
+        orderId,
+        origClientOrderId,
+        side: current.side,
+        quantity,
+        price: current.price,
+      },
+      { retrySafe: false }
+    );
   }
 
   async cancelReplace({ cancelOrderId, cancelOrigClientOrderId, ...order }) {
@@ -780,7 +836,11 @@ class BinanceUsdMClient extends BinanceSpotClient {
   }
 
   async accountStatus({ omitZeroBalances } = {}) {
-    const account = await this.signedRest("GET", "/fapi/v2/account");
+    const account = await this.signedWsOrRest(
+      "account.status",
+      "GET",
+      "/fapi/v2/account"
+    );
     let assets = Array.isArray(account.assets) ? account.assets : [];
     if (omitZeroBalances) {
       assets = assets.filter((asset) =>
@@ -1034,4 +1094,5 @@ module.exports = {
   BinanceUsdMClient,
   FUTURES_REST_BASE,
   FUTURES_WS_BASE,
+  FUTURES_WS_API_BASE,
 };

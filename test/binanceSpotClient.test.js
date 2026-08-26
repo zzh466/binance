@@ -153,7 +153,7 @@ test("签名请求复用后台同步的服务器时间，不逐笔访问 /time",
   assert.equal(result.offsetMs, 8);
 });
 
-test("下单优先复用账户事件 WebSocket，且低延迟模式不做余额预查", async () => {
+test("下单优先复用独立交易 WebSocket，且低延迟模式不做余额预查", async () => {
   const client = createClient();
   client.serverTimeCache.set(client.tradingRestBase, {
     serverTime: Date.now(),
@@ -196,9 +196,14 @@ test("下单优先复用账户事件 WebSocket，且低延迟模式不做余额�
         },
       }, socket));
     },
+    close() {
+      this.readyState = 3;
+    },
+    terminate() {
+      this.readyState = 3;
+    },
   };
-  client.userDataSocket = socket;
-  client.userDataSubscriptionId = 0;
+  client.tradingWsApiSocket = socket;
 
   const result = await client.placeOrder({ symbol: "BTCUSDT" });
   assert.equal(result.orderId, 123);
@@ -206,7 +211,7 @@ test("下单优先复用账户事件 WebSocket，且低延迟模式不做余额�
   assert.equal(result.preflightBalanceCheck, false);
 });
 
-test("单笔撤单优先复用账户事件 WebSocket", async () => {
+test("单笔撤单优先复用独立交易 WebSocket", async () => {
   const client = createClient();
   client.serverTimeCache.set(client.tradingRestBase, {
     serverTime: Date.now(),
@@ -234,9 +239,14 @@ test("单笔撤单优先复用账户事件 WebSocket", async () => {
         },
       }, socket));
     },
+    close() {
+      this.readyState = 3;
+    },
+    terminate() {
+      this.readyState = 3;
+    },
   };
-  client.userDataSocket = socket;
-  client.userDataSubscriptionId = 0;
+  client.tradingWsApiSocket = socket;
 
   const result = await client.cancelOrder({
     symbol: "BTCUSDT",

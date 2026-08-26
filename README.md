@@ -16,7 +16,7 @@
 - 账户信息、成交历史、手续费率和下单限频。
 - OCO、OTO、OTOCO 创建；组合订单历史、当前组合挂单、单笔查询和撤销。
 - Spot 与 USDⓈ-M User Data Stream 实时接收订单、成交和账户事件，永续订单事件会转换为页面统一使用的 `executionReport`，断线自动重连。
-- Spot 普通订单优先复用 User Data Stream 所在的 WebSocket API 持久连接，通过 `order.place` 报单；连接不可用时回退到 HTTPS Keep-Alive。USDⓈ-M 普通订单通过 Futures HTTPS Keep-Alive 提交。
+- Spot 与 USDⓈ-M 分别维护独立的交易 WebSocket API 持久连接；官方支持的下单、撤单、改单、订单及账户查询优先走 WebSocket，连接不可用时自动回退到 HTTPS Keep-Alive，并在后台指数退避重连。若真实下单已经写入 WebSocket 但响应丢失，程序不会用 HTTP 盲目重报，以避免重复委托，而是返回 `UNKNOWN` 提醒查询订单状态。
 - 报单和撤单只在收到 Binance 成功响应或 `executionReport` 后更新行情图，不使用本地乐观状态；确认后立即重绘。
 - 页面顶部提供“系统 / 配置”菜单；“配置 → 快捷键”以列表维护按键、动作、方向、超价和手数，支持新增、编辑、删除与恢复默认。设置保存在本机的 `~/Library/Application Support/Binance统一交易台/shortcut-settings.json`。
 - 行情图上方只保留一个“全局合约”输入框；行情、下单、撤单、订单与成交查询、手续费和组合订单等功能统一读取该合约，点击“切换行情”或按 Enter 可重连行情。
@@ -63,7 +63,9 @@ npm start
 
 运行时代码支持 macOS 和 Windows。正式环境 USDⓈ-M 的公共 REST 行情会依次尝试 Electron Chromium 网络栈、Node HTTPS 和可选 curl 后备，并缓存当前机器已验证可用的传输；Windows 不要求安装 curl。需要显式指定后备 curl 时，可在 `.env` 设置 `BINANCE_CURL_PATH=C:\\完整路径\\curl.exe`。打包后的 macOS 应用从 `.app` 同级读取 `.env`，Windows 应用从 `.exe` 同级读取 `.env`。
 
-## 生成 macOS 应用与三开
+## 生成桌面应用与三开
+
+### macOS
 
 在 Apple Silicon Mac 上执行：
 
@@ -72,6 +74,24 @@ npm run build:mac
 ```
 
 产物位于 `dist/mac-arm64/Binance统一交易台.app`，可直接双击运行。构建脚本不会把密钥封装进 `.app`，而是把当前 `.env` 以 `600` 权限放在应用旁边；移动应用时需要同时移动该 `.env`，或在目标目录按 `.env.example` 重新配置。
+
+### Windows
+
+在 Windows 10/11 上安装 Node.js 22.12 或更高版本，然后在 PowerShell 或命令提示符中执行：
+
+```powershell
+npm install
+npm run build:win
+```
+
+`build:win` 为主流 Intel/AMD 电脑生成 x64 版本；Windows ARM 电脑可执行 `npm run build:win:arm64`，需要同时生成两个架构时执行 `npm run build:win:all`。只想快速验证不生成安装程序时，可执行 `npm run build:win:dir`。
+
+正式构建会在 `dist` 目录同时生成以下两类产物：
+
+- `Binance统一交易台-1.0.0-Windows-x64.exe`：可选择安装目录的 NSIS 安装程序。
+- `Binance统一交易台-1.0.0-Windows-x64.zip`：解压后直接运行的版本。
+
+构建不会把真实 `.env` 或 API Secret 打进 Windows 包，只会附带 `.env.example`。安装或解压后，把配置保存为主程序 `Binance统一交易台.exe` 同目录下的 `.env`；也可以保存到 `%APPDATA%\Binance统一交易台\.env`。当前未配置 Windows 代码签名证书，因此首次运行时 Windows SmartScreen 可能显示“未知发布者”，确认文件来自本仓库后可选择继续运行。
 
 启动第一份后，点击“系统 → 打开另外两份”，程序会再启动两个使用独立 Chromium 数据目录的实例，避免多实例锁冲突。三份实例共享外部 `.env` 和快捷键 JSON 配置，其他页面本地设置彼此独立。
 
