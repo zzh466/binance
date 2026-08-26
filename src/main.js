@@ -2,21 +2,26 @@ const path = require("node:path");
 const fs = require("node:fs");
 const { spawn } = require("node:child_process");
 const { performance } = require("node:perf_hooks");
-const { app, BrowserWindow, ipcMain, Notification } = require("electron");
+const { app, BrowserWindow, ipcMain, net, Notification } = require("electron");
 const dotenv = require("dotenv");
 const { BinanceUnifiedClient } = require("./binance/binanceUnifiedClient");
 const {
   readShortcutConfig,
   writeShortcutConfig,
 } = require("./shortcutConfigStore");
+const {
+  getAdditionalInstanceLaunch,
+  getPackagedEnvironmentPath,
+} = require("./platformSupport");
 
 function loadEnvironmentFile() {
+  const packagedEnvironmentPath = getPackagedEnvironmentPath({
+    isPackaged: app.isPackaged,
+  });
   const candidates = [
     process.env.BINANCE_ENV_FILE,
     path.join(__dirname, "..", ".env"),
-    app.isPackaged
-      ? path.resolve(process.resourcesPath, "../../..", ".env")
-      : null,
+    packagedEnvironmentPath,
     path.join(app.getPath("appData"), "Binance统一交易台", ".env"),
   ].filter(Boolean);
   const envPath = candidates.find((candidate) => fs.existsSync(candidate));
@@ -95,6 +100,7 @@ function createBinanceClient(testnet) {
     depthSpeed: process.env.BINANCE_DEPTH_SPEED || "100ms",
     depthSnapshotLimit: process.env.BINANCE_DEPTH_SNAPSHOT_LIMIT || 1000,
     depthDisplayLevels: process.env.BINANCE_DEPTH_DISPLAY_LEVELS || 5,
+    publicMarketFetch: (url, options) => net.fetch(url, options),
     preflightBalanceCheck:
       process.env.BINANCE_PREFLIGHT_BALANCE_CHECK === "true",
   });
@@ -109,26 +115,17 @@ function openAdditionalInstances(count = 2) {
 
   for (let index = 1; index <= normalizedCount; index += 1) {
     const childInstanceId = `${launchGroup}-${index}`;
-    let command;
-    let args;
-
-    if (app.isPackaged && process.platform === "darwin") {
-      const appBundlePath = path.resolve(path.dirname(process.execPath), "../..");
-      command = "/usr/bin/open";
-      args = [
-        "-n",
-        appBundlePath,
-        "--args",
-        `--binance-instance=${childInstanceId}`,
-      ];
-    } else {
-      command = process.execPath;
-      args = [app.getAppPath(), `--binance-instance=${childInstanceId}`];
-    }
+    const { command, args } = getAdditionalInstanceLaunch({
+      isPackaged: app.isPackaged,
+      appPath: app.getAppPath(),
+      appBundlePath: path.resolve(path.dirname(process.execPath), "../.."),
+      instanceId: childInstanceId,
+    });
 
     const child = spawn(command, args, {
       detached: true,
       stdio: "ignore",
+      windowsHide: true,
       env: {
         ...process.env,
         ...(loadedEnvironmentPath
@@ -296,6 +293,7 @@ function getClientStatus() {
       futures: {
         restBase: client.futures.restBase,
         wsBase: client.futures.wsBase,
+        publicMarketTransport: client.futures.publicMarketTransport,
         hasApiKey: Boolean(client.futures.apiKey),
         hasApiSecret: Boolean(client.futures.apiSecret),
         credentialsSource: client.futures.credentialsSource,

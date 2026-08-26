@@ -26,6 +26,7 @@ class BinanceUnifiedClient extends EventEmitter {
     depthSnapshotLimit,
     depthDisplayLevels,
     preflightBalanceCheck,
+    publicMarketFetch,
   } = {}) {
     super();
     this.testnet = Boolean(testnet);
@@ -45,6 +46,7 @@ class BinanceUnifiedClient extends EventEmitter {
       ...common,
       apiKey: futuresCredentials.apiKey || "",
       apiSecret: futuresCredentials.apiSecret || "",
+      publicMarketFetch,
     });
     this.spot.credentialsSource = spotCredentials.source || "";
     this.futures.credentialsSource = futuresCredentials.source || "";

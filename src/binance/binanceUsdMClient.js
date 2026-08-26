@@ -4,6 +4,7 @@ const net = require("node:net");
 const tls = require("node:tls");
 const { promisify } = require("node:util");
 const WebSocket = require("ws");
+const { resolveCurlExecutable } = require("../platformSupport");
 const {
   BinanceSpotClient,
   BinanceApiError,
@@ -139,7 +140,7 @@ class BinanceUsdMClient extends BinanceSpotClient {
     this.marketType = "futures";
     this.restBase = this.testnet
       ? FUTURES_REST_BASE.testnet
-      : FUTURES_PUBLIC_REST_BASE;
+      : FUTURES_REST_BASE.production;
     this.tradingRestBase = this.testnet
       ? FUTURES_REST_BASE.testnet
       : FUTURES_REST_BASE.production;
@@ -157,9 +158,15 @@ class BinanceUsdMClient extends BinanceSpotClient {
     this.futuresListenKey = null;
     this.futuresListenKeyKeepAliveTimer = null;
     this.productionMarketTransportPromise = null;
-    if (!this.testnet) {
-      this.publicHostHeader = FUTURES_REST_HOST;
-    }
+    this.platform = options.platform || process.platform;
+    this.publicMarketFetch = options.publicMarketFetch || null;
+    this.publicMarketTransport = null;
+    this.publicMarketTimeoutMs = Math.max(
+      1_000,
+      Number(options.publicMarketTimeoutMs) || 6_000
+    );
+    this.curlExecutable = options.curlExecutable || resolveCurlExecutable();
+    this.executeFile = options.executeFile || execFileAsync;
   }
 
   async ensureProductionMarketTransport() {
@@ -209,59 +216,24 @@ class BinanceUsdMClient extends BinanceSpotClient {
   }
 
   async request(method, path, params = {}, signed = false, baseUrl = this.restBase) {
-    if (!this.testnet && !signed && baseUrl === this.restBase) {
-      return this.requestPublicMarketDataWithCurl(method, path, params);
+    if (
+      !this.testnet &&
+      !signed &&
+      String(method).toUpperCase() === "GET" &&
+      path.startsWith("/fapi/v1/") &&
+      baseUrl === this.restBase
+    ) {
+      return this.requestPublicMarketData(method, path, params);
     }
     return super.request(method, path, params, signed, baseUrl);
   }
 
-  async requestPublicMarketDataWithCurl(method, path, params = {}) {
-    if (String(method).toUpperCase() !== "GET" || !path.startsWith("/fapi/v1/")) {
-      throw new BinanceApiError("Futures 直连后备仅允许读取官方公共行情接口。");
-    }
-
+  createPublicMarketUrl(baseUrl, path, params = {}) {
     const query = new URLSearchParams(this.normalizeParams(params)).toString();
-    const url = `${this.restBase}${path}${query ? `?${query}` : ""}`;
-    let stdout;
-    try {
-      ({ stdout } = await execFileAsync("/usr/bin/curl", [
-        "--silent",
-        "--show-error",
-        "--connect-timeout",
-        "5",
-        "--max-time",
-        "15",
-        "--retry",
-        "2",
-        "--retry-delay",
-        "0",
-        "--retry-all-errors",
-        "--header",
-        `Host: ${FUTURES_REST_HOST}`,
-        "--header",
-        "Accept: application/json",
-        "--write-out",
-        "\n__BINANCE_HTTP_STATUS__:%{http_code}",
-        url,
-      ], {
-        encoding: "utf8",
-        maxBuffer: 20 * 1024 * 1024,
-        timeout: 20_000,
-      }));
-    } catch (error) {
-      throw new BinanceApiError(
-        `请求 Binance Futures 行情失败：${error.stderr?.trim() || error.message}`,
-        { data: { cause: error.name } }
-      );
-    }
+    return `${baseUrl}${path}${query ? `?${query}` : ""}`;
+  }
 
-    const marker = "\n__BINANCE_HTTP_STATUS__:";
-    const markerIndex = stdout.lastIndexOf(marker);
-    if (markerIndex < 0) {
-      throw new BinanceApiError("Binance Futures 行情响应缺少 HTTP 状态。");
-    }
-    const rawText = stdout.slice(0, markerIndex);
-    const statusCode = Number(stdout.slice(markerIndex + marker.length).trim());
+  parsePublicMarketResponse(statusCode, rawText) {
     let data;
     try {
       data = rawText ? JSON.parse(rawText) : {};
@@ -277,6 +249,166 @@ class BinanceUsdMClient extends BinanceSpotClient {
       });
     }
     return data;
+  }
+
+  getPublicMarketTransportOrder() {
+    const defaultOrder = this.platform === "darwin"
+      ? ["electron", "curl", "node"]
+      : ["electron", "node", "curl"];
+    const available = defaultOrder.filter(
+      (transport) => transport !== "electron" || this.publicMarketFetch
+    );
+    if (!this.publicMarketTransport) return available;
+    return [
+      this.publicMarketTransport,
+      ...available.filter((transport) => transport !== this.publicMarketTransport),
+    ];
+  }
+
+  async requestPublicMarketData(method, path, params = {}) {
+    const failures = [];
+    const transports = {
+      electron: () => this.requestPublicMarketDataWithElectron(
+        method,
+        path,
+        params
+      ),
+      node: () => this.requestPublicMarketDataWithNode(method, path, params),
+      curl: () => this.requestPublicMarketDataWithCurl(method, path, params),
+    };
+
+    for (const transport of this.getPublicMarketTransportOrder()) {
+      try {
+        const data = await transports[transport]();
+        this.publicMarketTransport = transport;
+        return data;
+      } catch (error) {
+        if (error?.status) throw error;
+        failures.push({
+          transport,
+          name: error?.name || "Error",
+          message: error?.message || "未知错误",
+          code: error?.data?.code || error?.code,
+        });
+      }
+    }
+
+    throw new BinanceApiError(
+      `请求 Binance Futures 行情失败：${failures
+        .map(({ transport, message }) => `${transport}: ${message}`)
+        .join("；")}`,
+      { data: { transports: failures } }
+    );
+  }
+
+  async requestPublicMarketDataWithElectron(method, path, params = {}) {
+    if (!this.publicMarketFetch) {
+      throw new Error("Electron 原生网络传输不可用。");
+    }
+
+    const url = this.createPublicMarketUrl(
+      FUTURES_REST_BASE.production,
+      path,
+      params
+    );
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), this.publicMarketTimeoutMs);
+    try {
+      const response = await this.publicMarketFetch(url, {
+        method,
+        headers: { Accept: "application/json" },
+        signal: controller.signal,
+      });
+      const rawText = await response.text();
+      return this.parsePublicMarketResponse(Number(response.status), rawText);
+    } catch (error) {
+      if (error instanceof BinanceApiError) throw error;
+      const message = controller.signal.aborted
+        ? `Electron 原生网络请求超时（${this.publicMarketTimeoutMs} ms）`
+        : error.message;
+      throw new BinanceApiError(message, {
+        data: { cause: error.name },
+      });
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  }
+
+  requestPublicMarketDataWithNode(method, path, params = {}) {
+    return super.request(
+      method,
+      path,
+      params,
+      false,
+      FUTURES_REST_BASE.production
+    );
+  }
+
+  async requestPublicMarketDataWithCurl(method, path, params = {}) {
+    if (String(method).toUpperCase() !== "GET" || !path.startsWith("/fapi/v1/")) {
+      throw new BinanceApiError("Futures 直连后备仅允许读取官方公共行情接口。");
+    }
+
+    const url = this.createPublicMarketUrl(
+      FUTURES_PUBLIC_REST_BASE,
+      path,
+      params
+    );
+    const curlArguments = [
+      "--silent",
+      "--show-error",
+      "--connect-timeout",
+      "5",
+      "--max-time",
+      "15",
+      "--header",
+      `Host: ${FUTURES_REST_HOST}`,
+      "--header",
+      "Accept: application/json",
+      "--write-out",
+      "\n__BINANCE_HTTP_STATUS__:%{http_code}",
+      url,
+    ];
+    let stdout;
+    let requestError;
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      try {
+        ({ stdout } = await this.executeFile(
+          this.curlExecutable,
+          curlArguments,
+          {
+            encoding: "utf8",
+            maxBuffer: 20 * 1024 * 1024,
+            timeout: 20_000,
+            windowsHide: true,
+          }
+        ));
+        requestError = null;
+        break;
+      } catch (error) {
+        requestError = error;
+        if (error.code === "ENOENT") break;
+      }
+    }
+
+    if (requestError) {
+      const message = requestError.code === "ENOENT"
+        ? `系统找不到 curl 可执行文件（${this.curlExecutable}）；可通过 BINANCE_CURL_PATH 指定路径。`
+        : requestError.stderr?.trim() || requestError.message;
+      throw new BinanceApiError(
+        `请求 Binance Futures 行情失败：${message}`,
+        { data: { cause: requestError.name, code: requestError.code } }
+      );
+    }
+
+    const marker = "\n__BINANCE_HTTP_STATUS__:";
+    const markerIndex = stdout.lastIndexOf(marker);
+    if (markerIndex < 0) {
+      throw new BinanceApiError("Binance Futures 行情响应缺少 HTTP 状态。");
+    }
+    const rawText = stdout.slice(0, markerIndex);
+    const statusCode = Number(stdout.slice(markerIndex + marker.length).trim());
+    return this.parsePublicMarketResponse(statusCode, rawText);
   }
 
   async connectDepth(symbol) {

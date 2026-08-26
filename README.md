@@ -61,6 +61,8 @@ npm test
 npm start
 ```
 
+运行时代码支持 macOS 和 Windows。正式环境 USDⓈ-M 的公共 REST 行情会依次尝试 Electron Chromium 网络栈、Node HTTPS 和可选 curl 后备，并缓存当前机器已验证可用的传输；Windows 不要求安装 curl。需要显式指定后备 curl 时，可在 `.env` 设置 `BINANCE_CURL_PATH=C:\\完整路径\\curl.exe`。打包后的 macOS 应用从 `.app` 同级读取 `.env`，Windows 应用从 `.exe` 同级读取 `.env`。
+
 ## 生成 macOS 应用与三开
 
 在 Apple Silicon Mac 上执行：
