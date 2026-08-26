@@ -181,7 +181,7 @@
   }
 
   function getActionLabel(action) {
-    if (action === ACTION_ORDER) return "下单";
+    if (action === ACTION_ORDER) return "下单（按数量）";
     if (action === ACTION_ORDER_QUOTE_TOTAL) return "下单（按总价）";
     return "撤单";
   }

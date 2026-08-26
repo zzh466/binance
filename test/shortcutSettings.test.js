@@ -61,6 +61,11 @@ test("按总价下单快捷键保留方向、超价和计价资产总价", () =>
   assert.equal(isOrderAction(ACTION_ORDER_QUOTE_TOTAL), true);
 });
 
+test("按数量和按总价下单动作使用明确的展示名称", () => {
+  assert.equal(getActionLabel(ACTION_ORDER), "下单（按数量）");
+  assert.equal(getActionLabel(ACTION_ORDER_QUOTE_TOTAL), "下单（按总价）");
+});
+
 test("按总价下单快捷键拒绝无效方向、超价和非正数总价", () => {
   const result = validate([{
     id: "invalid-quote-total",
