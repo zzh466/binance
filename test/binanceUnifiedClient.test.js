@@ -46,6 +46,14 @@ function seedTradingTime(client) {
   });
 }
 
+function seedPositionMode(client, dualSidePosition = false) {
+  client.positionModeCache = {
+    dualSidePosition,
+    positionMode: dualSidePosition ? "HEDGE" : "ONE_WAY",
+    loadedAt: Date.now(),
+  };
+}
+
 test("USDⓈ-M exchangeInfo 从 Futures 列表中解析指定合约", async () => {
   const client = new BinanceUsdMClient({ testnet: false });
   client.request = async (method, path) => {
@@ -67,6 +75,7 @@ test("永续下单通过 WebSocket 并映射 Spot 风格止损限价类型", asy
     apiSecret: "future-secret",
   });
   client.exchangeInfo = async () => ({ symbol: futuresSymbol() });
+  seedPositionMode(client);
   seedTradingTime(client);
   let submitted;
   const socket = {
@@ -102,6 +111,7 @@ test("永续下单通过 WebSocket 并映射 Spot 风格止损限价类型", asy
   assert.equal(submitted.params.type, "STOP");
   assert.equal(submitted.params.quantity, "0.031");
   assert.equal(submitted.params.price, "200.1");
+  assert.equal(submitted.params.positionSide, "BOTH");
   assert.equal(submitted.params.selfTradePreventionMode, "EXPIRE_MAKER");
   assert.equal(result.marketType, MARKET_FUTURES);
   assert.equal(result.transport, "websocket");
@@ -112,6 +122,7 @@ test("永续下单通过 WebSocket 并映射 Spot 风格止损限价类型", asy
 test("USDⓈ-M LIMIT 按总价下单时换算 quantity 且不发送 quoteOrderQty", async () => {
   const client = new BinanceUsdMClient({ testnet: true });
   client.exchangeInfo = async () => ({ symbol: futuresSymbol() });
+  seedPositionMode(client);
 
   const result = await client.prepareOrder({
     symbol: "SKHYUSDT",
@@ -124,6 +135,7 @@ test("USDⓈ-M LIMIT 按总价下单时换算 quantity 且不发送 quoteOrderQt
   assert.equal(result.params.price, "200.1");
   assert.equal(result.params.quantity, "0.099");
   assert.equal(result.params.quoteOrderQty, undefined);
+  assert.equal(result.params.positionSide, "BOTH");
   assert.equal(result.orderSizing.referenceSource, "委托价");
   assert.equal(result.orderSizing.convertedQuantity, "0.099");
   client.close();
@@ -132,6 +144,7 @@ test("USDⓈ-M LIMIT 按总价下单时换算 quantity 且不发送 quoteOrderQt
 test("USDⓈ-M MARKET 按总价下单时复用最新成交价缓存", async () => {
   const client = new BinanceUsdMClient({ testnet: true });
   client.exchangeInfo = async () => ({ symbol: futuresSymbol() });
+  seedPositionMode(client);
   client.lastTradePriceCache.set("SKHYUSDT", {
     price: "200",
     loadedAt: Date.now(),
@@ -158,6 +171,7 @@ test("USDⓈ-M MARKET 按总价下单时复用最新成交价缓存", async () =
 test("USDⓈ-M MARKET 与 GTX 会明确标记 STP 不在官方保证范围", async () => {
   const client = new BinanceUsdMClient({ testnet: true });
   client.exchangeInfo = async () => ({ symbol: futuresSymbol() });
+  seedPositionMode(client);
   client.signedRest = async (_method, _path, params) => ({
     symbol: params.symbol,
     status: "TEST_ACCEPTED",
@@ -180,6 +194,101 @@ test("USDⓈ-M MARKET 与 GTX 会明确标记 STP 不在官方保证范围", asy
   assert.equal(market.selfTradePrevention.mode, "EXPIRE_MAKER");
   assert.equal(market.selfTradePrevention.apiEffective, false);
   assert.equal(limitMaker.selfTradePrevention.apiEffective, false);
+  client.close();
+});
+
+test("USDⓈ-M 检测到双向持仓时自动切换为单向并发送 BOTH", async () => {
+  const client = new BinanceUsdMClient({ testnet: true });
+  client.exchangeInfo = async () => ({ symbol: futuresSymbol() });
+  seedPositionMode(client, true);
+  let modeChange;
+  client.signedRest = async (method, path, params) => {
+    modeChange = { method, path, params };
+    return { code: 200, msg: "success" };
+  };
+
+  const result = await client.prepareOrder({
+    symbol: "SKHYUSDT",
+    side: "BUY",
+    type: "LIMIT",
+    quantity: "0.1",
+    price: "200",
+  });
+
+  assert.deepEqual(modeChange, {
+    method: "POST",
+    path: "/fapi/v1/positionSide/dual",
+    params: { dualSidePosition: "false" },
+  });
+  assert.equal(result.params.positionSide, "BOTH");
+  assert.equal(result.positionMode.positionMode, "ONE_WAY");
+  assert.equal(client.positionModeCache.dualSidePosition, false);
+  client.close();
+});
+
+test("USDⓈ-M 持仓模式缓存失效导致 -4061 时刷新模式并仅重试一次", async () => {
+  const client = new BinanceUsdMClient({ testnet: true });
+  client.exchangeInfo = async () => ({ symbol: futuresSymbol() });
+  seedPositionMode(client, false);
+  const submittedPositionSides = [];
+  let modeQueryCount = 0;
+  let modeChangeCount = 0;
+  client.signedRest = async (method, path, params) => {
+    if (method === "GET" && path === "/fapi/v1/positionSide/dual") {
+      modeQueryCount += 1;
+      return { dualSidePosition: true };
+    }
+    if (method === "POST" && path === "/fapi/v1/positionSide/dual") {
+      modeChangeCount += 1;
+      assert.deepEqual(params, { dualSidePosition: "false" });
+      return { code: 200, msg: "success" };
+    }
+    if (path === "/fapi/v1/order/test") {
+      submittedPositionSides.push(params.positionSide);
+      if (submittedPositionSides.length === 1) {
+        throw new BinanceApiError(
+          "Order's position side does not match user's setting",
+          { status: 400, code: -4061 }
+        );
+      }
+      return { status: "TEST_ACCEPTED" };
+    }
+    throw new Error(`未预期的路径：${path}`);
+  };
+
+  const result = await client.placeOrder({
+    symbol: "SKHYUSDT",
+    side: "SELL",
+    type: "LIMIT",
+    quantity: "0.1",
+    price: "200",
+  }, { testOnly: true });
+
+  assert.deepEqual(submittedPositionSides, ["BOTH", "BOTH"]);
+  assert.equal(modeQueryCount, 1);
+  assert.equal(modeChangeCount, 1);
+  assert.equal(result.positionMode, "ONE_WAY");
+  assert.equal(result.positionSide, "BOTH");
+  client.close();
+});
+
+test("USDⓈ-M 存在持仓时不强行切换模式并返回可操作提示", async () => {
+  const client = new BinanceUsdMClient({ testnet: false });
+  seedPositionMode(client, true);
+  client.signedRest = async () => {
+    throw new BinanceApiError("Position mode cannot be changed", {
+      status: 400,
+      code: -4068,
+    });
+  };
+
+  await assert.rejects(
+    client.ensureOneWayPositionMode(),
+    (error) =>
+      error instanceof BinanceApiError &&
+      error.code === -4068 &&
+      /请先平掉所有 U 本位持仓/.test(error.message)
+  );
   client.close();
 });
 
@@ -278,6 +387,7 @@ test("真实下单已写入 WebSocket 后响应丢失时不会用 HTTP 重复报
   });
   seedTradingTime(client);
   client.exchangeInfo = async () => ({ symbol: futuresSymbol() });
+  seedPositionMode(client);
   client.tradingWsApiSocket = {
     readyState: 1,
     close() {},

@@ -30,6 +30,8 @@ const FUTURES_REST_HOST = "fapi.binance.com";
 const FUTURES_STREAM_HOST = "fstream.binance.com";
 const FUTURES_FRONT_SNI = "data-stream.binance.vision";
 const FUTURES_PUBLIC_REST_BASE = "https://d2ukl3c6tymv7q.cloudfront.net";
+const POSITION_MODE_ONE_WAY = "ONE_WAY";
+const POSITION_MODE_HEDGE = "HEDGE";
 const FUTURES_STREAM_BOOTSTRAP_ADDRESSES = [
   "52.192.95.242",
   "54.150.96.238",
@@ -175,6 +177,135 @@ class BinanceUsdMClient extends BinanceSpotClient {
     );
     this.curlExecutable = options.curlExecutable || resolveCurlExecutable();
     this.executeFile = options.executeFile || execFileAsync;
+    this.positionModeCache = null;
+    this.positionModePromise = null;
+    this.positionModeEnforcementPromise = null;
+  }
+
+  async initialize() {
+    await super.initialize();
+    if (this.apiKey && this.apiSecret) {
+      this.preloadOneWayPositionMode();
+    }
+  }
+
+  preloadOneWayPositionMode() {
+    const promise = this.ensureOneWayPositionMode();
+    promise.catch((error) => {
+      this.emit("user-data-error", {
+        marketType: this.marketType,
+        message: `后台设置永续单向持仓模式失败：${error.message}`,
+        time: Date.now(),
+      });
+    });
+    return promise;
+  }
+
+  async getPositionMode({ forceRefresh = false } = {}) {
+    if (!forceRefresh && this.positionModeCache) {
+      return this.positionModeCache;
+    }
+    if (this.positionModePromise) {
+      return this.positionModePromise;
+    }
+
+    this.positionModePromise = (async () => {
+      const result = await this.signedRest(
+        "GET",
+        "/fapi/v1/positionSide/dual"
+      );
+      const dualSidePosition = result?.dualSidePosition === true ||
+        result?.dualSidePosition === "true";
+      const positionMode = dualSidePosition
+        ? POSITION_MODE_HEDGE
+        : POSITION_MODE_ONE_WAY;
+      this.positionModeCache = {
+        dualSidePosition,
+        positionMode,
+        loadedAt: Date.now(),
+      };
+      return this.positionModeCache;
+    })().finally(() => {
+      this.positionModePromise = null;
+    });
+
+    return this.positionModePromise;
+  }
+
+  createPositionModeSwitchError(error) {
+    const messages = {
+      [-4067]: "当前账号存在 U 本位挂单，Binance 不允许切换为单向持仓；请先撤销所有 U 本位挂单。",
+      [-4068]: "当前账号存在 U 本位持仓，Binance 不允许切换为单向持仓；请先平掉所有 U 本位持仓。",
+    };
+    return new BinanceApiError(
+      messages[Number(error?.code)] ||
+        `无法把 U 本位账号切换为单向持仓：${error.message}`,
+      {
+        status: error?.status,
+        code: error?.code,
+        data: error?.data,
+      }
+    );
+  }
+
+  async ensureOneWayPositionMode({ forceRefresh = false } = {}) {
+    if (this.positionModeEnforcementPromise) {
+      return this.positionModeEnforcementPromise;
+    }
+
+    this.positionModeEnforcementPromise = (async () => {
+      const current = await this.getPositionMode({ forceRefresh });
+      if (!current.dualSidePosition) return current;
+
+      try {
+        await this.signedRest("POST", "/fapi/v1/positionSide/dual", {
+          dualSidePosition: "false",
+        });
+      } catch (error) {
+        throw this.createPositionModeSwitchError(error);
+      }
+
+      this.positionModeCache = {
+        dualSidePosition: false,
+        positionMode: POSITION_MODE_ONE_WAY,
+        loadedAt: Date.now(),
+      };
+      return this.positionModeCache;
+    })().finally(() => {
+      this.positionModeEnforcementPromise = null;
+    });
+
+    return this.positionModeEnforcementPromise;
+  }
+
+  async resolveOrderPositionSide(
+    order,
+    side,
+    { forceRefresh = false } = {}
+  ) {
+    const explicitPositionSide = String(order.positionSide || "")
+      .trim()
+      .toUpperCase();
+    if (
+      explicitPositionSide &&
+      !["BOTH", "LONG", "SHORT"].includes(explicitPositionSide)
+    ) {
+      throw new BinanceApiError(
+        `positionSide 只支持 BOTH、LONG 或 SHORT，当前值：${explicitPositionSide}`
+      );
+    }
+    if (explicitPositionSide && explicitPositionSide !== "BOTH") {
+      throw new BinanceApiError(
+        `程序已固定使用单向持仓，positionSide 不能使用 ${explicitPositionSide}。`
+      );
+    }
+    const mode = await this.ensureOneWayPositionMode({ forceRefresh });
+    return { ...mode, positionSide: "BOTH" };
+  }
+
+  isPositionSideMismatchError(error) {
+    return Number(error?.code) === -4061 ||
+      /position side does not match/i.test(error?.message || "");
   }
 
   async ensureProductionMarketTransport() {
@@ -556,7 +687,7 @@ class BinanceUsdMClient extends BinanceSpotClient {
     };
   }
 
-  async prepareOrder(order) {
+  async prepareOrder(order, { forcePositionModeRefresh = false } = {}) {
     const symbol = this.validateSymbol(order.symbol);
     const side = String(order.side || "").toUpperCase();
     const requestedType = String(order.type || "").toUpperCase();
@@ -584,7 +715,12 @@ class BinanceUsdMClient extends BinanceSpotClient {
       throw new BinanceApiError("永续跟踪止损使用 callbackRate，不能直接使用 Spot trailingDelta。");
     }
 
-    const info = await this.exchangeInfo(symbol);
+    const [positionMode, info] = await Promise.all([
+      this.resolveOrderPositionSide(order, side, {
+        forceRefresh: forcePositionModeRefresh,
+      }),
+      this.exchangeInfo(symbol),
+    ]);
     const symbolInfo = info.symbol;
     if (!symbolInfo || symbolInfo.status !== "TRADING") {
       throw new BinanceApiError(`${symbol} 在当前环境不可交易。`);
@@ -599,6 +735,7 @@ class BinanceUsdMClient extends BinanceSpotClient {
     const params = this.normalizeParams({
       symbol,
       side,
+      positionSide: positionMode.positionSide,
       type,
       selfTradePreventionMode: this.requireSelfTradePrevention(symbolInfo),
       timeInForce: mapped.timeInForce || order.timeInForce,
@@ -710,31 +847,55 @@ class BinanceUsdMClient extends BinanceSpotClient {
       this.assertFilterRange("订单金额", notional, minNotional, undefined);
     }
 
-    return { params, adjustments, symbolInfo, orderSizing };
+    return { params, adjustments, symbolInfo, orderSizing, positionMode };
   }
 
-  async placeOrder(order, { testOnly = false } = {}) {
-    const { params, adjustments, orderSizing } = await this.prepareOrder(order);
+  async placeOrder(
+    order,
+    {
+      testOnly = false,
+      positionModeRetry = false,
+      forcePositionModeRefresh = false,
+    } = {}
+  ) {
+    const { params, adjustments, orderSizing, positionMode } =
+      await this.prepareOrder(order, { forcePositionModeRefresh });
     let result;
     let transport;
     let fallbackReason;
-    if (testOnly) {
-      result = await this.signedRest("POST", "/fapi/v1/order/test", params);
-      transport = "https-keepalive";
-    } else {
-      ({ result, transport, fallbackReason } =
-        await this.requestWsApiWithRestFallback(
-          "order.place",
-          params,
-          () => this.request(
-            "POST",
-            "/fapi/v1/order",
+    try {
+      if (testOnly) {
+        result = await this.signedRest("POST", "/fapi/v1/order/test", params);
+        transport = "https-keepalive";
+      } else {
+        ({ result, transport, fallbackReason } =
+          await this.requestWsApiWithRestFallback(
+            "order.place",
             params,
-            true,
-            this.tradingRestBase
-          ),
-          { retrySafe: false }
-        ));
+            () => this.request(
+              "POST",
+              "/fapi/v1/order",
+              params,
+              true,
+              this.tradingRestBase
+            ),
+            { retrySafe: false }
+          ));
+      }
+    } catch (error) {
+      if (
+        !positionModeRetry &&
+        !order.positionSide &&
+        this.isPositionSideMismatchError(error)
+      ) {
+        this.positionModeCache = null;
+        return this.placeOrder(order, {
+          testOnly,
+          positionModeRetry: true,
+          forcePositionModeRefresh: true,
+        });
+      }
+      throw error;
     }
     return {
       ...result,
@@ -742,6 +903,8 @@ class BinanceUsdMClient extends BinanceSpotClient {
       testOnly,
       adjustments,
       orderSizing,
+      positionMode: positionMode.positionMode,
+      positionSide: positionMode.positionSide,
       selfTradePrevention: {
         mode: this.selfTradePreventionMode,
         enforced: true,
@@ -830,6 +993,10 @@ class BinanceUsdMClient extends BinanceSpotClient {
     const quantity = lotSize
       ? this.alignToStep(newQty, lotSize.stepSize)
       : String(newQty);
+    const positionMode = await this.resolveOrderPositionSide(
+      { positionSide: current.positionSide },
+      current.side
+    );
     return this.signedWsOrRest(
       "order.modify",
       "PUT",
@@ -839,6 +1006,7 @@ class BinanceUsdMClient extends BinanceSpotClient {
         orderId,
         origClientOrderId,
         side: current.side,
+        positionSide: positionMode.positionSide,
         quantity,
         price: current.price,
       },
@@ -985,6 +1153,8 @@ class BinanceUsdMClient extends BinanceSpotClient {
       n: order.n,
       N: order.N,
       t: order.t,
+      ps: order.ps,
+      positionSide: order.ps,
       marketType: this.marketType,
       rawEvent: message,
     };
