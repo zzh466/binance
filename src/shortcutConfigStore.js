@@ -2,7 +2,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { cloneDefaults, validate } = require("./shortcutSettings");
 
-const SHORTCUT_CONFIG_VERSION = 1;
+const SHORTCUT_CONFIG_VERSION = 2;
 
 function normalizeShortcutConfig(payload) {
   const source = Array.isArray(payload)

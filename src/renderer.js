@@ -1970,6 +1970,7 @@ const shortcutEditorFields = {
   direction: document.querySelector("#shortcutEditorDirection"),
   priceOffset: document.querySelector("#shortcutEditorPriceOffset"),
   quantity: document.querySelector("#shortcutEditorQuantity"),
+  amountLabel: document.querySelector("#shortcutEditorAmountLabel"),
 };
 let shortcutSettings = shortcutApi.cloneDefaults();
 let editingShortcutId = null;
@@ -2034,10 +2035,14 @@ function updateShortcutSummary() {
     if (shortcut.action === shortcutApi.ACTION_CANCEL_ALL) {
       return `${key} = 撤销全部未成交订单`;
     }
+    const amount = shortcut.action === shortcutApi.ACTION_ORDER_QUOTE_TOTAL
+      ? `总价 ${shortcut.quoteOrderQty}`
+      : `手数 ${shortcut.quantity}`;
     return [
-      `${key} = 下${shortcutApi.getDirectionLabel(shortcut.direction)}单`,
+      `${key} = ${shortcutApi.getActionLabel(shortcut.action)}` +
+        ` / 方向 ${shortcutApi.getDirectionLabel(shortcut.direction)}`,
       `超价 ${shortcutApi.formatPriceOffset(shortcut.priceOffset)}`,
-      `手数 ${shortcut.quantity}`,
+      amount,
     ].join(" / ");
   });
   document.querySelector("#shortcutSummary").textContent =
@@ -2064,7 +2069,9 @@ function renderShortcutTable() {
   }
 
   for (const shortcut of shortcutSettings) {
-    const isOrder = shortcut.action === shortcutApi.ACTION_ORDER;
+    const isOrder = shortcutApi.isOrderAction(shortcut.action);
+    const isQuoteTotal =
+      shortcut.action === shortcutApi.ACTION_ORDER_QUOTE_TOTAL;
     const row = document.createElement("tr");
     appendShortcutCell(row, shortcutApi.getKeyLabel(shortcut.key));
     appendShortcutCell(row, shortcutApi.getActionLabel(shortcut.action));
@@ -2076,7 +2083,12 @@ function renderShortcutTable() {
       row,
       isOrder ? shortcutApi.formatPriceOffset(shortcut.priceOffset) : "-"
     );
-    appendShortcutCell(row, isOrder ? shortcut.quantity : "-");
+    appendShortcutCell(
+      row,
+      isOrder
+        ? (isQuoteTotal ? `${shortcut.quoteOrderQty}（总价）` : shortcut.quantity)
+        : "-"
+    );
 
     const operationCell = document.createElement("td");
     operationCell.className = "shortcut-operation";
@@ -2096,11 +2108,16 @@ function renderShortcutTable() {
 }
 
 function updateShortcutEditorFields() {
-  const isOrder =
-    shortcutEditorFields.action.value === shortcutApi.ACTION_ORDER;
+  const action = shortcutEditorFields.action.value;
+  const isOrder = shortcutApi.isOrderAction(action);
+  const isQuoteTotal = action === shortcutApi.ACTION_ORDER_QUOTE_TOTAL;
   shortcutEditorFields.direction.disabled = !isOrder;
   shortcutEditorFields.priceOffset.disabled = !isOrder;
   shortcutEditorFields.quantity.disabled = !isOrder;
+  shortcutEditorFields.amountLabel.textContent = isQuoteTotal ? "总价" : "手数";
+  shortcutEditorFields.quantity.placeholder = isQuoteTotal
+    ? "计价资产名义金额，例如 100 USDT"
+    : "交易数量，例如 0.001";
 }
 
 function populateShortcutEditor(shortcut) {
@@ -2109,7 +2126,10 @@ function populateShortcutEditor(shortcut) {
   shortcutEditorFields.direction.value =
     shortcut.direction || shortcutApi.DIRECTION_SHORT;
   shortcutEditorFields.priceOffset.value = shortcut.priceOffset ?? "";
-  shortcutEditorFields.quantity.value = shortcut.quantity || "";
+  shortcutEditorFields.quantity.value =
+    shortcut.action === shortcutApi.ACTION_ORDER_QUOTE_TOTAL
+      ? shortcut.quoteOrderQty || ""
+      : shortcut.quantity || "";
   document.querySelector("#shortcutEditorError").textContent = "";
   updateShortcutEditorFields();
 }
@@ -2248,7 +2268,10 @@ shortcutEditorForm.addEventListener("submit", async (event) => {
   }
 
   const action = shortcutEditorFields.action.value;
+  const isOrder = shortcutApi.isOrderAction(action);
+  const isQuoteTotal = action === shortcutApi.ACTION_ORDER_QUOTE_TOTAL;
   const priceOffsetText = shortcutEditorFields.priceOffset.value.trim();
+  const amountText = shortcutEditorFields.quantity.value.trim();
   let createdId = `shortcut-${Date.now()}`;
   let suffix = 1;
   while (shortcutSettings.some(({ id }) => id === createdId)) {
@@ -2259,15 +2282,14 @@ shortcutEditorForm.addEventListener("submit", async (event) => {
     ...(existing || { id: createdId }),
     key: shortcutEditorFields.key.value,
     action,
-    direction: action === shortcutApi.ACTION_ORDER
+    direction: isOrder
       ? shortcutEditorFields.direction.value
       : "",
-    priceOffset: action === shortcutApi.ACTION_ORDER
+    priceOffset: isOrder
       ? (priceOffsetText === "" ? Number.NaN : Number(priceOffsetText))
       : null,
-    quantity: action === shortcutApi.ACTION_ORDER
-      ? shortcutEditorFields.quantity.value.trim()
-      : "",
+    quantity: action === shortcutApi.ACTION_ORDER ? amountText : "",
+    quoteOrderQty: isQuoteTotal ? amountText : "",
   };
   const candidate = isCreating
     ? [...shortcutSettings, edited]
@@ -2378,6 +2400,8 @@ async function placeOrderFromNumpad(shortcut) {
     : "BUY";
   const price = offsetTradePrice(latestPrice, shortcut.priceOffset);
   const shortcutLabel = shortcutApi.getKeyLabel(shortcut.key);
+  const quoteTotalMode =
+    shortcut.action === shortcutApi.ACTION_ORDER_QUOTE_TOTAL;
 
   if (!latestPrice || !price || Number(price) <= 0) {
     printResult(`${shortcutLabel} 快捷键报单失败`, {
@@ -2389,23 +2413,30 @@ async function placeOrderFromNumpad(shortcut) {
 
   elements.side.value = side;
   elements.orderType.value = "LIMIT";
-  elements.orderSizingMode.value = "quantity";
+  elements.orderSizingMode.value = quoteTotalMode ? "quote-total" : "quantity";
   updateOrderSizingFields();
-  elements.quantity.value = shortcut.quantity;
+  if (quoteTotalMode) {
+    elements.quoteOrderQty.value = shortcut.quoteOrderQty;
+  } else {
+    elements.quantity.value = shortcut.quantity;
+  }
   elements.price.value = price;
 
   const order = {
     symbol,
     side,
     type: "LIMIT",
-    quantity: shortcut.quantity,
     price,
     timeInForce: "GTC",
+    ...(quoteTotalMode
+      ? { quoteOrderQty: shortcut.quoteOrderQty }
+      : { quantity: shortcut.quantity }),
   };
   const submittedAt = Date.now();
   const result = await submitOrderWithTradFiAgreement(order);
   printResult(
-    `${shortcutLabel} 报${shortcutApi.getDirectionLabel(shortcut.direction)}单结果`,
+    `${shortcutLabel} ${shortcutApi.getActionLabel(shortcut.action)}` +
+      `（${shortcutApi.getDirectionLabel(shortcut.direction)}）结果`,
     result
   );
 
@@ -2487,7 +2518,7 @@ document.addEventListener("keydown", async (event) => {
 
   numpadOrderBusy = true;
   try {
-    if (shortcut.action === shortcutApi.ACTION_ORDER) {
+    if (shortcutApi.isOrderAction(shortcut.action)) {
       await placeOrderFromNumpad(shortcut);
     }
     if (shortcut.action === shortcutApi.ACTION_CANCEL_ALL) {

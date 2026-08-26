@@ -9,6 +9,7 @@
   }
 })(typeof window !== "undefined" ? window : globalThis, () => {
   const ACTION_ORDER = "ORDER";
+  const ACTION_ORDER_QUOTE_TOTAL = "ORDER_QUOTE_TOTAL";
   const ACTION_CANCEL_ALL = "CANCEL_ALL";
   const DIRECTION_SHORT = "SHORT";
   const DIRECTION_LONG = "LONG";
@@ -27,6 +28,7 @@
       direction: DIRECTION_SHORT,
       priceOffset: 0.1,
       quantity: "0.001",
+      quoteOrderQty: "",
     }),
     Object.freeze({
       id: "order-long",
@@ -35,6 +37,7 @@
       direction: DIRECTION_LONG,
       priceOffset: -0.1,
       quantity: "0.001",
+      quoteOrderQty: "",
     }),
     Object.freeze({
       id: "cancel-all",
@@ -43,11 +46,16 @@
       direction: "",
       priceOffset: null,
       quantity: "",
+      quoteOrderQty: "",
     }),
   ]);
 
   const availableCodes = new Set(AVAILABLE_KEYS.map(({ code }) => code));
-  const actions = new Set([ACTION_ORDER, ACTION_CANCEL_ALL]);
+  const actions = new Set([
+    ACTION_ORDER,
+    ACTION_ORDER_QUOTE_TOTAL,
+    ACTION_CANCEL_ALL,
+  ]);
   const directions = new Set([DIRECTION_SHORT, DIRECTION_LONG]);
 
   function cloneDefaults() {
@@ -89,18 +97,22 @@
         direction: "",
         priceOffset: null,
         quantity: "",
+        quoteOrderQty: "",
       };
     }
 
     const priceOffset = Number(record.priceOffset);
     const quantity = String(record.quantity ?? "").trim();
+    const quoteOrderQty = String(record.quoteOrderQty ?? "").trim();
     return {
       id,
       key,
       action,
       direction: directions.has(record.direction) ? record.direction : "",
       priceOffset: Number.isFinite(priceOffset) ? priceOffset : null,
-      quantity,
+      quantity: action === ACTION_ORDER ? quantity : "",
+      quoteOrderQty:
+        action === ACTION_ORDER_QUOTE_TOTAL ? quoteOrderQty : "",
     };
   }
 
@@ -135,15 +147,24 @@
         usedKeys.set(shortcut.key, describeShortcut(shortcut));
       }
 
-      if (shortcut.action === ACTION_ORDER) {
+      if (isOrderAction(shortcut.action)) {
         if (!directions.has(shortcut.direction)) {
           errors.push(`${getKeyLabel(shortcut.key)} 必须选择下单方向。`);
         }
         if (!Number.isFinite(shortcut.priceOffset)) {
           errors.push(`${getKeyLabel(shortcut.key)} 的超价必须是数字。`);
         }
-        if (!(Number(shortcut.quantity) > 0)) {
+        if (
+          shortcut.action === ACTION_ORDER &&
+          !(Number(shortcut.quantity) > 0)
+        ) {
           errors.push(`${getKeyLabel(shortcut.key)} 的手数必须大于 0。`);
+        }
+        if (
+          shortcut.action === ACTION_ORDER_QUOTE_TOTAL &&
+          !(Number(shortcut.quoteOrderQty) > 0)
+        ) {
+          errors.push(`${getKeyLabel(shortcut.key)} 的总价必须大于 0。`);
         }
       }
     }
@@ -160,7 +181,13 @@
   }
 
   function getActionLabel(action) {
-    return action === ACTION_ORDER ? "下单" : "撤单";
+    if (action === ACTION_ORDER) return "下单";
+    if (action === ACTION_ORDER_QUOTE_TOTAL) return "下单（按总价）";
+    return "撤单";
+  }
+
+  function isOrderAction(action) {
+    return action === ACTION_ORDER || action === ACTION_ORDER_QUOTE_TOTAL;
   }
 
   function getDirectionLabel(direction) {
@@ -177,11 +204,15 @@
 
   function describeShortcut(shortcut) {
     if (shortcut.action === ACTION_CANCEL_ALL) return "撤销全部未成交订单";
-    return `${getDirectionLabel(shortcut.direction)}单`;
+    const sizing = shortcut.action === ACTION_ORDER_QUOTE_TOTAL
+      ? `，总价 ${shortcut.quoteOrderQty}`
+      : `，手数 ${shortcut.quantity}`;
+    return `${getActionLabel(shortcut.action)}：${getDirectionLabel(shortcut.direction)}${sizing}`;
   }
 
   return {
     ACTION_ORDER,
+    ACTION_ORDER_QUOTE_TOTAL,
     ACTION_CANCEL_ALL,
     DIRECTION_SHORT,
     DIRECTION_LONG,
@@ -194,6 +225,7 @@
     getShortcutForCode,
     getKeyLabel,
     getActionLabel,
+    isOrderAction,
     getDirectionLabel,
     formatPriceOffset,
     describeShortcut,

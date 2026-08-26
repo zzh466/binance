@@ -639,6 +639,110 @@
         小键盘快捷键：1 = 卖出限价单（最新成交价 + 0.1），3 = 买入限价单（最新成交价 - 0.1），5 = 撤销账户全部未成交订单；数量固定为 0.001。
       </p>
       <div class="grid">
+        <section class="full">
+          <h2>普通订单记录</h2>
+          <p class="muted">
+            根据全局合约自动查询对应市场的普通订单，包括挂单、已撤单和已成交订单。组合订单功能仅适用于支持它的现货合约。
+          </p>
+          <div class="order-history-toolbar">
+            <button id="refreshOrderHistoryButton">刷新订单记录</button>
+            <span id="orderHistoryStatus">尚未加载</span>
+          </div>
+          <div class="table-scroll">
+            <table class="order-history-table">
+              <thead>
+                <tr>
+                  <th class="numeric">订单 ID</th>
+                  <th>交易对</th>
+                  <th>方向</th>
+                  <th>类型</th>
+                  <th>状态</th>
+                  <th>价格</th>
+                  <th>原始数量</th>
+                  <th>成交数量</th>
+                  <th>更新时间</th>
+                </tr>
+              </thead>
+              <tbody id="orderHistoryBody">
+                <tr><td colspan="9">点击“刷新订单记录”加载数据</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section>
+          <h2>下单</h2>
+          <label for="side">方向</label>
+          <select id="side">
+            <option value="BUY">BUY</option>
+            <option value="SELL">SELL</option>
+          </select>
+
+          <label for="orderType">委托类型</label>
+          <select id="orderType">
+            <option value="LIMIT">LIMIT</option>
+            <option value="MARKET">MARKET</option>
+            <option value="LIMIT_MAKER">LIMIT_MAKER</option>
+            <option value="STOP_LOSS">STOP_LOSS</option>
+            <option value="STOP_LOSS_LIMIT">STOP_LOSS_LIMIT</option>
+            <option value="TAKE_PROFIT">TAKE_PROFIT</option>
+            <option value="TAKE_PROFIT_LIMIT">TAKE_PROFIT_LIMIT</option>
+          </select>
+
+          <label for="orderSizingMode">下单模式</label>
+          <select id="orderSizingMode">
+            <option value="quantity">按数量</option>
+            <option value="quote-total">按总价</option>
+          </select>
+
+          <label id="quantityOrderLabel" for="quantity">数量 quantity</label>
+          <input id="quantity" value="0.001" />
+
+          <label id="quoteOrderQtyLabel" for="quoteOrderQty" hidden>
+            总价 quoteOrderQty（计价资产名义金额）
+          </label>
+          <input id="quoteOrderQty" value="10" hidden />
+          <p id="orderSizingHint" class="muted">
+            当前按交易数量下单。快捷键始终使用配置中的手数。
+          </p>
+          <p class="warning">
+            所有新委托固定使用 EXPIRE_MAKER。现货跨子账号还必须具有相同且非 -1 的
+            tradeGroupId；U 本位接口仅在 IOC/GTC/GTD 下保证 STP 生效。
+          </p>
+
+          <label for="price">价格 price（LIMIT 必填）</label>
+          <div class="price-input-row">
+            <input id="price" value="10000" />
+            <label class="latest-price-option" for="latestTradePriceToggle">
+              <input id="latestTradePriceToggle" type="checkbox" />
+              <span>最新成交价：</span>
+              <span id="latestTradePriceState">未选中</span>
+            </label>
+          </div>
+
+          <label for="stopPrice">触发价格 stopPrice（止盈止损）</label>
+          <input id="stopPrice" placeholder="可选" />
+
+          <label for="trailingDelta">追踪价差 trailingDelta（BIPS）</label>
+          <input id="trailingDelta" placeholder="追踪止盈止损可选" />
+
+          <label for="icebergQty">冰山数量 icebergQty（需 GTC）</label>
+          <input id="icebergQty" placeholder="限价类订单可选" />
+
+          <div class="buttons">
+            <button id="testOrderButton">仅测试参数</button>
+            <button id="placeOrderButton">提交真实委托</button>
+          </div>
+        </section>
+
+        <section>
+          <h2>撤单</h2>
+          <label for="orderId">orderId</label>
+          <input id="orderId" placeholder="下单成功后自动填入" />
+
+          <button id="cancelOrderButton">撤销委托</button>
+        </section>
+
         <section>
           <h2>运行状态</h2>
           <dl>
@@ -891,110 +995,6 @@
         </section>
 
         <section class="full">
-          <h2>普通订单记录</h2>
-          <p class="muted">
-            根据全局合约自动查询对应市场的普通订单，包括挂单、已撤单和已成交订单。组合订单功能仅适用于支持它的现货合约。
-          </p>
-          <div class="order-history-toolbar">
-            <button id="refreshOrderHistoryButton">刷新订单记录</button>
-            <span id="orderHistoryStatus">尚未加载</span>
-          </div>
-          <div class="table-scroll">
-            <table class="order-history-table">
-              <thead>
-                <tr>
-                  <th class="numeric">订单 ID</th>
-                  <th>交易对</th>
-                  <th>方向</th>
-                  <th>类型</th>
-                  <th>状态</th>
-                  <th>价格</th>
-                  <th>原始数量</th>
-                  <th>成交数量</th>
-                  <th>更新时间</th>
-                </tr>
-              </thead>
-              <tbody id="orderHistoryBody">
-                <tr><td colspan="9">点击“刷新订单记录”加载数据</td></tr>
-              </tbody>
-            </table>
-          </div>
-        </section>
-
-        <section>
-          <h2>下单</h2>
-          <label for="side">方向</label>
-          <select id="side">
-            <option value="BUY">BUY</option>
-            <option value="SELL">SELL</option>
-          </select>
-
-          <label for="orderType">委托类型</label>
-          <select id="orderType">
-            <option value="LIMIT">LIMIT</option>
-            <option value="MARKET">MARKET</option>
-            <option value="LIMIT_MAKER">LIMIT_MAKER</option>
-            <option value="STOP_LOSS">STOP_LOSS</option>
-            <option value="STOP_LOSS_LIMIT">STOP_LOSS_LIMIT</option>
-            <option value="TAKE_PROFIT">TAKE_PROFIT</option>
-            <option value="TAKE_PROFIT_LIMIT">TAKE_PROFIT_LIMIT</option>
-          </select>
-
-          <label for="orderSizingMode">下单模式</label>
-          <select id="orderSizingMode">
-            <option value="quantity">按数量</option>
-            <option value="quote-total">按总价</option>
-          </select>
-
-          <label id="quantityOrderLabel" for="quantity">数量 quantity</label>
-          <input id="quantity" value="0.001" />
-
-          <label id="quoteOrderQtyLabel" for="quoteOrderQty" hidden>
-            总价 quoteOrderQty（计价资产名义金额）
-          </label>
-          <input id="quoteOrderQty" value="10" hidden />
-          <p id="orderSizingHint" class="muted">
-            当前按交易数量下单。快捷键始终使用配置中的手数。
-          </p>
-          <p class="warning">
-            所有新委托固定使用 EXPIRE_MAKER。现货跨子账号还必须具有相同且非 -1 的
-            tradeGroupId；U 本位接口仅在 IOC/GTC/GTD 下保证 STP 生效。
-          </p>
-
-          <label for="price">价格 price（LIMIT 必填）</label>
-          <div class="price-input-row">
-            <input id="price" value="10000" />
-            <label class="latest-price-option" for="latestTradePriceToggle">
-              <input id="latestTradePriceToggle" type="checkbox" />
-              <span>最新成交价：</span>
-              <span id="latestTradePriceState">未选中</span>
-            </label>
-          </div>
-
-          <label for="stopPrice">触发价格 stopPrice（止盈止损）</label>
-          <input id="stopPrice" placeholder="可选" />
-
-          <label for="trailingDelta">追踪价差 trailingDelta（BIPS）</label>
-          <input id="trailingDelta" placeholder="追踪止盈止损可选" />
-
-          <label for="icebergQty">冰山数量 icebergQty（需 GTC）</label>
-          <input id="icebergQty" placeholder="限价类订单可选" />
-
-          <div class="buttons">
-            <button id="testOrderButton">仅测试参数</button>
-            <button id="placeOrderButton">提交真实委托</button>
-          </div>
-        </section>
-
-        <section>
-          <h2>撤单</h2>
-          <label for="orderId">orderId</label>
-          <input id="orderId" placeholder="下单成功后自动填入" />
-
-          <button id="cancelOrderButton">撤销委托</button>
-        </section>
-
-        <section class="full">
           <h2>执行结果与错误</h2>
           <p id="requestDuration" class="result-duration">端到端耗时：- ms</p>
           <pre id="output">等待操作</pre>
@@ -1007,7 +1007,7 @@
         <h2 id="shortcutDialogTitle">快捷键设置</h2>
         <p class="muted">当前生效的快捷键规则。新增、编辑或删除后会立即保存到本地 JSON 配置文件。</p>
         <div class="warning danger">
-          快捷键会直接提交或撤销委托；修改超价、手数或按键前请仔细确认。
+          快捷键会直接提交或撤销委托；修改超价、手数、总价或按键前请仔细确认。
         </div>
         <div class="table-scroll">
           <table class="shortcut-table">
@@ -1017,7 +1017,7 @@
                 <th>动作</th>
                 <th>方向</th>
                 <th>超价</th>
-                <th>手数</th>
+                <th>手数 / 总价</th>
                 <th>操作</th>
               </tr>
             </thead>
@@ -1044,6 +1044,7 @@
           <label for="shortcutEditorAction">动作</label>
           <select id="shortcutEditorAction" name="action">
             <option value="ORDER">下单</option>
+            <option value="ORDER_QUOTE_TOTAL">下单（按总价）</option>
             <option value="CANCEL_ALL">撤销全部未成交订单</option>
           </select>
 
@@ -1056,7 +1057,7 @@
           <label for="shortcutEditorPriceOffset">超价</label>
           <input id="shortcutEditorPriceOffset" name="priceOffset" type="number" step="any" />
 
-          <label for="shortcutEditorQuantity">手数</label>
+          <label id="shortcutEditorAmountLabel" for="shortcutEditorQuantity">手数</label>
           <input id="shortcutEditorQuantity" name="quantity" type="number" step="any" min="0" />
         </div>
         <p id="shortcutEditorError" class="shortcut-error" role="alert"></p>
