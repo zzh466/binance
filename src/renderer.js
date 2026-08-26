@@ -986,6 +986,7 @@ async function signCurrentTradFiPerpsAgreement({ retryOrder = false } = {}) {
 }
 
 async function submitOrderWithTradFiAgreement(order, { testOnly = false } = {}) {
+  console.log(order);
   const submit = () => testOnly
     ? window.binance.testOrder(order)
     : window.binance.placeOrder(order);
@@ -1629,6 +1630,7 @@ document.querySelector("#connectMarketButton").addEventListener("click", () => {
 });
 
 elements.switchChartSymbolButton.addEventListener("click", () => {
+  chart.data = [];
   connectMarketSymbol(elements.chartSymbolInput.value);
 });
 
@@ -1941,7 +1943,9 @@ elements.orderType.addEventListener("change", () => {
   elements.icebergQty.disabled = !supportsIceberg;
 });
 const chartDom = document.querySelector('#can');
-
+const mousebar= document.querySelector("#mousebar")
+mousebar.style.width = '13px'
+let left = 0;
 const chart = new Chart(chartDom,980, 300, 0.01,{
     volumeScaleCount: 3,
     volumeScaleHeight: 25,
@@ -1956,6 +1960,55 @@ const chart = new Chart(chartDom,980, 300, 0.01,{
     calcBarType: 2
 
 });
+chartDom.addEventListener('mousemove', function(e){
+   const {x ,y} = e;
+      
+    if(x > 122  && x < 13 * chart.count + 124   && y > 370 && y < 590){
+      left = x - (x-123)%13 - 24;
+      
+      mousebar.style.display = 'block';
+      mousebar.style.left = left+'px'
+    }else {
+      mousebar.style.display = 'none';
+      left = 0
+    }
+})
+document.addEventListener('dblclick', async function(){
+  debugger
+  if(left){
+     const index = (left - 123 + 24) / 13
+     let side 
+     let {buyIndex, askIndex, start} = chart;
+     if(index <= buyIndex){
+      side = 'BUY';
+     }else if(index >= askIndex){
+      side = 'SELL';
+     }else{
+      return
+     }
+     const price = chart.data[index- start].price;
+      const order = {
+        symbol: getSelectedSymbol(),
+        side,
+        type: 'LIMIT',
+        price,
+        stopPrice: '',
+        trailingDelta: '',
+        icebergQty: '',
+        timeInForce: "GTC" ,
+        quantity: '0.1'
+      };
+       const submittedAt = Date.now();
+      const result = await submitOrderWithTradFiAgreement(order);
+      printResult("下单结果", result);
+
+      if (result.ok && result.data.orderId !== undefined) {
+        elements.orderId.value = String(result.data.orderId);
+        elements.queryOrderId.value = String(result.data.orderId);
+        applyConfirmedOrderResponse(result.data, submittedAt);
+      }
+  }
+})
 const SHORTCUT_STORAGE_KEY = "binanceShortcutSettingsV2";
 const LEGACY_SHORTCUT_STORAGE_KEY = "binanceShortcutSettingsV1";
 const COLORBLIND_STORAGE_KEY = "binanceColorblindModeV1";
@@ -2418,7 +2471,7 @@ async function placeOrderFromNumpad(shortcut) {
   if (quoteTotalMode) {
     elements.quoteOrderQty.value = shortcut.quoteOrderQty;
   } else {
-    elements.quantity.value = shortcut.quantity;
+  elements.quantity.value = shortcut.quantity;
   }
   elements.price.value = price;
 

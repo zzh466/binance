@@ -379,13 +379,20 @@
         margin: 0;
         padding: 0;
       }
-
+       
       .chart-order-status {
         margin: 6px 0 14px;
         font-size: 13px;
         font-weight: 700;
       }
-
+      .price-tick{
+        position: absolute;
+        border: #fff 1px solid;
+        left: 150px;
+        top: 80px;
+        z-index: 10;
+        height: 200px;
+      }
       .chart-symbol-toolbar {
         display: flex;
         align-items: center;
@@ -631,7 +638,11 @@
         <button id="switchChartSymbolButton" type="button">切换行情</button>
         <span id="chartSymbolSwitchStatus" class="chart-symbol-status">当前：BTCUSDT</span>
       </div>
-      <canvas id="can" width="980px" height="300px"></canvas>
+      <div style="position: relative;">
+        <canvas id="can" width="980px" height="300px"></canvas>
+        <div  class="price-tick" id="mousebar"  style="display: none;"></div>
+      </div>
+      
       <p id="chartOpenOrderStatus" class="chart-order-status">
         <span class="open-order">鲜红色柱：自有未成交挂单</span>，等待账户订单数据
       </p>
