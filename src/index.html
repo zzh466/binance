@@ -763,8 +763,14 @@
           </p>
           <div class="account-toolbar">
             <button id="refreshAccountButton">刷新账户信息</button>
+            <button id="signTradFiAgreementButton">
+              签署 TradFi-Perps 协议
+            </button>
             <span id="accountStatus">尚未加载</span>
           </div>
+          <p id="tradFiAgreementStatus" class="muted">
+            仅正式环境需要；协议按当前 U 本位 API Key 所属子账号分别签署。
+          </p>
           <dl class="account-summary">
             <dt>账户类型</dt>
             <dd id="accountType">-</dd>
@@ -776,6 +782,8 @@
             <dd id="accountCanWithdraw">-</dd>
             <dt>账户权限</dt>
             <dd id="accountPermissions">-</dd>
+            <dt>STP 交易组</dt>
+            <dd id="accountTradeGroupId">-</dd>
             <dt>更新时间</dt>
             <dd id="accountUpdateTime">-</dd>
           </dl>
@@ -932,8 +940,26 @@
             <option value="TAKE_PROFIT_LIMIT">TAKE_PROFIT_LIMIT</option>
           </select>
 
-          <label for="quantity">数量 quantity</label>
+          <label for="orderSizingMode">下单模式</label>
+          <select id="orderSizingMode">
+            <option value="quantity">按数量</option>
+            <option value="quote-total">按总价</option>
+          </select>
+
+          <label id="quantityOrderLabel" for="quantity">数量 quantity</label>
           <input id="quantity" value="0.001" />
+
+          <label id="quoteOrderQtyLabel" for="quoteOrderQty" hidden>
+            总价 quoteOrderQty（计价资产名义金额）
+          </label>
+          <input id="quoteOrderQty" value="10" hidden />
+          <p id="orderSizingHint" class="muted">
+            当前按交易数量下单。快捷键始终使用配置中的手数。
+          </p>
+          <p class="warning">
+            所有新委托固定使用 EXPIRE_MAKER。现货跨子账号还必须具有相同且非 -1 的
+            tradeGroupId；U 本位接口仅在 IOC/GTC/GTD 下保证 STP 生效。
+          </p>
 
           <label for="price">价格 price（LIMIT 必填）</label>
           <div class="price-input-row">

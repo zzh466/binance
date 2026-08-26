@@ -96,7 +96,92 @@ test("prepareOrder 按交易过滤器对价格和数量向下对齐", async () =
   assert.equal(result.params.quantity, "0.001");
   assert.equal(result.params.price, "50000.10");
   assert.equal(result.params.timeInForce, "GTC");
+  assert.equal(result.params.selfTradePreventionMode, "EXPIRE_MAKER");
   assert.equal(result.adjustments.length, 2);
+});
+
+test("现货交易对不支持 EXPIRE_MAKER 时在本地下单前拒绝", async () => {
+  const client = createClient();
+  client.exchangeInfo = async () => ({
+    symbol: {
+      symbol: "BTCUSDT",
+      status: "TRADING",
+      allowedSelfTradePreventionModes: ["NONE", "EXPIRE_TAKER"],
+      filters: [],
+    },
+  });
+
+  await assert.rejects(
+    client.prepareOrder({
+      symbol: "BTCUSDT",
+      side: "BUY",
+      type: "MARKET",
+      quantity: "0.01",
+    }),
+    (error) =>
+      error instanceof BinanceApiError &&
+      /不允许 EXPIRE_MAKER/.test(error.message)
+  );
+  client.close();
+});
+
+test("现货 OCO、OTO、OTOCO 全部强制发送 EXPIRE_MAKER", async () => {
+  const client = createClient();
+  client.exchangeInfo = async () => ({
+    symbol: {
+      symbol: "BTCUSDT",
+      status: "TRADING",
+      allowedSelfTradePreventionModes: ["EXPIRE_MAKER"],
+      filters: [],
+    },
+  });
+  const submissions = [];
+  client.signedWsOrRest = async (wsMethod, _restMethod, _path, params) => {
+    submissions.push({ wsMethod, params });
+    return { accepted: true };
+  };
+
+  await client.placeOco({
+    symbol: "BTCUSDT",
+    side: "SELL",
+    quantity: "0.01",
+    abovePrice: "110",
+    belowPrice: "90",
+    belowStopPrice: "95",
+  });
+  await client.placeOto({
+    symbol: "BTCUSDT",
+    workingSide: "BUY",
+    workingPrice: "90",
+    workingQuantity: "0.01",
+    pendingSide: "SELL",
+    pendingPrice: "110",
+    pendingQuantity: "0.01",
+  });
+  await client.placeOtoco({
+    symbol: "BTCUSDT",
+    workingSide: "BUY",
+    workingPrice: "90",
+    workingQuantity: "0.01",
+    pendingSide: "SELL",
+    pendingQuantity: "0.01",
+    pendingAbovePrice: "110",
+    pendingBelowPrice: "80",
+    pendingBelowStopPrice: "85",
+  });
+
+  assert.deepEqual(
+    submissions.map(({ wsMethod, params }) => [
+      wsMethod,
+      params.selfTradePreventionMode,
+    ]),
+    [
+      ["orderList.place.oco", "EXPIRE_MAKER"],
+      ["orderList.place.oto", "EXPIRE_MAKER"],
+      ["orderList.place.otoco", "EXPIRE_MAKER"],
+    ]
+  );
+  client.close();
 });
 
 test("prepareOrder 在本地拒绝不满足最小成交额的订单", async () => {
@@ -132,6 +217,108 @@ test("MARKET 委托不会发送页面残留的 price 和 stopPrice", async () =>
 
   assert.equal(result.params.price, undefined);
   assert.equal(result.params.stopPrice, undefined);
+});
+
+test("现货 MARKET 按总价下单时直接发送 quoteOrderQty", async () => {
+  const client = createClient();
+  client.exchangeInfo = async () => ({
+    symbol: {
+      status: "TRADING",
+      filters: [{ filterType: "MIN_NOTIONAL", minNotional: "5" }],
+    },
+  });
+
+  const result = await client.prepareOrder({
+    symbol: "BTCUSDT",
+    side: "BUY",
+    type: "MARKET",
+    quoteOrderQty: "100",
+    price: "50000",
+  });
+
+  assert.equal(result.params.quoteOrderQty, "100");
+  assert.equal(result.params.quantity, undefined);
+  assert.equal(result.params.price, undefined);
+  assert.deepEqual(result.orderSizing, {
+    mode: "quote-total",
+    requestedQuoteOrderQty: "100",
+    directQuoteOrderQty: true,
+  });
+  client.close();
+});
+
+test("现货 LIMIT 按总价下单时按对齐后的委托价换算数量", async () => {
+  const client = createClient();
+  client.exchangeInfo = async () => ({
+    symbol: {
+      status: "TRADING",
+      filters: [
+        { filterType: "PRICE_FILTER", minPrice: "1", maxPrice: "1000000", tickSize: "0.1" },
+        { filterType: "LOT_SIZE", minQty: "0.001", maxQty: "100", stepSize: "0.001" },
+        { filterType: "MIN_NOTIONAL", minNotional: "5" },
+      ],
+    },
+  });
+
+  const result = await client.prepareOrder({
+    symbol: "BTCUSDT",
+    side: "BUY",
+    type: "LIMIT",
+    quoteOrderQty: "100",
+    price: "333.39",
+  });
+
+  assert.equal(result.params.price, "333.3");
+  assert.equal(result.params.quantity, "0.300");
+  assert.equal(result.params.quoteOrderQty, undefined);
+  assert.equal(result.orderSizing.referenceSource, "委托价");
+  assert.equal(result.orderSizing.convertedQuantity, "0.300");
+  assert.match(result.adjustments.join(";"), /总价模式/);
+  client.close();
+});
+
+test("现货下单拒绝同时提供数量和总价", async () => {
+  const client = createClient();
+  client.exchangeInfo = async () => ({
+    symbol: { status: "TRADING", filters: [] },
+  });
+
+  await assert.rejects(
+    client.prepareOrder({
+      symbol: "BTCUSDT",
+      side: "BUY",
+      type: "MARKET",
+      quantity: "0.01",
+      quoteOrderQty: "100",
+    }),
+    (error) => error instanceof BinanceApiError && /只能选择一种/.test(error.message)
+  );
+  client.close();
+});
+
+test("现货按总价卖出启用余额预查时换算基础资产数量", async () => {
+  const client = createClient();
+  client.accountStatus = async () => ({
+    balances: [{ asset: "BTC", free: "0.001" }],
+  });
+  client.lastTradePriceCache.set("BTCUSDT", {
+    price: "50000",
+    loadedAt: Date.now(),
+  });
+
+  await assert.rejects(
+    client.validateAvailableBalance(
+      {
+        symbol: "BTCUSDT",
+        side: "SELL",
+        type: "MARKET",
+        quoteOrderQty: "100",
+      },
+      { baseAsset: "BTC", quoteAsset: "USDT" }
+    ),
+    (error) => error instanceof BinanceApiError && /BTC 可用余额不足/.test(error.message)
+  );
+  client.close();
 });
 
 test("签名请求复用后台同步的服务器时间，不逐笔访问 /time", async () => {

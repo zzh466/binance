@@ -31,6 +31,7 @@ const DYNAMIC_PRICE_MAX_AGE_MS = 10_000;
 const WS_API_REQUEST_TIMEOUT_MS = 5_000;
 const WS_API_CONNECT_TIMEOUT_MS = 10_000;
 const WS_API_HEARTBEAT_INTERVAL_MS = 20_000;
+const REQUIRED_SELF_TRADE_PREVENTION_MODE = "EXPIRE_MAKER";
 
 function requestHttps(url, options = {}) {
   return new Promise((resolve, reject) => {
@@ -91,6 +92,7 @@ class BinanceSpotClient extends EventEmitter {
     this.apiSecret = apiSecret.trim();
     this.testnet = Boolean(testnet);
     this.marketType = "spot";
+    this.selfTradePreventionMode = REQUIRED_SELF_TRADE_PREVENTION_MODE;
 
     this.restBase = this.testnet ? REST_BASE.testnet : REST_BASE.production;
     this.tradingRestBase = this.testnet
@@ -154,6 +156,8 @@ class BinanceSpotClient extends EventEmitter {
 
     this.exchangeInfoCache = new Map();
     this.averagePriceCache = new Map();
+    this.lastTradePriceCache = new Map();
+    this.tickerPricePath = "/v3/ticker/price";
     this.userDataSocket = null;
     this.userDataManualClose = false;
     this.userDataReconnectTimer = null;
@@ -484,6 +488,70 @@ class BinanceSpotClient extends EventEmitter {
     }
   }
 
+  assertPositiveOrderAmount(name, value) {
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric) || numeric <= 0) {
+      throw new BinanceApiError(`${name} 必须是大于 0 的数字。`);
+    }
+    return numeric;
+  }
+
+  requireSelfTradePrevention(symbolInfo) {
+    const allowedModes = Array.isArray(
+      symbolInfo?.allowedSelfTradePreventionModes
+    )
+      ? symbolInfo.allowedSelfTradePreventionModes.map((mode) =>
+          String(mode).toUpperCase()
+        )
+      : [];
+
+    if (
+      allowedModes.length &&
+      !allowedModes.includes(this.selfTradePreventionMode)
+    ) {
+      throw new BinanceApiError(
+        `${symbolInfo?.symbol || "当前交易对"} 不允许 ` +
+        `${this.selfTradePreventionMode} 自成交预防模式；允许值：` +
+        `${allowedModes.join(", ")}。`
+      );
+    }
+
+    return this.selfTradePreventionMode;
+  }
+
+  describeSelfTradePrevention() {
+    return {
+      mode: this.selfTradePreventionMode,
+      enforced: true,
+      scope: "同一账户，或由 Binance 配置为相同 tradeGroupId 的现货账户",
+    };
+  }
+
+  async resolveTotalOrderReferencePrice(symbol, preferredPrices = []) {
+    for (const candidate of preferredPrices) {
+      const price = Number(candidate?.value);
+      if (Number.isFinite(price) && price > 0) {
+        return { price, source: candidate.source };
+      }
+    }
+
+    const cached = this.lastTradePriceCache.get(symbol);
+    if (
+      cached &&
+      Date.now() - cached.loadedAt <= DYNAMIC_PRICE_MAX_AGE_MS &&
+      Number(cached.price) > 0
+    ) {
+      return { price: Number(cached.price), source: "最新成交价缓存" };
+    }
+
+    const ticker = await this.request("GET", this.tickerPricePath, { symbol });
+    const price = Number(ticker.price);
+    if (!Number.isFinite(price) || price <= 0) {
+      throw new BinanceApiError(`${symbol} 没有可用于总价换算的有效行情价格。`);
+    }
+    return { price, source: "ticker 最新价" };
+  }
+
   async prepareOrder(order) {
     const symbol = this.validateSymbol(order.symbol);
     const side = String(order.side || "").toUpperCase();
@@ -522,6 +590,7 @@ class BinanceSpotClient extends EventEmitter {
       symbol,
       side,
       type,
+      selfTradePreventionMode: this.requireSelfTradePrevention(symbolInfo),
       timeInForce: order.timeInForce,
       quantity: order.quantity,
       quoteOrderQty: order.quoteOrderQty,
@@ -543,6 +612,12 @@ class BinanceSpotClient extends EventEmitter {
     if (!params.quantity && !params.quoteOrderQty) {
       throw new BinanceApiError("委托必须提供 quantity 或 quoteOrderQty。");
     }
+    if (params.quantity && params.quoteOrderQty) {
+      throw new BinanceApiError("按数量和按总价只能选择一种下单模式。");
+    }
+    if (params.quoteOrderQty) {
+      this.assertPositiveOrderAmount("订单总价 quoteOrderQty", params.quoteOrderQty);
+    }
     if ((type.includes("STOP") || type.includes("TAKE_PROFIT")) && !params.stopPrice && !params.trailingDelta) {
       throw new BinanceApiError(`${type} 委托必须提供 stopPrice 或 trailingDelta。`);
     }
@@ -556,6 +631,13 @@ class BinanceSpotClient extends EventEmitter {
     }
 
     const adjustments = [];
+    let orderSizing = params.quoteOrderQty
+      ? {
+          mode: "quote-total",
+          requestedQuoteOrderQty: params.quoteOrderQty,
+          directQuoteOrderQty: type === "MARKET",
+        }
+      : { mode: "quantity" };
     if (params.price && filters.PRICE_FILTER) {
       const original = params.price;
       params.price = this.alignToStep(params.price, filters.PRICE_FILTER.tickSize);
@@ -568,11 +650,40 @@ class BinanceSpotClient extends EventEmitter {
       this.assertFilterRange("stopPrice", params.stopPrice, filters.PRICE_FILTER.minPrice, filters.PRICE_FILTER.maxPrice);
       if (original !== params.stopPrice) adjustments.push(`stopPrice: ${original} -> ${params.stopPrice}`);
     }
+
+    if (params.quoteOrderQty && type !== "MARKET") {
+      const requestedQuoteOrderQty = params.quoteOrderQty;
+      const reference = await this.resolveTotalOrderReferencePrice(symbol, [
+        { value: params.price, source: "委托价" },
+        { value: params.stopPrice, source: "触发价" },
+      ]);
+      params.quantity = String(
+        Number(requestedQuoteOrderQty) / reference.price
+      );
+      delete params.quoteOrderQty;
+      orderSizing = {
+        mode: "quote-total",
+        requestedQuoteOrderQty,
+        directQuoteOrderQty: false,
+        referencePrice: String(reference.price),
+        referenceSource: reference.source,
+      };
+    }
+
     if (params.quantity && quantityFilter) {
       const original = params.quantity;
       params.quantity = this.alignToStep(params.quantity, quantityFilter.stepSize);
       this.assertFilterRange("quantity", params.quantity, quantityFilter.minQty, quantityFilter.maxQty);
-      if (original !== params.quantity) adjustments.push(`quantity: ${original} -> ${params.quantity}`);
+      if (orderSizing.mode === "quote-total") {
+        orderSizing.convertedQuantity = params.quantity;
+        adjustments.push(
+          `总价模式: ${orderSizing.requestedQuoteOrderQty} / ` +
+          `${orderSizing.referencePrice}（${orderSizing.referenceSource}） -> ` +
+          `quantity ${params.quantity}`
+        );
+      } else if (original !== params.quantity) {
+        adjustments.push(`quantity: ${original} -> ${params.quantity}`);
+      }
     }
     if (params.icebergQty && filters.LOT_SIZE) {
       const original = params.icebergQty;
@@ -603,9 +714,12 @@ class BinanceSpotClient extends EventEmitter {
       }
     }
 
-    const notional = params.price && params.quantity
-      ? Number(params.price) * Number(params.quantity)
-      : Number(params.quoteOrderQty || 0);
+    const notionalReferencePrice = Number(
+      params.price || params.stopPrice || orderSizing.referencePrice || 0
+    );
+    const notional = params.quoteOrderQty
+      ? Number(params.quoteOrderQty)
+      : notionalReferencePrice * Number(params.quantity || 0);
     const notionalFilter = filters.NOTIONAL || filters.MIN_NOTIONAL;
     if (notional > 0 && notionalFilter) {
       this.assertFilterRange(
@@ -616,11 +730,12 @@ class BinanceSpotClient extends EventEmitter {
       );
     }
 
-    return { params, adjustments, symbolInfo };
+    return { params, adjustments, symbolInfo, orderSizing };
   }
 
   async placeOrder(order, { testOnly = false } = {}) {
-    const { params, adjustments, symbolInfo } = await this.prepareOrder(order);
+    const { params, adjustments, symbolInfo, orderSizing } =
+      await this.prepareOrder(order);
     this.assertTradingCredentials();
     await this.ensureTradingServerTime();
 
@@ -645,6 +760,8 @@ class BinanceSpotClient extends EventEmitter {
       ...result,
       testOnly,
       adjustments,
+      orderSizing,
+      selfTradePrevention: this.describeSelfTradePrevention(),
       transport,
       ...(fallbackReason ? { fallbackReason } : {}),
       preflightBalanceCheck: this.preflightBalanceCheck,
@@ -660,7 +777,13 @@ class BinanceSpotClient extends EventEmitter {
     const quoteAsset = symbolInfo.quoteAsset;
 
     if (params.side === "SELL") {
-      const required = Number(params.quantity || 0);
+      let required = Number(params.quantity || 0);
+      if (!required && params.quoteOrderQty) {
+        const reference = await this.resolveTotalOrderReferencePrice(
+          params.symbol
+        );
+        required = Number(params.quoteOrderQty) / reference.price;
+      }
       const available = balances[baseAsset] || 0;
       if (required > available) {
         throw new BinanceApiError(
@@ -846,7 +969,11 @@ class BinanceSpotClient extends EventEmitter {
       params,
       { retrySafe: false }
     );
-    return { ...result, adjustments };
+    return {
+      ...result,
+      adjustments,
+      selfTradePrevention: this.describeSelfTradePrevention(),
+    };
   }
 
   async accountRateLimits() {
@@ -921,6 +1048,9 @@ class BinanceSpotClient extends EventEmitter {
     }
 
     const info = await this.exchangeInfo(symbol);
+    const selfTradePreventionMode = this.requireSelfTradePrevention(
+      info.symbol
+    );
     const filters = Object.fromEntries(
       (info.symbol?.filters || []).map((filter) => [filter.filterType, filter])
     );
@@ -958,6 +1088,7 @@ class BinanceSpotClient extends EventEmitter {
         side: normalizedSide,
         quantity: alignedQuantity,
         ...sideSpecificParams,
+        selfTradePreventionMode,
         newOrderRespType: "RESULT",
       },
       { retrySafe: false }
@@ -977,6 +1108,9 @@ class BinanceSpotClient extends EventEmitter {
       throw new BinanceApiError("OTO 必须提供工作单和待触发单的价格与数量。");
     }
     const info = await this.exchangeInfo(symbol);
+    const selfTradePreventionMode = this.requireSelfTradePrevention(
+      info.symbol
+    );
     const filters = Object.fromEntries((info.symbol?.filters || []).map((filter) => [filter.filterType, filter]));
     const alignPrice = (value) => filters.PRICE_FILTER ? this.alignToStep(value, filters.PRICE_FILTER.tickSize) : String(value);
     const alignQty = (value) => filters.LOT_SIZE ? this.alignToStep(value, filters.LOT_SIZE.stepSize) : String(value);
@@ -996,6 +1130,7 @@ class BinanceSpotClient extends EventEmitter {
         pendingPrice: alignPrice(pendingPrice),
         pendingQuantity: alignQty(pendingQuantity),
         pendingTimeInForce: "GTC",
+        selfTradePreventionMode,
         newOrderRespType: "RESULT",
       },
       { retrySafe: false }
@@ -1018,6 +1153,9 @@ class BinanceSpotClient extends EventEmitter {
       throw new BinanceApiError("OTOCO 的工作单及待触发 OCO 价格、数量必须填写完整。");
     }
     const info = await this.exchangeInfo(symbol);
+    const selfTradePreventionMode = this.requireSelfTradePrevention(
+      info.symbol
+    );
     const filters = Object.fromEntries((info.symbol?.filters || []).map((filter) => [filter.filterType, filter]));
     const alignPrice = (value) => filters.PRICE_FILTER ? this.alignToStep(value, filters.PRICE_FILTER.tickSize) : String(value);
     const alignQty = (value) => filters.LOT_SIZE ? this.alignToStep(value, filters.LOT_SIZE.stepSize) : String(value);
@@ -1040,6 +1178,7 @@ class BinanceSpotClient extends EventEmitter {
         pendingBelowPrice: alignPrice(pendingBelowPrice),
         pendingBelowStopPrice: alignPrice(pendingBelowStopPrice),
         pendingBelowTimeInForce: "GTC",
+        selfTradePreventionMode,
         newOrderRespType: "RESULT",
       },
       { retrySafe: false }
@@ -1770,10 +1909,17 @@ class BinanceSpotClient extends EventEmitter {
           return;
         }
 
+        const receivedAt = Date.now();
+        this.lastTradePriceCache.set(symbol, {
+          price: String(message.p),
+          loadedAt: receivedAt,
+          eventTime: Number(message.E),
+        });
+
         if (!this.supportsAveragePriceStream) {
           this.averagePriceCache.set(symbol, {
             price: String(message.p),
-            loadedAt: Date.now(),
+            loadedAt: receivedAt,
             eventTime: Number(message.E),
           });
         }
@@ -1786,7 +1932,7 @@ class BinanceSpotClient extends EventEmitter {
           tradeId: Number(message.t),
           eventTime: Number(message.E),
           tradeTime: Number(message.T),
-          receivedAt: Date.now(),
+          receivedAt,
         });
       } catch (error) {
         this.emit("market-error", {
@@ -2185,4 +2331,5 @@ class BinanceSpotClient extends EventEmitter {
 module.exports = {
   BinanceSpotClient,
   BinanceApiError,
+  REQUIRED_SELF_TRADE_PREVENTION_MODE,
 };

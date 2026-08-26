@@ -454,6 +454,10 @@ function registerIpcHandlers() {
     return safeCall(() => client.accountCommission(payload || {}));
   });
 
+  ipcMain.handle("binance:sign-tradfi-perps-agreement", async () => {
+    return safeCall(() => client.signTradFiPerpsAgreement());
+  });
+
   ipcMain.handle("binance:query-order-list", async (_event, payload) => {
     return safeCall(() => client.queryOrderList(payload || {}));
   });

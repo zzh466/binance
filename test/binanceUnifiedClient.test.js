@@ -102,8 +102,84 @@ test("永续下单通过 WebSocket 并映射 Spot 风格止损限价类型", asy
   assert.equal(submitted.params.type, "STOP");
   assert.equal(submitted.params.quantity, "0.031");
   assert.equal(submitted.params.price, "200.1");
+  assert.equal(submitted.params.selfTradePreventionMode, "EXPIRE_MAKER");
   assert.equal(result.marketType, MARKET_FUTURES);
   assert.equal(result.transport, "websocket");
+  assert.equal(result.selfTradePrevention.apiEffective, true);
+  client.close();
+});
+
+test("USDⓈ-M LIMIT 按总价下单时换算 quantity 且不发送 quoteOrderQty", async () => {
+  const client = new BinanceUsdMClient({ testnet: true });
+  client.exchangeInfo = async () => ({ symbol: futuresSymbol() });
+
+  const result = await client.prepareOrder({
+    symbol: "SKHYUSDT",
+    side: "BUY",
+    type: "LIMIT",
+    quoteOrderQty: "20",
+    price: "200.19",
+  });
+
+  assert.equal(result.params.price, "200.1");
+  assert.equal(result.params.quantity, "0.099");
+  assert.equal(result.params.quoteOrderQty, undefined);
+  assert.equal(result.orderSizing.referenceSource, "委托价");
+  assert.equal(result.orderSizing.convertedQuantity, "0.099");
+  client.close();
+});
+
+test("USDⓈ-M MARKET 按总价下单时复用最新成交价缓存", async () => {
+  const client = new BinanceUsdMClient({ testnet: true });
+  client.exchangeInfo = async () => ({ symbol: futuresSymbol() });
+  client.lastTradePriceCache.set("SKHYUSDT", {
+    price: "200",
+    loadedAt: Date.now(),
+  });
+  client.request = async () => {
+    throw new Error("存在新鲜成交价缓存时不应额外查询 ticker");
+  };
+
+  const result = await client.prepareOrder({
+    symbol: "SKHYUSDT",
+    side: "SELL",
+    type: "MARKET",
+    quoteOrderQty: "20",
+  });
+
+  assert.equal(result.params.quantity, "0.100");
+  assert.equal(result.params.quoteOrderQty, undefined);
+  assert.equal(result.params.selfTradePreventionMode, "EXPIRE_MAKER");
+  assert.equal(result.orderSizing.referenceSource, "最新成交价缓存");
+  assert.equal(result.orderSizing.referencePrice, "200");
+  client.close();
+});
+
+test("USDⓈ-M MARKET 与 GTX 会明确标记 STP 不在官方保证范围", async () => {
+  const client = new BinanceUsdMClient({ testnet: true });
+  client.exchangeInfo = async () => ({ symbol: futuresSymbol() });
+  client.signedRest = async (_method, _path, params) => ({
+    symbol: params.symbol,
+    status: "TEST_ACCEPTED",
+  });
+
+  const market = await client.placeOrder({
+    symbol: "SKHYUSDT",
+    side: "BUY",
+    type: "MARKET",
+    quantity: "0.1",
+  }, { testOnly: true });
+  const limitMaker = await client.placeOrder({
+    symbol: "SKHYUSDT",
+    side: "SELL",
+    type: "LIMIT_MAKER",
+    quantity: "0.1",
+    price: "200",
+  }, { testOnly: true });
+
+  assert.equal(market.selfTradePrevention.mode, "EXPIRE_MAKER");
+  assert.equal(market.selfTradePrevention.apiEffective, false);
+  assert.equal(limitMaker.selfTradePrevention.apiEffective, false);
   client.close();
 });
 
@@ -114,6 +190,41 @@ test("USDⓈ-M 正式和测试环境使用各自官方 WebSocket API", () => {
   assert.equal(testnet.tradingWsApiBase, FUTURES_WS_API_BASE.testnet);
   production.close();
   testnet.close();
+});
+
+test("正式环境可为当前 USDⓈ-M 子账号签署 TradFi-Perps 协议", async () => {
+  const client = new BinanceUsdMClient({ testnet: false });
+  let submitted;
+  client.signedRest = async (method, path, params) => {
+    submitted = { method, path, params };
+    return { code: 200, msg: "success" };
+  };
+
+  const result = await client.signTradFiPerpsAgreement();
+
+  assert.deepEqual(submitted, {
+    method: "POST",
+    path: "/fapi/v1/stock/contract",
+    params: undefined,
+  });
+  assert.equal(result.code, 200);
+  assert.equal(result.agreement, "TradFi-Perps");
+  assert.equal(result.signedForCurrentApiAccount, true);
+  client.close();
+});
+
+test("Testnet 不会误调用正式环境 TradFi-Perps 协议接口", async () => {
+  const client = new BinanceUsdMClient({ testnet: true });
+  client.signedRest = async () => {
+    throw new Error("Testnet 不应调用协议接口");
+  };
+
+  await assert.rejects(
+    client.signTradFiPerpsAgreement(),
+    (error) =>
+      error instanceof BinanceApiError && /仅适用于 Binance 正式环境/.test(error.message)
+  );
+  client.close();
 });
 
 for (const platform of ["darwin", "win32"]) {

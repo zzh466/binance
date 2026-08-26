@@ -428,6 +428,11 @@ class BinanceUnifiedClient extends EventEmitter {
     );
   }
 
+  async signTradFiPerpsAgreement() {
+    const result = await this.futures.signTradFiPerpsAgreement();
+    return this.addMarketType(result, MARKET_FUTURES);
+  }
+
   async requireSpot(symbol, feature) {
     const resolution = await this.resolveMarket(symbol || this.activeSymbol);
     if (resolution.marketType !== MARKET_SPOT) {

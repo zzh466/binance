@@ -10,6 +10,9 @@
 - 最新价、最优买卖、平均价、24 小时行情、最近成交、聚合成交和 K 线。
 - REST 深度快照 + WebSocket 增量维护本地订单簿。
 - `LIMIT`、`MARKET`、`LIMIT_MAKER`、止盈止损类普通订单。
+- 普通下单可选择“按数量”或“按总价”：现货 `MARKET` 直接发送 `quoteOrderQty`；现货其他类型和 USDⓈ-M 按委托价、触发价或最新成交价换算并按 `stepSize` 修正数量。USDⓈ-M 总价表示名义价值，不是保证金金额。
+- 所有普通委托、撤单重报和 Spot OCO/OTO/OTOCO 固定携带 `selfTradePreventionMode=EXPIRE_MAKER`。账户信息会显示当前市场账户接口返回的 `tradeGroupId`：跨子账号现货 STP 只有在各账号属于相同且非 `-1` 的交易组时生效。USDⓈ-M 官方只保证该模式在 `IOC/GTC/GTD` 下有效，因此 `MARKET` 和映射为 `GTX` 的 `LIMIT_MAKER` 不应被视为具有同等保护。
+- 正式环境支持为当前 U 本位 API Key 所属子账号签署 TradFi-Perps 协议；可在“账户信息”中主动签署，下单收到 `Please sign TradFi-Perps agreement contract fapi` 时也会弹出二次确认并在签署成功后重试原委托。协议不会在程序启动时静默签署，Testnet 不调用该正式环境接口。
 - `/api/v3/order/test` 测试下单（只校验，不进入撮合引擎）。
 - 下单前按 `PRICE_FILTER`、`LOT_SIZE`、`MIN_NOTIONAL/NOTIONAL`、`PERCENT_PRICE(_BY_SIDE)` 校验，并按 tickSize/stepSize 修正精度。
 - 单笔撤单、全部撤单、当前挂单、单笔订单、全部订单、减量改单、撤单重报。

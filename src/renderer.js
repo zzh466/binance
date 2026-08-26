@@ -835,7 +835,12 @@ const elements = {
   askRows: document.querySelector("#askRows"),
   side: document.querySelector("#side"),
   orderType: document.querySelector("#orderType"),
+  orderSizingMode: document.querySelector("#orderSizingMode"),
+  quantityOrderLabel: document.querySelector("#quantityOrderLabel"),
   quantity: document.querySelector("#quantity"),
+  quoteOrderQtyLabel: document.querySelector("#quoteOrderQtyLabel"),
+  quoteOrderQty: document.querySelector("#quoteOrderQty"),
+  orderSizingHint: document.querySelector("#orderSizingHint"),
   price: document.querySelector("#price"),
   latestTradePriceToggle: document.querySelector("#latestTradePriceToggle"),
   latestTradePriceState: document.querySelector("#latestTradePriceState"),
@@ -854,12 +859,17 @@ const elements = {
   tradeHistoryStatus: document.querySelector("#tradeHistoryStatus"),
   tradeHistoryBody: document.querySelector("#tradeHistoryBody"),
   refreshAccountButton: document.querySelector("#refreshAccountButton"),
+  signTradFiAgreementButton: document.querySelector(
+    "#signTradFiAgreementButton"
+  ),
+  tradFiAgreementStatus: document.querySelector("#tradFiAgreementStatus"),
   accountStatus: document.querySelector("#accountStatus"),
   accountType: document.querySelector("#accountType"),
   accountCanTrade: document.querySelector("#accountCanTrade"),
   accountCanDeposit: document.querySelector("#accountCanDeposit"),
   accountCanWithdraw: document.querySelector("#accountCanWithdraw"),
   accountPermissions: document.querySelector("#accountPermissions"),
+  accountTradeGroupId: document.querySelector("#accountTradeGroupId"),
   accountUpdateTime: document.querySelector("#accountUpdateTime"),
   accountBalancesBody: document.querySelector("#accountBalancesBody"),
   riskStatus: document.querySelector("#riskStatus"),
@@ -882,6 +892,7 @@ const elements = {
 
 let activeEnvironmentTestnet = true;
 let environmentSwitchBusy = false;
+let tradFiAgreementBusy = false;
 
 function printResult(title, result) {
   const elapsedMs = Number(result?.elapsedMs);
@@ -904,6 +915,92 @@ function formatError(result) {
   ]
     .filter(Boolean)
     .join("；");
+}
+
+function requiresTradFiPerpsAgreement(result) {
+  if (result?.ok) return false;
+  const errorText = [
+    result?.error?.message,
+    result?.error?.data?.msg,
+    JSON.stringify(result?.error?.data || {}),
+  ]
+    .filter(Boolean)
+    .join(" ");
+  return /sign\s+tradfi[-\s]?perps\s+agreement\s+contract\s+fapi/i.test(
+    errorText
+  );
+}
+
+async function signCurrentTradFiPerpsAgreement({ retryOrder = false } = {}) {
+  if (tradFiAgreementBusy) return null;
+  if (activeEnvironmentTestnet) {
+    const result = {
+      ok: false,
+      error: {
+        name: "EnvironmentError",
+        message: "TradFi-Perps 协议签署仅适用于 Binance 正式环境。",
+      },
+    };
+    elements.tradFiAgreementStatus.textContent = result.error.message;
+    printResult("TradFi-Perps 协议签署失败", result);
+    return result;
+  }
+
+  const retryDescription = retryOrder
+    ? "签署成功后，程序会重试刚才被币安拒绝的原委托。"
+    : "该操作只签署协议，不会创建订单。";
+  if (!window.confirm(
+    "即将使用当前配置的 U 本位 API Key，为其所属子账号签署 Binance " +
+    `TradFi-Perps 协议。${retryDescription}\n\n` +
+    "这是账户级交易协议操作，请确认你有权代表该子账号签署。是否继续？"
+  )) {
+    elements.tradFiAgreementStatus.textContent = "已取消签署";
+    return null;
+  }
+
+  tradFiAgreementBusy = true;
+  elements.signTradFiAgreementButton.disabled = true;
+  elements.tradFiAgreementStatus.textContent = "正在签署…";
+  try {
+    const result = await window.binance.signTradFiPerpsAgreement();
+    elements.tradFiAgreementStatus.textContent = result.ok
+      ? "当前 U 本位子账号已成功签署 TradFi-Perps 协议"
+      : formatError(result);
+    printResult("TradFi-Perps 协议签署结果", result);
+    return result;
+  } catch (error) {
+    const result = {
+      ok: false,
+      error: {
+        name: error?.name || "Error",
+        message: error?.message || "协议签署请求失败",
+      },
+    };
+    elements.tradFiAgreementStatus.textContent = result.error.message;
+    printResult("TradFi-Perps 协议签署异常", result);
+    return result;
+  } finally {
+    tradFiAgreementBusy = false;
+    elements.signTradFiAgreementButton.disabled = false;
+  }
+}
+
+async function submitOrderWithTradFiAgreement(order, { testOnly = false } = {}) {
+  const submit = () => testOnly
+    ? window.binance.testOrder(order)
+    : window.binance.placeOrder(order);
+  let result = await submit();
+  if (!requiresTradFiPerpsAgreement(result)) return result;
+
+  printResult("币安要求先签署 TradFi-Perps 协议", result);
+  const agreementResult = await signCurrentTradFiPerpsAgreement({
+    retryOrder: true,
+  });
+  if (!agreementResult) return result;
+  if (!agreementResult.ok) return agreementResult;
+
+  result = await submit();
+  return result;
 }
 
 function renderDepthRows(container, levels) {
@@ -1069,6 +1166,15 @@ function renderAccountInfo(account) {
   elements.accountPermissions.textContent = Array.isArray(account.permissions)
     ? account.permissions.join(", ") || "-"
     : "-";
+  if (Number(account.tradeGroupId) === -1) {
+    elements.accountTradeGroupId.textContent = account.marketType === "futures"
+      ? "-1（U 本位账户未配置交易组）"
+      : "-1（未分组，跨子账号 STP 不生效）";
+  } else if (account.tradeGroupId !== undefined && account.tradeGroupId !== null) {
+    elements.accountTradeGroupId.textContent = String(account.tradeGroupId);
+  } else {
+    elements.accountTradeGroupId.textContent = "未返回";
+  }
   elements.accountUpdateTime.textContent = formatOrderTime(account.updateTime);
 
   elements.accountBalancesBody.replaceChildren();
@@ -1239,18 +1345,39 @@ function getMarketLabel(marketType) {
 
 function readOrderForm() {
   const type = elements.orderType.value;
-  return {
+  const quoteTotalMode = elements.orderSizingMode.value === "quote-total";
+  const order = {
     symbol: getSelectedSymbol(),
     side: elements.side.value,
     type,
-    quantity: elements.quantity.value.trim(),
     price: elements.price.value.trim(),
     stopPrice: elements.stopPrice.value.trim(),
     trailingDelta: elements.trailingDelta.value.trim(),
     icebergQty: elements.icebergQty.value.trim(),
     timeInForce: ["LIMIT", "STOP_LOSS_LIMIT", "TAKE_PROFIT_LIMIT"].includes(type) ? "GTC" : undefined,
   };
+  if (quoteTotalMode) {
+    order.quoteOrderQty = elements.quoteOrderQty.value.trim();
+  } else {
+    order.quantity = elements.quantity.value.trim();
+  }
+  return order;
 }
+
+function updateOrderSizingFields() {
+  const quoteTotalMode = elements.orderSizingMode.value === "quote-total";
+  elements.quantityOrderLabel.hidden = quoteTotalMode;
+  elements.quantity.hidden = quoteTotalMode;
+  elements.quoteOrderQtyLabel.hidden = !quoteTotalMode;
+  elements.quoteOrderQty.hidden = !quoteTotalMode;
+  elements.orderSizingHint.textContent = quoteTotalMode
+    ? "总价是计价资产的名义金额（例如 USDT），不是永续保证金。" +
+      "现货市价单直接按总价提交；其他订单由程序按委托价、触发价或最新成交价换算数量。"
+    : "当前按交易数量下单。快捷键始终使用配置中的手数。";
+}
+
+elements.orderSizingMode.addEventListener("change", updateOrderSizingFields);
+updateOrderSizingFields();
 
 async function loadStatus() {
   const result = await window.binance.getStatus();
@@ -1263,6 +1390,10 @@ async function loadStatus() {
 
   const status = result.data;
   activeEnvironmentTestnet = Boolean(status.testnet);
+  elements.signTradFiAgreementButton.disabled = activeEnvironmentTestnet;
+  elements.tradFiAgreementStatus.textContent = activeEnvironmentTestnet
+    ? "Testnet 不需要签署 TradFi-Perps 正式协议"
+    : "协议按当前 U 本位 API Key 所属子账号分别签署";
   elements.environmentSwitch.checked = !activeEnvironmentTestnet;
   elements.environmentSwitchStatus.textContent = activeEnvironmentTestnet
     ? "当前：Binance Testnet"
@@ -1519,7 +1650,7 @@ document
   .addEventListener("click", async () => {
     const order = readOrderForm();
     const submittedAt = Date.now();
-    const result = await window.binance.placeOrder(order);
+    const result = await submitOrderWithTradFiAgreement(order);
     printResult("下单结果", result);
 
     if (result.ok && result.data.orderId !== undefined) {
@@ -1530,7 +1661,9 @@ document
   });
 
 document.querySelector("#testOrderButton").addEventListener("click", async () => {
-  const result = await window.binance.testOrder(readOrderForm());
+  const result = await submitOrderWithTradFiAgreement(readOrderForm(), {
+    testOnly: true,
+  });
   printResult("测试下单结果（不会进入撮合引擎）", result);
 });
 
@@ -1638,6 +1771,10 @@ elements.refreshAccountButton.addEventListener("click", async () => {
   } finally {
     elements.refreshAccountButton.disabled = false;
   }
+});
+
+elements.signTradFiAgreementButton.addEventListener("click", () => {
+  signCurrentTradFiPerpsAgreement();
 });
 
 document.querySelector("#refreshCommissionButton").addEventListener("click", async () => {
@@ -2252,6 +2389,8 @@ async function placeOrderFromNumpad(shortcut) {
 
   elements.side.value = side;
   elements.orderType.value = "LIMIT";
+  elements.orderSizingMode.value = "quantity";
+  updateOrderSizingFields();
   elements.quantity.value = shortcut.quantity;
   elements.price.value = price;
 
@@ -2264,7 +2403,7 @@ async function placeOrderFromNumpad(shortcut) {
     timeInForce: "GTC",
   };
   const submittedAt = Date.now();
-  const result = await window.binance.placeOrder(order);
+  const result = await submitOrderWithTradFiAgreement(order);
   printResult(
     `${shortcutLabel} 报${shortcutApi.getDirectionLabel(shortcut.direction)}单结果`,
     result
@@ -2654,6 +2793,24 @@ window.binance.onUserDataStatus((status) => {
 
 window.binance.onUserDataError((error) => {
   printResult("实时账户事件错误", error);
+  if (requiresTradFiPerpsAgreement({ ok: false, error })) {
+    signCurrentTradFiPerpsAgreement().then((result) => {
+      if (!result?.ok) return;
+      window.binance.connectUserData({
+        symbol: getSelectedSymbol(),
+      }).then((reconnectResult) => {
+        printResult("签署协议后重新连接实时账户事件", reconnectResult);
+      }).catch((reconnectError) => {
+        printResult("签署协议后重连实时账户事件异常", {
+          ok: false,
+          error: {
+            name: reconnectError?.name || "Error",
+            message: reconnectError?.message || "重连失败",
+          },
+        });
+      });
+    });
+  }
 });
 
 async function initializeApp() {

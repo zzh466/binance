@@ -65,6 +65,8 @@ contextBridge.exposeInMainWorld("binance", {
     ipcRenderer.invoke("binance:account-rate-limits", options || {}),
   accountCommission: (options) =>
     ipcRenderer.invoke("binance:account-commission", options || {}),
+  signTradFiPerpsAgreement: () =>
+    ipcRenderer.invoke("binance:sign-tradfi-perps-agreement"),
   queryOrderList: (options) =>
     ipcRenderer.invoke("binance:query-order-list", options || {}),
   openOrderLists: (options) =>

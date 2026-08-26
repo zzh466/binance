@@ -159,6 +159,7 @@ class BinanceUsdMClient extends BinanceSpotClient {
     this.timePath = "/fapi/v1/time";
     this.pingPath = "/fapi/v1/ping";
     this.depthPath = "/fapi/v1/depth";
+    this.tickerPricePath = "/fapi/v1/ticker/price";
     this.supportsAveragePriceStream = false;
 
     this.exchangeInfoSnapshot = null;
@@ -599,8 +600,10 @@ class BinanceUsdMClient extends BinanceSpotClient {
       symbol,
       side,
       type,
+      selfTradePreventionMode: this.requireSelfTradePrevention(symbolInfo),
       timeInForce: mapped.timeInForce || order.timeInForce,
       quantity: order.quantity,
+      quoteOrderQty: order.quoteOrderQty,
       price: order.price,
       stopPrice: order.stopPrice,
       newClientOrderId: order.newClientOrderId,
@@ -613,8 +616,14 @@ class BinanceUsdMClient extends BinanceSpotClient {
     if ((type === "LIMIT" || type === "STOP" || type === "TAKE_PROFIT") && !params.price) {
       throw new BinanceApiError(`${requestedType} 委托必须提供 price。`);
     }
-    if (!params.quantity) {
-      throw new BinanceApiError("永续委托必须提供 quantity。");
+    if (!params.quantity && !params.quoteOrderQty) {
+      throw new BinanceApiError("永续委托必须提供 quantity 或 quoteOrderQty。");
+    }
+    if (params.quantity && params.quoteOrderQty) {
+      throw new BinanceApiError("按数量和按总价只能选择一种下单模式。");
+    }
+    if (params.quoteOrderQty) {
+      this.assertPositiveOrderAmount("订单总价 quoteOrderQty", params.quoteOrderQty);
     }
     if ((type.includes("STOP") || type.includes("TAKE_PROFIT")) && !params.stopPrice) {
       throw new BinanceApiError(`${requestedType} 委托必须提供 stopPrice。`);
@@ -628,6 +637,13 @@ class BinanceUsdMClient extends BinanceSpotClient {
     }
 
     const adjustments = [];
+    let orderSizing = params.quoteOrderQty
+      ? {
+          mode: "quote-total",
+          requestedQuoteOrderQty: params.quoteOrderQty,
+          directQuoteOrderQty: false,
+        }
+      : { mode: "quantity" };
     if (params.price && filters.PRICE_FILTER) {
       const original = params.price;
       params.price = this.alignToStep(params.price, filters.PRICE_FILTER.tickSize);
@@ -644,6 +660,26 @@ class BinanceUsdMClient extends BinanceSpotClient {
       params.stopPrice = this.alignToStep(params.stopPrice, filters.PRICE_FILTER.tickSize);
       if (original !== params.stopPrice) adjustments.push(`stopPrice: ${original} -> ${params.stopPrice}`);
     }
+
+    if (params.quoteOrderQty) {
+      const requestedQuoteOrderQty = params.quoteOrderQty;
+      const reference = await this.resolveTotalOrderReferencePrice(symbol, [
+        { value: params.price, source: "委托价" },
+        { value: params.stopPrice, source: "触发价" },
+      ]);
+      params.quantity = String(
+        Number(requestedQuoteOrderQty) / reference.price
+      );
+      delete params.quoteOrderQty;
+      orderSizing = {
+        mode: "quote-total",
+        requestedQuoteOrderQty,
+        directQuoteOrderQty: false,
+        referencePrice: String(reference.price),
+        referenceSource: reference.source,
+      };
+    }
+
     if (quantityFilter) {
       const original = params.quantity;
       params.quantity = this.alignToStep(params.quantity, quantityFilter.stepSize);
@@ -653,20 +689,32 @@ class BinanceUsdMClient extends BinanceSpotClient {
         quantityFilter.minQty,
         quantityFilter.maxQty
       );
-      if (original !== params.quantity) adjustments.push(`quantity: ${original} -> ${params.quantity}`);
+      if (orderSizing.mode === "quote-total") {
+        orderSizing.convertedQuantity = params.quantity;
+        adjustments.push(
+          `总价模式: ${orderSizing.requestedQuoteOrderQty} / ` +
+          `${orderSizing.referencePrice}（${orderSizing.referenceSource}） -> ` +
+          `quantity ${params.quantity}`
+        );
+      } else if (original !== params.quantity) {
+        adjustments.push(`quantity: ${original} -> ${params.quantity}`);
+      }
     }
 
     const minNotional = filters.MIN_NOTIONAL?.notional || filters.MIN_NOTIONAL?.minNotional;
-    const notional = Number(params.price || params.stopPrice || 0) * Number(params.quantity || 0);
+    const notionalReferencePrice = Number(
+      params.price || params.stopPrice || orderSizing.referencePrice || 0
+    );
+    const notional = notionalReferencePrice * Number(params.quantity || 0);
     if (notional > 0 && Number(minNotional) > 0) {
       this.assertFilterRange("订单金额", notional, minNotional, undefined);
     }
 
-    return { params, adjustments, symbolInfo };
+    return { params, adjustments, symbolInfo, orderSizing };
   }
 
   async placeOrder(order, { testOnly = false } = {}) {
-    const { params, adjustments } = await this.prepareOrder(order);
+    const { params, adjustments, orderSizing } = await this.prepareOrder(order);
     let result;
     let transport;
     let fallbackReason;
@@ -693,6 +741,14 @@ class BinanceUsdMClient extends BinanceSpotClient {
       marketType: this.marketType,
       testOnly,
       adjustments,
+      orderSizing,
+      selfTradePrevention: {
+        mode: this.selfTradePreventionMode,
+        enforced: true,
+        apiEffective: ["IOC", "GTC", "GTD"].includes(params.timeInForce),
+        limitation:
+          "Binance USDⓈ-M 文档仅保证该模式在 IOC/GTC/GTD 下生效。",
+      },
       transport,
       ...(fallbackReason ? { fallbackReason } : {}),
       preflightBalanceCheck: false,
@@ -861,6 +917,25 @@ class BinanceUsdMClient extends BinanceSpotClient {
         walletBalance: asset.walletBalance,
         unrealizedProfit: asset.unrealizedProfit,
       })),
+    };
+  }
+
+  async signTradFiPerpsAgreement() {
+    if (this.testnet) {
+      throw new BinanceApiError(
+        "TradFi-Perps 协议签署接口仅适用于 Binance 正式环境。"
+      );
+    }
+
+    const result = await this.signedRest(
+      "POST",
+      "/fapi/v1/stock/contract"
+    );
+    return {
+      ...result,
+      marketType: this.marketType,
+      agreement: "TradFi-Perps",
+      signedForCurrentApiAccount: true,
     };
   }
 
