@@ -73,6 +73,7 @@ test("永续下单通过 WebSocket 并映射 Spot 风格止损限价类型", asy
   const client = new BinanceUsdMClient({
     apiKey: "future-key",
     apiSecret: "future-secret",
+    brokerLinkId: "tdk3UjFd",
   });
   client.exchangeInfo = async () => ({ symbol: futuresSymbol() });
   seedPositionMode(client);
@@ -113,9 +114,25 @@ test("永续下单通过 WebSocket 并映射 Spot 风格止损限价类型", asy
   assert.equal(submitted.params.price, "200.1");
   assert.equal(submitted.params.positionSide, "BOTH");
   assert.equal(submitted.params.selfTradePreventionMode, "EXPIRE_MAKER");
+  assert.match(
+    submitted.params.newClientOrderId,
+    /^x-tdk3UjFd-[0-9]{13}[a-f0-9]{8}$/
+  );
+  assert.ok(submitted.params.newClientOrderId.length <= 36);
   assert.equal(result.marketType, MARKET_FUTURES);
   assert.equal(result.transport, "websocket");
   assert.equal(result.selfTradePrevention.apiEffective, true);
+  client.close();
+});
+
+test("统一客户端把现货和合约 LinkID 分别传给对应底层客户端", () => {
+  const client = new BinanceUnifiedClient({
+    spotBrokerLinkId: "P8DHAU8C",
+    futuresBrokerLinkId: "tdk3UjFd",
+  });
+
+  assert.equal(client.spot.brokerLinkId, "P8DHAU8C");
+  assert.equal(client.futures.brokerLinkId, "tdk3UjFd");
   client.close();
 });
 

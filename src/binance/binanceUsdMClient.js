@@ -743,7 +743,7 @@ class BinanceUsdMClient extends BinanceSpotClient {
       quoteOrderQty: order.quoteOrderQty,
       price: order.price,
       stopPrice: order.stopPrice,
-      newClientOrderId: order.newClientOrderId,
+      newClientOrderId: this.buildBrokerClientOrderId(order.newClientOrderId),
       newOrderRespType: order.newOrderRespType || "RESULT",
     });
 

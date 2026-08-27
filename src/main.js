@@ -100,6 +100,8 @@ function createBinanceClient(testnet) {
     depthSpeed: process.env.BINANCE_DEPTH_SPEED || "100ms",
     depthSnapshotLimit: process.env.BINANCE_DEPTH_SNAPSHOT_LIMIT || 1000,
     depthDisplayLevels: process.env.BINANCE_DEPTH_DISPLAY_LEVELS || 5,
+    spotBrokerLinkId: process.env.BINANCE_SPOT_LINK_ID || "",
+    futuresBrokerLinkId: process.env.BINANCE_FUTURES_LINK_ID || "",
     publicMarketFetch: (url, options) => net.fetch(url, options),
     preflightBalanceCheck:
       process.env.BINANCE_PREFLIGHT_BALANCE_CHECK === "true",

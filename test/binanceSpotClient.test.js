@@ -100,6 +100,48 @@ test("prepareOrder 按交易过滤器对价格和数量向下对齐", async () =
   assert.equal(result.adjustments.length, 2);
 });
 
+test("现货底层报单参数自动拼接 LinkID 并生成唯一 client order id", async () => {
+  const client = new BinanceSpotClient({
+    apiKey: "test-key",
+    apiSecret: "test-secret",
+    brokerLinkId: "P8DHAU8C",
+  });
+  client.exchangeInfo = async () => ({
+    symbol: { status: "TRADING", filters: [] },
+  });
+
+  const first = await client.prepareOrder({
+    symbol: "BTCUSDT",
+    side: "BUY",
+    type: "MARKET",
+    quantity: "0.001",
+  });
+  const second = await client.prepareOrder({
+    symbol: "BTCUSDT",
+    side: "BUY",
+    type: "MARKET",
+    quantity: "0.001",
+  });
+
+  assert.match(
+    first.params.newClientOrderId,
+    /^x-P8DHAU8C-[0-9]{13}[a-f0-9]{8}$/
+  );
+  assert.ok(first.params.newClientOrderId.length <= 36);
+  assert.notEqual(first.params.newClientOrderId, second.params.newClientOrderId);
+  client.close();
+});
+
+test("已经包含目标 LinkID 的 newClientOrderId 不会被重复拼接", () => {
+  const client = new BinanceSpotClient({ brokerLinkId: "P8DHAU8C" });
+
+  assert.equal(
+    client.buildBrokerClientOrderId("x-P8DHAU8C-custom-order"),
+    "x-P8DHAU8C-custom-order"
+  );
+  client.close();
+});
+
 test("现货交易对不支持 EXPIRE_MAKER 时在本地下单前拒绝", async () => {
   const client = createClient();
   client.exchangeInfo = async () => ({

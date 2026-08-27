@@ -32,6 +32,7 @@ const WS_API_REQUEST_TIMEOUT_MS = 5_000;
 const WS_API_CONNECT_TIMEOUT_MS = 10_000;
 const WS_API_HEARTBEAT_INTERVAL_MS = 20_000;
 const REQUIRED_SELF_TRADE_PREVENTION_MODE = "EXPIRE_MAKER";
+const CLIENT_ORDER_ID_PATTERN = /^[.A-Za-z0-9_:/-]{1,36}$/;
 
 function requestHttps(url, options = {}) {
   return new Promise((resolve, reject) => {
@@ -85,6 +86,7 @@ class BinanceSpotClient extends EventEmitter {
     depthSnapshotLimit = 1000,
     depthDisplayLevels = 10,
     preflightBalanceCheck = false,
+    brokerLinkId = "",
   } = {}) {
     super();
 
@@ -93,6 +95,7 @@ class BinanceSpotClient extends EventEmitter {
     this.testnet = Boolean(testnet);
     this.marketType = "spot";
     this.selfTradePreventionMode = REQUIRED_SELF_TRADE_PREVENTION_MODE;
+    this.brokerLinkId = String(brokerLinkId || "").trim();
 
     this.restBase = this.testnet ? REST_BASE.testnet : REST_BASE.production;
     this.tradingRestBase = this.testnet
@@ -171,6 +174,31 @@ class BinanceSpotClient extends EventEmitter {
     this.tradingWsApiHeartbeatTimer = null;
     this.tradingWsApiHeartbeatAlive = true;
     this.wsApiPendingRequests = new Map();
+  }
+
+  buildBrokerClientOrderId(existingClientOrderId) {
+    const existing = String(existingClientOrderId || "").trim();
+    if (!this.brokerLinkId) return existing || undefined;
+
+    if (!/^[A-Za-z0-9]+$/.test(this.brokerLinkId)) {
+      throw new BinanceApiError(
+        `经纪商 LinkID 格式无效：${this.brokerLinkId}`
+      );
+    }
+
+    const prefix = `x-${this.brokerLinkId}-`;
+    const suffix = existing.startsWith(prefix)
+      ? existing.slice(prefix.length)
+      : existing || `${Date.now()}${crypto.randomBytes(4).toString("hex")}`;
+    const clientOrderId = `${prefix}${suffix}`;
+
+    if (!CLIENT_ORDER_ID_PATTERN.test(clientOrderId)) {
+      throw new BinanceApiError(
+        "拼接 LinkID 后的 newClientOrderId 必须为 1-36 个受支持字符。"
+      );
+    }
+
+    return clientOrderId;
   }
 
   async initialize() {
@@ -598,7 +626,7 @@ class BinanceSpotClient extends EventEmitter {
       stopPrice: order.stopPrice,
       trailingDelta: order.trailingDelta,
       icebergQty: order.icebergQty,
-      newClientOrderId: order.newClientOrderId,
+      newClientOrderId: this.buildBrokerClientOrderId(order.newClientOrderId),
       newOrderRespType: order.newOrderRespType || "RESULT",
     });
 

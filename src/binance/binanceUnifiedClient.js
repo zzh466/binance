@@ -27,6 +27,8 @@ class BinanceUnifiedClient extends EventEmitter {
     depthDisplayLevels,
     preflightBalanceCheck,
     publicMarketFetch,
+    spotBrokerLinkId,
+    futuresBrokerLinkId,
   } = {}) {
     super();
     this.testnet = Boolean(testnet);
@@ -41,11 +43,13 @@ class BinanceUnifiedClient extends EventEmitter {
       ...common,
       apiKey: spotCredentials.apiKey || "",
       apiSecret: spotCredentials.apiSecret || "",
+      brokerLinkId: spotBrokerLinkId,
     });
     this.futures = new BinanceUsdMClient({
       ...common,
       apiKey: futuresCredentials.apiKey || "",
       apiSecret: futuresCredentials.apiSecret || "",
+      brokerLinkId: futuresBrokerLinkId,
       publicMarketFetch,
     });
     this.spot.credentialsSource = spotCredentials.source || "";
