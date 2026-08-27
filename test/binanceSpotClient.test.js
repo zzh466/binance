@@ -30,41 +30,30 @@ test("正式环境公共行情使用 Binance Vision，交易仍使用正式交�
   );
 });
 
-test("深度快照按 lastUpdateId + 1 衔接首条增量", async () => {
+test("现货默认使用十档部分深度流且只向界面发送十档", () => {
   const client = createClient(false);
-  const socket = {};
-  client.marketSocket = socket;
   client.marketSymbol = "BTCUSDT";
-  client.marketManualClose = false;
-  client.depthEventBuffer = [
-    {
-      U: 90,
-      u: 99,
-      b: [],
-      a: [],
-    },
-    {
-      U: 101,
-      u: 102,
-      b: [["50000", "1"]],
-      a: [["50001", "2"]],
-    },
-  ];
-  client.request = async () => ({
-    lastUpdateId: 100,
-    bids: [["49999", "3"]],
-    asks: [["50002", "4"]],
+  let update;
+  client.once("depth-update", (payload) => {
+    update = payload;
   });
+  const bids = Array.from({ length: 12 }, (_, index) => [
+    String(50000 - index),
+    String(index + 1),
+  ]);
+  const asks = Array.from({ length: 12 }, (_, index) => [
+    String(50001 + index),
+    String(index + 1),
+  ]);
 
-  await client.synchronizeDepthSnapshot(socket, "BTCUSDT");
+  client.emitPartialDepthUpdate({ lastUpdateId: 102, bids, asks });
 
-  assert.equal(client.depthReady, true);
-  assert.equal(client.orderBook.lastUpdateId, 102);
-  assert.deepEqual(client.orderBook.getTopLevels(1), {
-    bids: [{ price: "50000", quantity: "1" }],
-    asks: [{ price: "50001", quantity: "2" }],
-  });
-  client.marketSocket = null;
+  assert.equal(client.getDepthStreamName("BTCUSDT"), "btcusdt@depth10@100ms");
+  assert.equal(client.depthMode, "partial");
+  assert.equal(update.lastUpdateId, 102);
+  assert.equal(update.bids.length, 10);
+  assert.equal(update.asks.length, 10);
+  assert.deepEqual(update.bids[0], { price: "50000", quantity: "1" });
   client.close();
 });
 
@@ -96,8 +85,59 @@ test("prepareOrder 按交易过滤器对价格和数量向下对齐", async () =
   assert.equal(result.params.quantity, "0.001");
   assert.equal(result.params.price, "50000.10");
   assert.equal(result.params.timeInForce, "GTC");
+  assert.equal(result.params.newOrderRespType, "ACK");
   assert.equal(result.params.selfTradePreventionMode, "EXPIRE_MAKER");
   assert.equal(result.adjustments.length, 2);
+});
+
+test("正式现货服务器时间同步同时预热公共域名和交易域名", async () => {
+  const client = createClient(false);
+  const synchronizedBases = [];
+  client.syncServerTimeForBase = async (baseUrl) => {
+    synchronizedBases.push(baseUrl);
+    return { baseUrl, offsetMs: baseUrl === client.tradingRestBase ? 7 : 3 };
+  };
+
+  const result = await client.syncServerTime();
+
+  assert.deepEqual(synchronizedBases.sort(), [
+    client.restBase,
+    client.tradingRestBase,
+  ].sort());
+  assert.equal(result.baseUrl, client.tradingRestBase);
+  assert.equal(result.offsetMs, 7);
+  client.close();
+});
+
+test("现货 exchangeInfo 过期后立即复用旧缓存并在后台刷新", async () => {
+  const client = createClient();
+  const staleData = {
+    symbol: { symbol: "BTCUSDT", status: "TRADING", filters: [] },
+  };
+  client.exchangeInfoCache.set("BTCUSDT", {
+    loadedAt: Date.now() - 600_000,
+    data: staleData,
+  });
+  let resolveRequest;
+  let requestCount = 0;
+  client.request = async () => {
+    requestCount += 1;
+    return new Promise((resolve) => {
+      resolveRequest = resolve;
+    });
+  };
+
+  const result = await client.exchangeInfo("BTCUSDT");
+
+  assert.equal(result, staleData);
+  assert.equal(requestCount, 1);
+  const refreshPromise = client.exchangeInfoRefreshPromises.get("BTCUSDT");
+  resolveRequest({
+    symbols: [{ symbol: "BTCUSDT", status: "TRADING", filters: [] }],
+  });
+  await refreshPromise;
+  assert.ok(client.exchangeInfoCache.get("BTCUSDT").loadedAt > Date.now() - 1_000);
+  client.close();
 });
 
 test("现货底层报单参数自动拼接 LinkID 并生成唯一 client order id", async () => {
@@ -167,7 +207,7 @@ test("现货交易对不支持 EXPIRE_MAKER 时在本地下单前拒绝", async 
   client.close();
 });
 
-test("现货 OCO、OTO、OTOCO 全部强制发送 EXPIRE_MAKER", async () => {
+test("现货 OCO、OTO、OTOCO 全部使用 ACK、EXPIRE_MAKER 并等待交易 WebSocket", async () => {
   const client = createClient();
   client.exchangeInfo = async () => ({
     symbol: {
@@ -178,8 +218,8 @@ test("现货 OCO、OTO、OTOCO 全部强制发送 EXPIRE_MAKER", async () => {
     },
   });
   const submissions = [];
-  client.signedWsOrRest = async (wsMethod, _restMethod, _path, params) => {
-    submissions.push({ wsMethod, params });
+  client.signedWsOrRest = async (wsMethod, _restMethod, _path, params, options) => {
+    submissions.push({ wsMethod, params, options });
     return { accepted: true };
   };
 
@@ -213,14 +253,16 @@ test("现货 OCO、OTO、OTOCO 全部强制发送 EXPIRE_MAKER", async () => {
   });
 
   assert.deepEqual(
-    submissions.map(({ wsMethod, params }) => [
+    submissions.map(({ wsMethod, params, options }) => [
       wsMethod,
       params.selfTradePreventionMode,
+      params.newOrderRespType,
+      options.waitForWebSocketReady,
     ]),
     [
-      ["orderList.place.oco", "EXPIRE_MAKER"],
-      ["orderList.place.oto", "EXPIRE_MAKER"],
-      ["orderList.place.otoco", "EXPIRE_MAKER"],
+      ["orderList.place.oco", "EXPIRE_MAKER", "ACK", true],
+      ["orderList.place.oto", "EXPIRE_MAKER", "ACK", true],
+      ["orderList.place.otoco", "EXPIRE_MAKER", "ACK", true],
     ]
   );
   client.close();
@@ -438,6 +480,63 @@ test("下单优先复用独立交易 WebSocket，且低延迟模式不做余额�
   assert.equal(result.orderId, 123);
   assert.equal(result.transport, "websocket");
   assert.equal(result.preflightBalanceCheck, false);
+});
+
+test("交易 WebSocket 尚在连接时，报单等待其就绪而不是直接走 HTTP", async () => {
+  const client = createClient();
+  client.serverTimeCache.set(client.tradingRestBase, {
+    serverTime: Date.now(),
+    localMidpoint: Date.now(),
+    offsetMs: 0,
+    baseUrl: client.tradingRestBase,
+    synchronizedAt: Date.now(),
+  });
+  client.prepareOrder = async () => ({
+    params: {
+      symbol: "BTCUSDT",
+      side: "BUY",
+      type: "LIMIT",
+      quantity: "0.001",
+      price: "50000",
+      newOrderRespType: "ACK",
+    },
+    adjustments: [],
+    symbolInfo: {},
+  });
+  let httpOrderCount = 0;
+  client.request = async () => {
+    httpOrderCount += 1;
+    return {};
+  };
+  const socket = {
+    readyState: 1,
+    send(payload) {
+      const request = JSON.parse(payload);
+      setImmediate(() => client.handleWsApiResponse({
+        id: request.id,
+        status: 200,
+        result: { symbol: "BTCUSDT", orderId: 456, clientOrderId: "ack-456" },
+      }, socket));
+    },
+    close() {},
+    terminate() {},
+  };
+  let connectCount = 0;
+  client.connectTradingWebSocket = async () => {
+    connectCount += 1;
+    await new Promise((resolve) => setImmediate(resolve));
+    client.tradingWsApiSocket = socket;
+    return { connected: true };
+  };
+
+  const result = await client.placeOrder({ symbol: "BTCUSDT" });
+
+  assert.equal(connectCount, 1);
+  assert.equal(httpOrderCount, 0);
+  assert.equal(result.orderId, 456);
+  assert.equal(result.transport, "websocket");
+  client.tradingWsApiSocket = null;
+  client.close();
 });
 
 test("单笔撤单优先复用独立交易 WebSocket", async () => {

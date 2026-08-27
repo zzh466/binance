@@ -7,6 +7,8 @@ const { BinanceUsdMClient } = require("./binanceUsdMClient");
 
 const MARKET_SPOT = "spot";
 const MARKET_FUTURES = "futures";
+const MARKET_RESOLUTION_CACHE_TTL_MS = 300_000;
+const MARKET_RESOLUTION_REFRESH_RETRY_MS = 30_000;
 const ROUTED_EVENTS = [
   "depth-update",
   "trade-update",
@@ -23,8 +25,6 @@ class BinanceUnifiedClient extends EventEmitter {
     spotCredentials = {},
     futuresCredentials = {},
     depthSpeed,
-    depthSnapshotLimit,
-    depthDisplayLevels,
     preflightBalanceCheck,
     publicMarketFetch,
     spotBrokerLinkId,
@@ -35,8 +35,6 @@ class BinanceUnifiedClient extends EventEmitter {
     const common = {
       testnet: this.testnet,
       depthSpeed,
-      depthSnapshotLimit,
-      depthDisplayLevels,
       preflightBalanceCheck,
     };
     this.spot = new BinanceSpotClient({
@@ -58,6 +56,8 @@ class BinanceUnifiedClient extends EventEmitter {
     this.activeMarketType = MARKET_SPOT;
     this.activeSymbol = null;
     this.marketResolutionCache = new Map();
+    this.marketResolutionRefreshPromises = new Map();
+    this.marketResolutionRefreshAttemptAt = new Map();
     this.futuresInitializationPromise = null;
     this.bindChildEvents(this.spot, MARKET_SPOT);
     this.bindChildEvents(this.futures, MARKET_FUTURES);
@@ -115,12 +115,16 @@ class BinanceUnifiedClient extends EventEmitter {
     return this.spot.depthSpeed;
   }
 
-  get depthSnapshotLimit() {
-    return this.spot.depthSnapshotLimit;
-  }
-
   get depthDisplayLevels() {
     return this.spot.depthDisplayLevels;
+  }
+
+  get depthStreamLevels() {
+    return this.spot.depthStreamLevels;
+  }
+
+  get depthMode() {
+    return this.spot.depthMode;
   }
 
   getActiveClient() {
@@ -170,7 +174,16 @@ class BinanceUnifiedClient extends EventEmitter {
     }
     const cacheKey = `${marketType || "auto"}:${normalizedSymbol}`;
     const cached = this.marketResolutionCache.get(cacheKey);
-    if (!forceRefresh && cached && Date.now() - cached.resolvedAt < 300_000) {
+    if (!forceRefresh && cached) {
+      if (
+        Date.now() - cached.resolvedAt >= MARKET_RESOLUTION_CACHE_TTL_MS
+      ) {
+        this.refreshMarketResolutionInBackground(
+          normalizedSymbol,
+          marketType,
+          cacheKey
+        );
+      }
       return cached;
     }
 
@@ -240,6 +253,35 @@ class BinanceUnifiedClient extends EventEmitter {
         }
       );
     }
+  }
+
+  refreshMarketResolutionInBackground(symbol, marketType, cacheKey) {
+    const pending = this.marketResolutionRefreshPromises.get(cacheKey);
+    if (pending) return pending;
+    const lastAttemptAt = this.marketResolutionRefreshAttemptAt.get(cacheKey) || 0;
+    if (Date.now() - lastAttemptAt < MARKET_RESOLUTION_REFRESH_RETRY_MS) {
+      return null;
+    }
+
+    this.marketResolutionRefreshAttemptAt.set(cacheKey, Date.now());
+    const promise = this.resolveMarket(symbol, {
+      forceRefresh: true,
+      marketType,
+    });
+    this.marketResolutionRefreshPromises.set(cacheKey, promise);
+    promise.catch((error) => {
+      this.emit("market-error", {
+        marketType,
+        symbol,
+        message: `市场类型后台刷新失败：${error.message}`,
+        time: Date.now(),
+      });
+    }).finally(() => {
+      if (this.marketResolutionRefreshPromises.get(cacheKey) === promise) {
+        this.marketResolutionRefreshPromises.delete(cacheKey);
+      }
+    });
+    return promise;
   }
 
   addMarketType(data, marketType) {
