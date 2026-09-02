@@ -73,6 +73,7 @@ test("永续下单通过 WebSocket 并映射 Spot 风格止损限价类型", asy
   const client = new BinanceUsdMClient({
     apiKey: "future-key",
     apiSecret: "future-secret",
+    brokerLinkId: "tdk3UjFd",
   });
   client.exchangeInfo = async () => ({ symbol: futuresSymbol() });
   seedPositionMode(client);
@@ -112,10 +113,83 @@ test("永续下单通过 WebSocket 并映射 Spot 风格止损限价类型", asy
   assert.equal(submitted.params.quantity, "0.031");
   assert.equal(submitted.params.price, "200.1");
   assert.equal(submitted.params.positionSide, "BOTH");
+  assert.equal(submitted.params.newOrderRespType, "ACK");
   assert.equal(submitted.params.selfTradePreventionMode, "EXPIRE_MAKER");
+  assert.match(
+    submitted.params.newClientOrderId,
+    /^x-tdk3UjFd-[0-9]{13}[a-f0-9]{8}$/
+  );
+  assert.ok(submitted.params.newClientOrderId.length <= 36);
   assert.equal(result.marketType, MARKET_FUTURES);
   assert.equal(result.transport, "websocket");
   assert.equal(result.selfTradePrevention.apiEffective, true);
+  client.close();
+});
+
+test("统一客户端把现货和合约 LinkID 分别传给对应底层客户端", () => {
+  const client = new BinanceUnifiedClient({
+    spotBrokerLinkId: "P8DHAU8C",
+    futuresBrokerLinkId: "tdk3UjFd",
+  });
+
+  assert.equal(client.spot.brokerLinkId, "P8DHAU8C");
+  assert.equal(client.futures.brokerLinkId, "tdk3UjFd");
+  client.close();
+});
+
+test("永续 exchangeInfo 过期后立即复用旧缓存并刷新全市场快照", async () => {
+  const client = new BinanceUsdMClient();
+  const staleSymbol = futuresSymbol();
+  const staleData = {
+    symbols: [staleSymbol],
+    symbol: staleSymbol,
+    marketType: MARKET_FUTURES,
+  };
+  client.exchangeInfoSnapshot = {
+    loadedAt: Date.now() - 600_000,
+    data: { symbols: [staleSymbol] },
+  };
+  client.exchangeInfoCache.set("SKHYUSDT", {
+    loadedAt: Date.now() - 600_000,
+    data: staleData,
+  });
+  let resolveRequest;
+  client.request = async () => new Promise((resolve) => {
+    resolveRequest = resolve;
+  });
+
+  const result = await client.exchangeInfo("SKHYUSDT");
+
+  assert.equal(result, staleData);
+  const refreshPromise = client.exchangeInfoSnapshotRefreshPromise;
+  resolveRequest({ symbols: [staleSymbol] });
+  await refreshPromise;
+  assert.ok(client.exchangeInfoCache.get("SKHYUSDT").loadedAt > Date.now() - 1_000);
+  client.close();
+});
+
+test("统一市场路由过期后先复用结果，不阻塞报单链路", async () => {
+  const client = new BinanceUnifiedClient();
+  const cached = {
+    symbol: "BTCUSDT",
+    marketType: MARKET_SPOT,
+    client: client.spot,
+    exchangeInfo: { symbol: { symbol: "BTCUSDT" } },
+    resolvedAt: Date.now() - 600_000,
+  };
+  client.marketResolutionCache.set("auto:BTCUSDT", cached);
+  let resolveRefresh;
+  client.spot.exchangeInfo = async () => new Promise((resolve) => {
+    resolveRefresh = resolve;
+  });
+
+  const result = await client.resolveMarket("BTCUSDT");
+
+  assert.equal(result, cached);
+  const refreshPromise = client.marketResolutionRefreshPromises.get("auto:BTCUSDT");
+  resolveRefresh({ symbol: { symbol: "BTCUSDT" } });
+  await refreshPromise;
+  assert.ok(client.marketResolutionCache.get("auto:BTCUSDT").resolvedAt > cached.resolvedAt);
   client.close();
 });
 
@@ -505,25 +579,27 @@ test("永续 ORDER_TRADE_UPDATE 被转换为现有界面可消费的 executionRe
   client.close();
 });
 
-test("永续深度使用 pu 衔接，不要求 U 数值连续", () => {
+test("永续十档部分深度事件直接转换为页面行情", () => {
   const client = new BinanceUsdMClient();
-  client.orderBook.loadSnapshot({
-    symbol: "BTCUSDT",
-    lastUpdateId: 100,
-    bids: [["50000", "1"]],
-    asks: [["50001", "1"]],
+  let update;
+  client.once("depth-update", (payload) => {
+    update = payload;
   });
 
-  const result = client.applyDepthEventToOrderBook({
+  client.emitPartialDepthUpdate({
+    e: "depthUpdate",
+    s: "BTCUSDT",
     U: 105,
     u: 110,
     pu: 100,
     b: [["50000", "2"]],
-    a: [],
+    a: [["50001", "3"]],
   });
 
-  assert.equal(result.applied, true);
-  assert.equal(client.orderBook.lastUpdateId, 110);
-  assert.equal(client.orderBook.getTopLevels(1).bids[0].quantity, "2");
+  assert.equal(client.getDepthStreamName("BTCUSDT"), "btcusdt@depth10@100ms");
+  assert.equal(update.firstUpdateId, 105);
+  assert.equal(update.finalUpdateId, 110);
+  assert.deepEqual(update.bids[0], { price: "50000", quantity: "2" });
+  assert.deepEqual(update.asks[0], { price: "50001", quantity: "3" });
   client.close();
 });

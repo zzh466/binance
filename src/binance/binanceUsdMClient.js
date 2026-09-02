@@ -160,11 +160,12 @@ class BinanceUsdMClient extends BinanceSpotClient {
     this.tradingWsApiBase = this.wsApiBase;
     this.timePath = "/fapi/v1/time";
     this.pingPath = "/fapi/v1/ping";
-    this.depthPath = "/fapi/v1/depth";
     this.tickerPricePath = "/fapi/v1/ticker/price";
     this.supportsAveragePriceStream = false;
 
     this.exchangeInfoSnapshot = null;
+    this.exchangeInfoSnapshotRefreshPromise = null;
+    this.exchangeInfoSnapshotRefreshAttemptAt = 0;
     this.futuresListenKey = null;
     this.futuresListenKeyKeepAliveTimer = null;
     this.productionMarketTransportPromise = null;
@@ -555,17 +556,6 @@ class BinanceUsdMClient extends BinanceSpotClient {
     return super.connectDepth(symbol);
   }
 
-  isFirstDepthEventApplicable(event, snapshotUpdateId) {
-    return (
-      Number(event.U) <= snapshotUpdateId &&
-      snapshotUpdateId <= Number(event.u)
-    );
-  }
-
-  applyDepthEventToOrderBook(event) {
-    return this.orderBook.applyFuturesEvent(event);
-  }
-
   assertTradingCredentials() {
     if (!this.apiKey || !this.apiSecret) {
       throw new BinanceApiError(
@@ -586,23 +576,32 @@ class BinanceUsdMClient extends BinanceSpotClient {
   async exchangeInfo(symbol, { forceRefresh = false } = {}) {
     const normalizedSymbol = this.validateSymbol(symbol);
     const cached = this.exchangeInfoCache.get(normalizedSymbol);
-    if (!forceRefresh && cached && Date.now() - cached.loadedAt < 300_000) {
+    const cacheExpired = cached && Date.now() - cached.loadedAt >= 300_000;
+    if (!forceRefresh && cached) {
+      if (cacheExpired) this.refreshExchangeInfoSnapshotInBackground();
       return cached.data;
     }
 
-    if (
-      forceRefresh ||
-      !this.exchangeInfoSnapshot ||
-      Date.now() - this.exchangeInfoSnapshot.loadedAt >= 300_000
-    ) {
-      const result = await this.request("GET", "/fapi/v1/exchangeInfo");
-      this.exchangeInfoSnapshot = { loadedAt: Date.now(), data: result };
+    const snapshotExpired = this.exchangeInfoSnapshot &&
+      Date.now() - this.exchangeInfoSnapshot.loadedAt >= 300_000;
+    if (forceRefresh || !this.exchangeInfoSnapshot) {
+      await this.refreshExchangeInfoSnapshot();
+    } else if (snapshotExpired) {
+      this.refreshExchangeInfoSnapshotInBackground();
     }
 
-    const result = this.exchangeInfoSnapshot.data;
-    const symbolInfo = (result.symbols || []).find(
+    let result = this.exchangeInfoSnapshot.data;
+    let symbolInfo = (result.symbols || []).find(
       (item) => item.symbol === normalizedSymbol
     );
+    // 旧快照里不存在的交易对可能是刚上线的合约，此时必须刷新一次确认。
+    if (!symbolInfo && snapshotExpired && !forceRefresh) {
+      await this.refreshExchangeInfoSnapshot();
+      result = this.exchangeInfoSnapshot.data;
+      symbolInfo = (result.symbols || []).find(
+        (item) => item.symbol === normalizedSymbol
+      );
+    }
     if (!symbolInfo) {
       throw new BinanceApiError("Invalid symbol.", {
         status: 400,
@@ -622,6 +621,58 @@ class BinanceUsdMClient extends BinanceSpotClient {
       data,
     });
     return data;
+  }
+
+  refreshExchangeInfoSnapshotInBackground() {
+    if (
+      Date.now() - this.exchangeInfoSnapshotRefreshAttemptAt < 30_000
+    ) {
+      return this.exchangeInfoSnapshotRefreshPromise;
+    }
+    const promise = this.refreshExchangeInfoSnapshot();
+    promise.catch((error) => {
+      this.emit("market-error", {
+        marketType: this.marketType,
+        message: `永续交易规则后台刷新失败：${error.message}`,
+        symbol: this.marketSymbol,
+        time: Date.now(),
+      });
+    });
+    return promise;
+  }
+
+  refreshExchangeInfoSnapshot() {
+    if (this.exchangeInfoSnapshotRefreshPromise) {
+      return this.exchangeInfoSnapshotRefreshPromise;
+    }
+    this.exchangeInfoSnapshotRefreshAttemptAt = Date.now();
+    const promise = (async () => {
+      const result = await this.request("GET", "/fapi/v1/exchangeInfo");
+      this.exchangeInfoSnapshot = { loadedAt: Date.now(), data: result };
+      for (const [symbol, cached] of this.exchangeInfoCache) {
+        const symbolInfo = (result.symbols || []).find(
+          (item) => item.symbol === symbol
+        );
+        if (!symbolInfo) continue;
+        this.exchangeInfoCache.set(symbol, {
+          loadedAt: Date.now(),
+          data: {
+            ...result,
+            symbols: [symbolInfo],
+            symbol: symbolInfo,
+            marketType: this.marketType,
+          },
+        });
+      }
+      return result;
+    })();
+    this.exchangeInfoSnapshotRefreshPromise = promise;
+    promise.finally(() => {
+      if (this.exchangeInfoSnapshotRefreshPromise === promise) {
+        this.exchangeInfoSnapshotRefreshPromise = null;
+      }
+    }).catch(() => {});
+    return promise;
   }
 
   async marketOverview(symbol, { interval = "1m", limit = 50 } = {}) {
@@ -743,8 +794,8 @@ class BinanceUsdMClient extends BinanceSpotClient {
       quoteOrderQty: order.quoteOrderQty,
       price: order.price,
       stopPrice: order.stopPrice,
-      newClientOrderId: order.newClientOrderId,
-      newOrderRespType: order.newOrderRespType || "RESULT",
+      newClientOrderId: this.buildBrokerClientOrderId(order.newClientOrderId),
+      newOrderRespType: order.newOrderRespType || "ACK",
     });
 
     if (type === "LIMIT" || type === "STOP" || type === "TAKE_PROFIT") {
@@ -879,7 +930,7 @@ class BinanceUsdMClient extends BinanceSpotClient {
               true,
               this.tradingRestBase
             ),
-            { retrySafe: false }
+            { retrySafe: false, waitForWebSocketReady: true }
           ));
       }
     } catch (error) {

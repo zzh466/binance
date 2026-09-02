@@ -421,6 +421,14 @@
         opacity: 0.78;
       }
 
+      .chart-latest-trade {
+        padding: 5px 9px;
+        border: 1px solid color-mix(in srgb, #ffb300 55%, transparent);
+        border-radius: 6px;
+        color: #ffb300;
+        font: 700 14px ui-monospace, SFMono-Regular, Consolas, monospace;
+      }
+
       .chart-order-status .open-order {
         color: #ff0000;
       }
@@ -636,7 +644,10 @@
         <label for="chartSymbolInput">全局合约</label>
         <input id="chartSymbolInput" value=" MUUSDT" autocomplete="off" spellcheck="false" />
         <button id="switchChartSymbolButton" type="button">切换行情</button>
-        <span id="chartSymbolSwitchStatus" class="chart-symbol-status">当前： MUUSDT</span>
+        <span id="chartSymbolSwitchStatus" class="chart-symbol-status">当前：BTCUSDT</span>
+        <span class="chart-latest-trade">
+          最新成交价：<span id="chartLatestTradePrice">-</span>
+        </span>
       </div>
       <div style="position: relative;">
         <canvas id="can" width="980px" height="300px"></canvas>
@@ -965,7 +976,7 @@
         </section>
 
         <section>
-          <h2>增量深度连接</h2>
+          <h2>十档深度连接</h2>
           <p class="muted">使用页面最上方的“全局合约”。</p>
           <div class="buttons">
             <button id="connectMarketButton">连接深度行情</button>
@@ -982,7 +993,7 @@
         </section>
 
         <section class="full">
-          <h2>本地订单簿</h2>
+          <h2>十档订单簿</h2>
           <div class="depth-grid">
             <div>
               <h3>买盘 Bids</h3>

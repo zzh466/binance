@@ -6,6 +6,9 @@ const { app, BrowserWindow, ipcMain, net, Notification } = require("electron");
 const dotenv = require("dotenv");
 const { BinanceUnifiedClient } = require("./binance/binanceUnifiedClient");
 const {
+  createLatestUpdateCoalescer,
+} = require("./latestUpdateCoalescer");
+const {
   readShortcutConfig,
   writeShortcutConfig,
 } = require("./shortcutConfigStore");
@@ -98,8 +101,8 @@ function createBinanceClient(testnet) {
     futuresCredentials,
     testnet,
     depthSpeed: process.env.BINANCE_DEPTH_SPEED || "100ms",
-    depthSnapshotLimit: process.env.BINANCE_DEPTH_SNAPSHOT_LIMIT || 1000,
-    depthDisplayLevels: process.env.BINANCE_DEPTH_DISPLAY_LEVELS || 5,
+    spotBrokerLinkId: process.env.BINANCE_SPOT_LINK_ID || "",
+    futuresBrokerLinkId: process.env.BINANCE_FUTURES_LINK_ID || "",
     publicMarketFetch: (url, options) => net.fetch(url, options),
     preflightBalanceCheck:
       process.env.BINANCE_PREFLIGHT_BALANCE_CHECK === "true",
@@ -276,7 +279,8 @@ function getClientStatus() {
     tradingServerTimeOffsetMs: client.tradingServerTimeOffsetMs,
     preflightBalanceCheck: client.preflightBalanceCheck,
     depthSpeed: client.depthSpeed,
-    depthSnapshotLimit: client.depthSnapshotLimit,
+    depthMode: client.depthMode,
+    depthStreamLevels: client.depthStreamLevels,
     depthDisplayLevels: client.depthDisplayLevels,
     activeMarketType: client.activeMarketType,
     activeSymbol: client.activeSymbol,
@@ -492,12 +496,21 @@ function registerIpcHandlers() {
 }
 
 function bindClientEvents(targetClient) {
+  const tradeUpdateCoalescer = createLatestUpdateCoalescer({
+    intervalMs: 32,
+    send: (data) => {
+      if (targetClient === client) {
+        sendToRenderer("binance:trade-update", data);
+      }
+    },
+  });
+
   targetClient.on("depth-update", (data) => {
     if (targetClient === client) sendToRenderer("binance:depth-update", data);
   });
 
   targetClient.on("trade-update", (data) => {
-    if (targetClient === client) sendToRenderer("binance:trade-update", data);
+    if (targetClient === client) tradeUpdateCoalescer.push(data);
   });
 
   targetClient.on("market-status", (data) => {

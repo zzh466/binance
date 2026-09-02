@@ -705,7 +705,6 @@ class Chart {
         }
         if(arg.LastPrice > Number.MAX_SAFE_INTEGER) return
         if(this.data.length === 0) {
-            console.log(arg.LastPrice)
             this.initData(arg.LastPrice);
             if(!this.data.length) return
             this.renderPrice();
@@ -715,17 +714,23 @@ class Chart {
         this.args= arg
         // this.renderTime(arg.UpdateTime)
         // console.log(arg)
-        if(arg.BidPrice5  &&  arg.BidPrice5 <= Number.MAX_SAFE_INTEGER){
-            this.clearData(arg.BidPrice5 , arg.BidPrice1 );
+        const depthLevelCount = Math.min(
+            20,
+            Math.max(1, Math.floor(Number(arg.DepthLevels) || 5))
+        );
+        const deepestBid = arg[`BidPrice${depthLevelCount}`];
+        const deepestAsk = arg[`AskPrice${depthLevelCount}`];
+        if(deepestBid && deepestBid <= Number.MAX_SAFE_INTEGER){
+            this.clearData(deepestBid, arg.BidPrice1 );
         }
-        if(arg.AskPrice5  &&  arg.AskPrice5 <= Number.MAX_SAFE_INTEGER){
-            this.clearData(arg.AskPrice1 , arg.AskPrice5 );
+        if(deepestAsk && deepestAsk <= Number.MAX_SAFE_INTEGER){
+            this.clearData(arg.AskPrice1, deepestAsk);
         }
         let pauseAsk, pasuseBuy;
-        for(let i=5; i> 0; i--){
+        for(let i=depthLevelCount; i> 0; i--){
             let buyPirce = arg[`BidPrice${i}`];
             let buyIndex ;
-            const flag = this.rendered?i> 1 : i < 5;
+            const flag = this.rendered ? i > 1 : i < depthLevelCount;
             
             if(buyPirce && !pasuseBuy){
                 buyIndex = this.getindex(buyPirce, flag)
@@ -828,6 +833,7 @@ const elements = {
   chartSymbolInput: document.querySelector("#chartSymbolInput"),
   switchChartSymbolButton: document.querySelector("#switchChartSymbolButton"),
   chartSymbolSwitchStatus: document.querySelector("#chartSymbolSwitchStatus"),
+  chartLatestTradePrice: document.querySelector("#chartLatestTradePrice"),
   lastUpdateId: document.querySelector("#lastUpdateId"),
   receivedAt: document.querySelector("#receivedAt"),
   spread: document.querySelector("#spread"),
@@ -986,7 +992,6 @@ async function signCurrentTradFiPerpsAgreement({ retryOrder = false } = {}) {
 }
 
 async function submitOrderWithTradFiAgreement(order, { testOnly = false } = {}) {
-  console.log(order);
   const submit = () => testOnly
     ? window.binance.testOrder(order)
     : window.binance.placeOrder(order);
@@ -1005,18 +1010,19 @@ async function submitOrderWithTradFiAgreement(order, { testOnly = false } = {}) 
 }
 
 function renderDepthRows(container, levels) {
-
-  container.replaceChildren();
-
-  for (const level of levels) {
-    const row = document.createElement("tr");
-    const price = document.createElement("td");
-    const quantity = document.createElement("td");
-
-    price.textContent = level.price;
-    quantity.textContent = level.quantity;
-    row.append(price, quantity);
-    container.append(row);
+  const visibleLevels = levels.slice(0, 10);
+  for (const [index, level] of visibleLevels.entries()) {
+    let row = container.children[index];
+    if (!row) {
+      row = document.createElement("tr");
+      row.append(document.createElement("td"), document.createElement("td"));
+      container.append(row);
+    }
+    row.children[0].textContent = level.price;
+    row.children[1].textContent = level.quantity;
+  }
+  while (container.children.length > visibleLevels.length) {
+    container.lastElementChild.remove();
   }
 }
 
@@ -1426,7 +1432,8 @@ async function loadStatus() {
     `Spot ${status.markets?.spot?.serverTimeOffsetMs ?? 0} ms / ` +
     `USDⓈ-M ${status.markets?.futures?.serverTimeOffsetMs ?? 0} ms`;
   elements.depthConfig.textContent =
-    `${status.depthSpeed} / 快照 ${status.depthSnapshotLimit} 档 / 显示 ${status.depthDisplayLevels} 档`;
+    `${status.depthSpeed} / 部分深度流 ${status.depthStreamLevels || 10} 档 / ` +
+    `显示 ${status.depthDisplayLevels || 10} 档`;
 }
 
 elements.environmentSwitch.addEventListener("change", async () => {
@@ -1573,6 +1580,7 @@ document.querySelector("#cancelReplaceButton").addEventListener("click", async (
 
 function synchronizeSymbolInput(symbol) {
   elements.chartSymbolInput.value = symbol;
+  renderLatestTradePrice(symbol);
 }
 
 async function connectMarketSymbol(rawSymbol, { showResult = true } = {}) {
@@ -2716,13 +2724,19 @@ async function refreshTrackedOpenOrders(symbol = getSelectedSymbol()) {
   return result;
 }
 
-function fillLatestTradePrice() {
-  const symbol = getSelectedSymbol();
+function fillLatestTradePrice(
+  symbol = elements.chartSymbolInput.value.trim().toUpperCase()
+) {
   const price = latestTradePrices.get(symbol);
 
   if (elements.latestTradePriceToggle.checked && price) {
     elements.price.value = price;
   }
+}
+
+function renderLatestTradePrice(symbol = getSelectedSymbol()) {
+  elements.chartLatestTradePrice.textContent =
+    latestTradePrices.get(symbol) || "-";
 }
 
 elements.latestTradePriceToggle.addEventListener("change", () => {
@@ -2732,7 +2746,10 @@ elements.latestTradePriceToggle.addEventListener("change", () => {
   fillLatestTradePrice();
 });
 
-elements.chartSymbolInput.addEventListener("change", fillLatestTradePrice);
+elements.chartSymbolInput.addEventListener("change", () => {
+  fillLatestTradePrice();
+  renderLatestTradePrice();
+});
 
 window.binance.onTradeUpdate((trade) => {
   const symbol = String(trade.symbol || "").toUpperCase();
@@ -2740,7 +2757,17 @@ window.binance.onTradeUpdate((trade) => {
 
   if (symbol && price && Number.isFinite(Number(price))) {
     latestTradePrices.set(symbol, price);
-    fillLatestTradePrice();
+    const selectedSymbol = elements.chartSymbolInput.value.trim().toUpperCase();
+    if (symbol === selectedSymbol) {
+      fillLatestTradePrice(symbol);
+      renderLatestTradePrice(symbol);
+    }
+    if (symbol === chartSymbol && chart.data.length) {
+      const numericPrice = Number(price);
+      chart.args ||= {};
+      chart.args.LastPrice = numericPrice;
+      chart.renderCurrentPirce(numericPrice, Number(trade.quantity) || 0);
+    }
   }
 });
 
@@ -2752,7 +2779,7 @@ function createChartDepthData(depth) {
   ];
 
   for (const [side, levels] of sides) {
-    for (const [index, level] of (levels || []).slice(0, 5).entries()) {
+    for (const [index, level] of (levels || []).slice(0, 10).entries()) {
       const price = Number(level.price);
       const volume = Number(level.quantity);
 
@@ -2763,7 +2790,13 @@ function createChartDepthData(depth) {
     }
   }
 
-  data.LastPrice = data.AskPrice1 || data.BidPrice1;
+  data.DepthLevels = 10;
+  const latestTradePrice = Number(
+    latestTradePrices.get(String(depth.symbol || "").toUpperCase())
+  );
+  data.LastPrice = Number.isFinite(latestTradePrice) && latestTradePrice > 0
+    ? latestTradePrice
+    : data.AskPrice1 || data.BidPrice1;
   return data;
 }
 
