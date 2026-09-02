@@ -11,6 +11,7 @@
     <title>Binance 统一交易测试台</title>
     <style>
       :root {
+        --latency-bar-height: 24px;
         font-family:
           Inter, "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
         color-scheme: light dark;
@@ -18,9 +19,26 @@
 
       body {
         margin: 0;
-        padding: 24px;
+        padding: 24px 24px calc(24px + var(--latency-bar-height));
         background: Canvas;
         color: CanvasText;
+      }
+
+      .binance-latency-bar {
+        position: fixed;
+        z-index: 100;
+        right: 0;
+        bottom: 0;
+        left: 0;
+        box-sizing: border-box;
+        height: var(--latency-bar-height);
+        padding: 0 10px;
+        overflow: hidden;
+        border-top: 1px solid color-mix(in srgb, CanvasText 24%, transparent);
+        background: color-mix(in srgb, Canvas 96%, CanvasText 4%);
+        font: 12px/23px ui-monospace, SFMono-Regular, Consolas, monospace;
+        white-space: nowrap;
+        text-overflow: ellipsis;
       }
 
       .title-menu-bar {
@@ -1023,6 +1041,15 @@
         </section>
       </div>
     </main>
+
+    <footer
+      id="binanceLatencyBar"
+      class="binance-latency-bar"
+      aria-live="off"
+      title="最近一次 Binance 网络调用的延迟"
+    >
+      Binance 接口延迟：等待调用
+    </footer>
 
     <dialog id="shortcutDialog" aria-labelledby="shortcutDialogTitle">
       <div class="shortcut-dialog-content">

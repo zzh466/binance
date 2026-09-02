@@ -137,6 +137,65 @@ test("统一客户端把现货和合约 LinkID 分别传给对应底层客户端
   client.close();
 });
 
+test("统一客户端把现货和永续的延迟事件路由到同一出口", async () => {
+  const client = new BinanceUnifiedClient();
+  const updates = [];
+  client.on("latency-update", (payload) => updates.push(payload));
+
+  client.spot.emit("latency-update", {
+    operation: "GET /v3/time",
+    transport: "https-keepalive",
+    elapsedMs: 12.345,
+  });
+  client.futures.emit("latency-update", {
+    operation: "ping/pong 心跳",
+    transport: "websocket-heartbeat",
+    elapsedMs: 8.765,
+    background: true,
+  });
+
+  assert.deepEqual(updates, [
+    {
+      marketType: MARKET_SPOT,
+      operation: "GET /v3/time",
+      transport: "https-keepalive",
+      elapsedMs: 12.345,
+    },
+    {
+      marketType: MARKET_FUTURES,
+      operation: "ping/pong 心跳",
+      transport: "websocket-heartbeat",
+      elapsedMs: 8.765,
+      background: true,
+    },
+  ]);
+  client.close();
+});
+
+test("未指定合约时同时连接现货和 U 本位账户订单事件", async () => {
+  const client = new BinanceUnifiedClient({
+    spotCredentials: { apiKey: "spot-key", apiSecret: "spot-secret" },
+    futuresCredentials: { apiKey: "futures-key", apiSecret: "futures-secret" },
+  });
+  const connectedMarkets = [];
+  client.spot.connectUserData = async () => {
+    connectedMarkets.push(MARKET_SPOT);
+    return { subscriptionId: "spot-subscription" };
+  };
+  client.futures.connectUserData = async () => {
+    connectedMarkets.push(MARKET_FUTURES);
+    return { subscriptionId: "futures-subscription" };
+  };
+
+  const result = await client.connectUserData();
+
+  assert.deepEqual(connectedMarkets.sort(), [MARKET_FUTURES, MARKET_SPOT]);
+  assert.equal(result.connected.spot.marketType, MARKET_SPOT);
+  assert.equal(result.connected.futures.marketType, MARKET_FUTURES);
+  assert.deepEqual(result.failedMarketTypes, []);
+  client.close();
+});
+
 test("永续 exchangeInfo 过期后立即复用旧缓存并刷新全市场快照", async () => {
   const client = new BinanceUsdMClient();
   const staleSymbol = futuresSymbol();

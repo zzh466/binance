@@ -57,6 +57,41 @@ test("现货默认使用十档部分深度流且只向界面发送十档", () =>
   client.close();
 });
 
+test("WebSocket API 请求响应会发布统一延迟事件", async () => {
+  const client = createClient();
+  let submitted;
+  const socket = {
+    readyState: 1,
+    send(payload) {
+      submitted = JSON.parse(payload);
+      setImmediate(() => client.handleWsApiResponse({
+        id: submitted.id,
+        status: 200,
+        result: { orderId: 7 },
+      }, socket));
+    },
+  };
+  const latencyPromise = new Promise((resolve) => {
+    client.once("latency-update", resolve);
+  });
+
+  const result = await client.requestWsApiOnSocket(
+    socket,
+    "order.place",
+    { symbol: "BTCUSDT" }
+  );
+  const latency = await latencyPromise;
+
+  assert.deepEqual(result, { orderId: 7 });
+  assert.equal(latency.marketType, "spot");
+  assert.equal(latency.operation, "order.place");
+  assert.equal(latency.transport, "websocket-api");
+  assert.equal(latency.success, true);
+  assert.ok(Number.isFinite(latency.elapsedMs));
+  assert.ok(latency.elapsedMs >= 0);
+  client.close();
+});
+
 test("prepareOrder 按交易过滤器对价格和数量向下对齐", async () => {
   const client = createClient();
   client.exchangeInfo = async () => ({
@@ -480,6 +515,56 @@ test("下单优先复用独立交易 WebSocket，且低延迟模式不做余额�
   assert.equal(result.orderId, 123);
   assert.equal(result.transport, "websocket");
   assert.equal(result.preflightBalanceCheck, false);
+});
+
+test("币安拒绝的现货订单会发布可持久化的 REJECTED 状态", async () => {
+  const client = createClient();
+  client.serverTimeCache.set(client.tradingRestBase, {
+    offsetMs: 0,
+    synchronizedAt: Date.now(),
+  });
+  client.prepareOrder = async () => ({
+    params: {
+      symbol: "BTCUSDT",
+      side: "BUY",
+      type: "LIMIT",
+      quantity: "0.001",
+      price: "50000",
+      newClientOrderId: "rejected-client-order",
+    },
+    adjustments: [],
+    symbolInfo: {},
+  });
+  const socket = {
+    readyState: 1,
+    send(payload) {
+      const request = JSON.parse(payload);
+      setImmediate(() => client.handleWsApiResponse({
+        id: request.id,
+        status: 400,
+        error: { code: -2010, msg: "Order rejected" },
+      }, socket));
+    },
+    close() {},
+    terminate() {},
+  };
+  client.tradingWsApiSocket = socket;
+  const attemptPromise = new Promise((resolve) => {
+    client.once("order-state-update", resolve);
+  });
+
+  await assert.rejects(
+    client.placeOrder({ symbol: "BTCUSDT" }),
+    (error) => error.code === -2010
+  );
+  const attempt = await attemptPromise;
+  assert.equal(attempt.marketType, "spot");
+  assert.equal(attempt.status, "REJECTED");
+  assert.equal(attempt.clientOrderId, undefined);
+  assert.equal(attempt.newClientOrderId, "rejected-client-order");
+  assert.equal(attempt.rejectReason, "Order rejected");
+  client.tradingWsApiSocket = null;
+  client.close();
 });
 
 test("交易 WebSocket 尚在连接时，报单等待其就绪而不是直接走 HTTP", async () => {

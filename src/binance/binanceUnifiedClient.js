@@ -14,6 +14,8 @@ const ROUTED_EVENTS = [
   "trade-update",
   "market-status",
   "market-error",
+  "latency-update",
+  "order-state-update",
   "user-data-event",
   "user-data-status",
   "user-data-error",
@@ -529,7 +531,39 @@ class BinanceUnifiedClient extends EventEmitter {
       const result = await resolution.client.connectUserData();
       return this.addMarketType(result, resolution.marketType);
     }
-    return this.spot.connectUserData();
+
+    const candidates = [this.spot, this.futures].filter(
+      (client) => client.apiKey && client.apiSecret
+    );
+    if (!candidates.length) this.spot.assertTradingCredentials();
+    const results = await Promise.allSettled(
+      candidates.map((client) => client.connectUserData())
+    );
+    const connected = {};
+    const failures = [];
+    for (const [index, result] of results.entries()) {
+      const marketClient = candidates[index];
+      if (result.status === "fulfilled") {
+        connected[marketClient.marketType] = this.addMarketType(
+          result.value,
+          marketClient.marketType
+        );
+      } else {
+        failures.push({
+          marketType: marketClient.marketType,
+          error: result.reason,
+        });
+        this.emit("user-data-error", {
+          marketType: marketClient.marketType,
+          message: result.reason?.message || "账户事件连接失败",
+          time: Date.now(),
+        });
+      }
+    }
+    if (!Object.keys(connected).length && failures.length) {
+      throw failures[0].error;
+    }
+    return { connected, failedMarketTypes: failures.map(({ marketType }) => marketType) };
   }
 
   disconnectUserData() {

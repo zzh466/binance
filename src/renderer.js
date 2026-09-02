@@ -892,6 +892,7 @@ const elements = {
   orderListsBody: document.querySelector("#orderListsBody"),
   userDataStatus: document.querySelector("#userDataStatus"),
   userDataBody: document.querySelector("#userDataBody"),
+  binanceLatencyBar: document.querySelector("#binanceLatencyBar"),
   requestDuration: document.querySelector("#requestDuration"),
   output: document.querySelector("#output"),
 };
@@ -1071,7 +1072,7 @@ function renderOrders(orders, container = elements.orderHistoryBody) {
     originalQuantity.textContent = order.origQty ?? "-";
     executedQuantity.textContent = order.executedQty ?? "-";
     updateTime.textContent = formatOrderTime(
-      order.updateTime ?? order.time
+      order.updateTime ?? order.updatedAt ?? order.time ?? order.createdAt
     );
 
     row.append(
@@ -1700,6 +1701,21 @@ async function refreshOrderHistory(symbol, { showResult = true } = {}) {
       limit: 100,
     });
     if (showResult) printResult("普通订单记录结果", result);
+
+    const storedResult = await window.binance.recentOrders({
+      symbol,
+      ...(chartMarketType ? { marketType: chartMarketType } : {}),
+    });
+    if (storedResult.ok) {
+      const storedOrders = Array.isArray(storedResult.data)
+        ? storedResult.data
+        : [];
+      renderOrders(storedOrders);
+      elements.orderHistoryStatus.textContent = result.ok
+        ? `本地保存最近 24 小时 ${storedOrders.length} 条 / ${new Date().toLocaleString()}`
+        : `已显示本地保存的 ${storedOrders.length} 条；Binance 同步失败：${formatError(result)}`;
+      return;
+    }
 
     if (!result.ok) {
       elements.orderHistoryStatus.textContent = formatError(result);
@@ -2690,8 +2706,8 @@ function applyOpenOrderUpdate(order, receivedAt = Date.now()) {
   const normalized = normalizeOpenOrder(order, receivedAt);
   if (!normalized) return;
 
-  const key = openOrderKey(normalized);
-  const existing = openOrdersByKey.get(key);
+
+    const existing = openOrdersByKey.get(key);
   if (existing && existing.receivedAt > normalized.receivedAt) return;
 
   if (isOpenOrder(normalized)) openOrdersByKey.set(key, normalized);
@@ -2867,6 +2883,39 @@ window.binance.onMarketError((error) => {
       `${error.symbol || "行情"}：${error.message || "连接失败"}`;
   }
   printResult("行情连接错误", error);
+});
+
+window.binance.onLatencyUpdate((latency) => {
+  if (!latency) {
+    elements.binanceLatencyBar.textContent = "Binance 接口延迟：等待调用";
+    elements.binanceLatencyBar.title = "最近一次 Binance 网络调用的延迟";
+    return;
+  }
+
+  const elapsedMs = Number(latency.elapsedMs);
+  const transportLabels = {
+    "https-keepalive": "HTTP",
+    "electron-net": "HTTP/Electron",
+    curl: "HTTP/curl",
+    "websocket-api": "WebSocket API",
+    "websocket-stream": "WebSocket Stream",
+    "websocket-heartbeat": "WebSocket 心跳",
+  };
+  const parts = [
+    `Binance 接口延迟：${Number.isFinite(elapsedMs) ? elapsedMs.toFixed(3) : "-"} ms`,
+    transportLabels[latency.transport] || latency.transport,
+    getMarketLabel(latency.marketType),
+    latency.operation,
+    latency.success ? "成功" : "失败",
+    Number.isFinite(Number(latency.time))
+      ? new Date(Number(latency.time)).toLocaleTimeString("zh-CN", {
+          hour12: false,
+        })
+      : "",
+  ].filter(Boolean);
+  const text = parts.join(" · ");
+  elements.binanceLatencyBar.textContent = text;
+  elements.binanceLatencyBar.title = text;
 });
 
 window.binance.onUserDataEvent((payload) => {

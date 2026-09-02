@@ -57,6 +57,8 @@ contextBridge.exposeInMainWorld("binance", {
     ipcRenderer.invoke("binance:all-order-lists", options || {}),
   allOrders: (options) =>
     ipcRenderer.invoke("binance:all-orders", options || {}),
+  recentOrders: (options) =>
+    ipcRenderer.invoke("binance:recent-orders", options || {}),
   myTrades: (options) =>
     ipcRenderer.invoke("binance:my-trades", options || {}),
   accountStatus: (options) =>
@@ -92,6 +94,8 @@ contextBridge.exposeInMainWorld("binance", {
     subscribe("binance:market-status", callback),
   onMarketError: (callback) =>
     subscribe("binance:market-error", callback),
+  onLatencyUpdate: (callback) =>
+    subscribe("binance:latency-update", callback),
   onUserDataEvent: (callback) =>
     subscribe("binance:user-data-event", callback),
   onUserDataStatus: (callback) =>

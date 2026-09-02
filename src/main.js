@@ -1,3 +1,4 @@
+const crypto = require("node:crypto");
 const path = require("node:path");
 const fs = require("node:fs");
 const { spawn } = require("node:child_process");
@@ -12,6 +13,7 @@ const {
   readShortcutConfig,
   writeShortcutConfig,
 } = require("./shortcutConfigStore");
+const { RecentOrderStore } = require("./recentOrderStore");
 const {
   getAdditionalInstanceLaunch,
   getPackagedEnvironmentPath,
@@ -47,12 +49,118 @@ if (instanceId) {
 }
 
 let mainWindow = null;
+let latestBinanceLatency = null;
 const defaultTestnet = process.env.BINANCE_TESTNET !== "false";
 const shortcutConfigPath = path.join(
   app.getPath("appData"),
   "Binance统一交易台",
   "shortcut-settings.json"
 );
+const recentOrderStorePath = path.join(
+  app.getPath("userData"),
+  "recent-orders.json"
+);
+const recentOrderStore = new RecentOrderStore(recentOrderStorePath);
+
+function fingerprintApiKey(apiKey) {
+  const value = String(apiKey || "");
+  if (!value) return "";
+  return crypto.createHash("sha256").update(value).digest("hex").slice(0, 16);
+}
+
+function getOrderStoreContext(
+  targetClient,
+  marketType,
+  { defaultStatus, source } = {}
+) {
+  const marketClient = targetClient.getClient(marketType);
+  return {
+    environment: targetClient.testnet ? "testnet" : "production",
+    accountFingerprint: fingerprintApiKey(marketClient.apiKey),
+    marketType,
+    defaultStatus,
+    source,
+  };
+}
+
+function collectOrderCandidates(payload, target = []) {
+  if (Array.isArray(payload)) {
+    for (const item of payload) collectOrderCandidates(item, target);
+    return target;
+  }
+  if (!payload || typeof payload !== "object") return target;
+
+  const hasOrderIdentity =
+    (payload.orderId !== undefined || payload.i !== undefined ||
+      payload.clientOrderId || payload.c) &&
+    (payload.symbol || payload.s);
+  if (hasOrderIdentity) target.push(payload);
+
+  for (const field of [
+    "orders",
+    "orderReports",
+    "cancelResult",
+    "newOrderResult",
+  ]) {
+    if (payload[field]) collectOrderCandidates(payload[field], target);
+  }
+  return target;
+}
+
+function trackOrderPayload(
+  payload,
+  { targetClient = client, marketType, defaultStatus, source } = {}
+) {
+  const saved = [];
+  const rootMarketType = payload?.marketType || marketType;
+  for (const order of collectOrderCandidates(payload)) {
+    const resolvedMarketType = order.marketType || rootMarketType;
+    if (!resolvedMarketType) continue;
+    const result = recentOrderStore.upsert(
+      order,
+      getOrderStoreContext(targetClient, resolvedMarketType, {
+        defaultStatus,
+        source,
+      })
+    );
+    if (result) saved.push(result);
+  }
+  return saved;
+}
+
+async function trackOrderCall(action, options = {}) {
+  try {
+    const data = await action();
+    trackOrderPayload(data, options);
+    return data;
+  } catch (error) {
+    if (error?.data?.orderAttempt) {
+      trackOrderPayload(error.data.orderAttempt, {
+        ...options,
+        defaultStatus: error.data.orderAttempt.status || "REJECTED",
+        source: "place-order-rejected",
+      });
+    }
+    throw error;
+  }
+}
+
+function listRecentOrders(payload = {}, targetClient = client) {
+  const marketTypes = payload.marketType
+    ? [payload.marketType]
+    : ["spot", "futures"];
+  const accountFingerprints = marketTypes
+    .map((marketType) => fingerprintApiKey(
+      targetClient.getClient(marketType).apiKey
+    ))
+    .filter(Boolean);
+  return recentOrderStore.list({
+    environment: targetClient.testnet ? "testnet" : "production",
+    accountFingerprints,
+    marketType: payload.marketType,
+    symbol: payload.symbol,
+  });
+}
 
 function getEnvironmentCredentials(testnet) {
   const prefix = testnet ? "BINANCE_TESTNET" : "BINANCE_PRODUCTION";
@@ -160,8 +268,11 @@ function createWindow() {
   mainWindow.loadFile(path.join(__dirname, "index.html"));
   mainWindow.once("ready-to-show", () => mainWindow.show());
   mainWindow.webContents.on("did-finish-load", () => {
+    if (latestBinanceLatency) {
+      sendToRenderer("binance:latency-update", latestBinanceLatency);
+    }
     const activeClient = client;
-    if (activeClient.apiKey && activeClient.apiSecret) {
+    if (hasAnyTradingCredentials(activeClient)) {
       connectUserDataInBackground(activeClient);
     }
   });
@@ -226,6 +337,12 @@ function connectUserDataInBackground(targetClient = client) {
       time: Date.now(),
     });
   });
+}
+
+function hasAnyTradingCredentials(targetClient = client) {
+  return [targetClient.spot, targetClient.futures].some(
+    (marketClient) => marketClient.apiKey && marketClient.apiSecret
+  );
 }
 
 function sendToRenderer(channel, payload) {
@@ -319,6 +436,8 @@ async function switchClientEnvironment(testnet) {
   const nextClient = createBinanceClient(testnet);
   bindClientEvents(nextClient);
   client = nextClient;
+  latestBinanceLatency = null;
+  sendToRenderer("binance:latency-update", null);
   previousClient.close();
 
   let initializationWarning = null;
@@ -327,7 +446,7 @@ async function switchClientEnvironment(testnet) {
   } catch (error) {
     initializationWarning = serializeError(error);
   }
-  if (nextClient.apiKey && nextClient.apiSecret) {
+  if (hasAnyTradingCredentials(nextClient)) {
     connectUserDataInBackground(nextClient);
   }
 
@@ -403,7 +522,10 @@ function registerIpcHandlers() {
   });
 
   ipcMain.handle("binance:place-order", async (_event, payload) => {
-    return safeCall(() => client.placeOrder(payload || {}));
+    return safeCall(() => trackOrderCall(
+      () => client.placeOrder(payload || {}),
+      { defaultStatus: "ACKNOWLEDGED", source: "place-order" }
+    ));
   });
 
   ipcMain.handle("binance:test-order", async (_event, payload) => {
@@ -411,27 +533,45 @@ function registerIpcHandlers() {
   });
 
   ipcMain.handle("binance:cancel-order", async (_event, payload) => {
-    return safeCall(() => client.cancelOrder(payload || {}));
+    return safeCall(() => trackOrderCall(
+      () => client.cancelOrder(payload || {}),
+      { defaultStatus: "CANCELED", source: "cancel-order" }
+    ));
   });
 
   ipcMain.handle("binance:query-order", async (_event, payload) => {
-    return safeCall(() => client.queryOrder(payload || {}));
+    return safeCall(() => trackOrderCall(
+      () => client.queryOrder(payload || {}),
+      { source: "query-order" }
+    ));
   });
 
   ipcMain.handle("binance:open-orders", async (_event, payload) => {
-    return safeCall(() => client.openOrders(payload || {}));
+    return safeCall(() => trackOrderCall(
+      () => client.openOrders(payload || {}),
+      { defaultStatus: "NEW", source: "open-orders" }
+    ));
   });
 
   ipcMain.handle("binance:cancel-all-open-orders", async (_event, payload) => {
-    return safeCall(() => client.cancelAllOpenOrders(payload || {}));
+    return safeCall(() => trackOrderCall(
+      () => client.cancelAllOpenOrders(payload || {}),
+      { defaultStatus: "CANCELED", source: "cancel-all-open-orders" }
+    ));
   });
 
   ipcMain.handle("binance:amend-order", async (_event, payload) => {
-    return safeCall(() => client.amendOrder(payload || {}));
+    return safeCall(() => trackOrderCall(
+      () => client.amendOrder(payload || {}),
+      { source: "amend-order" }
+    ));
   });
 
   ipcMain.handle("binance:cancel-replace", async (_event, payload) => {
-    return safeCall(() => client.cancelReplace(payload || {}));
+    return safeCall(() => trackOrderCall(
+      () => client.cancelReplace(payload || {}),
+      { source: "cancel-replace" }
+    ));
   });
 
   ipcMain.handle("binance:all-order-lists", async (_event, payload) => {
@@ -439,7 +579,14 @@ function registerIpcHandlers() {
   });
 
   ipcMain.handle("binance:all-orders", async (_event, payload) => {
-    return safeCall(() => client.allOrders(payload || {}));
+    return safeCall(() => trackOrderCall(
+      () => client.allOrders(payload || {}),
+      { source: "all-orders" }
+    ));
+  });
+
+  ipcMain.handle("binance:recent-orders", async (_event, payload) => {
+    return safeCall(async () => listRecentOrders(payload || {}));
   });
 
   ipcMain.handle("binance:my-trades", async (_event, payload) => {
@@ -471,19 +618,31 @@ function registerIpcHandlers() {
   });
 
   ipcMain.handle("binance:place-oco", async (_event, payload) => {
-    return safeCall(() => client.placeOco(payload || {}));
+    return safeCall(() => trackOrderCall(
+      () => client.placeOco(payload || {}),
+      { defaultStatus: "ACKNOWLEDGED", source: "place-oco" }
+    ));
   });
 
   ipcMain.handle("binance:place-oto", async (_event, payload) => {
-    return safeCall(() => client.placeOto(payload || {}));
+    return safeCall(() => trackOrderCall(
+      () => client.placeOto(payload || {}),
+      { defaultStatus: "ACKNOWLEDGED", source: "place-oto" }
+    ));
   });
 
   ipcMain.handle("binance:place-otoco", async (_event, payload) => {
-    return safeCall(() => client.placeOtoco(payload || {}));
+    return safeCall(() => trackOrderCall(
+      () => client.placeOtoco(payload || {}),
+      { defaultStatus: "ACKNOWLEDGED", source: "place-otoco" }
+    ));
   });
 
   ipcMain.handle("binance:cancel-order-list", async (_event, payload) => {
-    return safeCall(() => client.cancelOrderList(payload || {}));
+    return safeCall(() => trackOrderCall(
+      () => client.cancelOrderList(payload || {}),
+      { defaultStatus: "CANCELED", source: "cancel-order-list" }
+    ));
   });
 
   ipcMain.handle("binance:connect-user-data", async (_event, payload) => {
@@ -504,6 +663,14 @@ function bindClientEvents(targetClient) {
       }
     },
   });
+  const latencyUpdateCoalescer = createLatestUpdateCoalescer({
+    intervalMs: 32,
+    send: (data) => {
+      if (targetClient === client) {
+        sendToRenderer("binance:latency-update", data);
+      }
+    },
+  });
 
   targetClient.on("depth-update", (data) => {
     if (targetClient === client) sendToRenderer("binance:depth-update", data);
@@ -521,8 +688,30 @@ function bindClientEvents(targetClient) {
     if (targetClient === client) sendToRenderer("binance:market-error", data);
   });
 
+  targetClient.on("latency-update", (data) => {
+    if (targetClient !== client) return;
+    latestBinanceLatency = data;
+    latencyUpdateCoalescer.push(data);
+  });
+
+  targetClient.on("order-state-update", (data) => {
+    if (targetClient !== client) return;
+    trackOrderPayload(data, {
+      targetClient,
+      marketType: data.marketType,
+      source: "order-attempt",
+    });
+  });
+
   targetClient.on("user-data-event", (data) => {
     if (targetClient !== client) return;
+    if (data.event?.e === "executionReport") {
+      trackOrderPayload(data.event, {
+        targetClient,
+        marketType: data.marketType,
+        source: "user-data-stream",
+      });
+    }
     sendToRenderer("binance:user-data-event", data);
     showUserDataNotification(data);
   });
@@ -557,6 +746,7 @@ app.whenReady().then(async () => {
 });
 
 app.on("before-quit", () => {
+  recentOrderStore.close();
   client.close();
 });
 

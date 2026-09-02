@@ -1,6 +1,7 @@
 const crypto = require("node:crypto");
 const { EventEmitter } = require("node:events");
 const https = require("node:https");
+const { performance } = require("node:perf_hooks");
 const WebSocket = require("ws");
 const REST_BASE = {
   testnet: "https://testnet.binance.vision/api",
@@ -160,7 +161,65 @@ class BinanceSpotClient extends EventEmitter {
     this.tradingWsApiReconnectDelayMs = 1_000;
     this.tradingWsApiHeartbeatTimer = null;
     this.tradingWsApiHeartbeatAlive = true;
+    this.tradingWsApiHeartbeatStartedAt = null;
     this.wsApiPendingRequests = new Map();
+  }
+
+  emitApiLatency({
+    operation,
+    transport,
+    startedAt,
+    elapsedMs,
+    success = true,
+    status,
+    background = false,
+  } = {}) {
+    const measuredElapsedMs = Number.isFinite(Number(elapsedMs))
+      ? Number(elapsedMs)
+      : performance.now() - Number(startedAt);
+    if (!Number.isFinite(measuredElapsedMs) || measuredElapsedMs < 0) {
+      return null;
+    }
+
+    const payload = {
+      marketType: this.marketType,
+      operation: String(operation || "Binance API"),
+      transport: String(transport || "unknown"),
+      elapsedMs: Number(measuredElapsedMs.toFixed(3)),
+      success: Boolean(success),
+      background: Boolean(background),
+      time: Date.now(),
+      ...(status === undefined ? {} : { status: Number(status) }),
+    };
+    this.emit("latency-update", payload);
+    return payload;
+  }
+
+  reportWsApiLatency(pending, details = {}) {
+    if (!pending || pending.latencyReported) return null;
+    pending.latencyReported = true;
+    return this.emitApiLatency({
+      operation: pending.method,
+      transport: "websocket-api",
+      startedAt: pending.startedAt,
+      ...details,
+    });
+  }
+
+  attachOrderAttempt(error, params = {}) {
+    const status = error?.data?.executionStatus === "UNKNOWN"
+      ? "UNKNOWN"
+      : "REJECTED";
+    const orderAttempt = {
+      ...params,
+      marketType: this.marketType,
+      status,
+      rejectReason: error?.message || "订单未被接受",
+      updateTime: Date.now(),
+    };
+    error.data = { ...(error.data || {}), orderAttempt };
+    this.emit("order-state-update", orderAttempt);
+    return error;
   }
 
   buildBrokerClientOrderId(existingClientOrderId) {
@@ -345,6 +404,7 @@ class BinanceSpotClient extends EventEmitter {
     }
 
     let response;
+    const requestStartedAt = performance.now();
     try {
       response = await requestHttps(url, {
         method,
@@ -355,10 +415,24 @@ class BinanceSpotClient extends EventEmitter {
           : this.httpsAgent,
       });
     } catch (error) {
+      this.emitApiLatency({
+        operation: `${String(method).toUpperCase()} ${path}`,
+        transport: "https-keepalive",
+        startedAt: requestStartedAt,
+        success: false,
+      });
       throw new BinanceApiError(`请求 Binance 失败：${error.message}`, {
         data: { cause: error.name },
       });
     }
+
+    this.emitApiLatency({
+      operation: `${String(method).toUpperCase()} ${path}`,
+      transport: "https-keepalive",
+      startedAt: requestStartedAt,
+      success: response.statusCode >= 200 && response.statusCode < 300,
+      status: response.statusCode,
+    });
 
     const rawText = response.rawText;
     let data;
@@ -799,8 +873,9 @@ class BinanceSpotClient extends EventEmitter {
       await this.validateAvailableBalance(params, symbolInfo);
     }
 
-    const { result, transport, fallbackReason } =
-      await this.requestWsApiWithRestFallback(
+    let response;
+    try {
+      response = await this.requestWsApiWithRestFallback(
         testOnly ? "order.test" : "order.place",
         params,
         () => this.request(
@@ -812,6 +887,11 @@ class BinanceSpotClient extends EventEmitter {
         ),
         { retrySafe: testOnly, waitForWebSocketReady: true }
       );
+    } catch (error) {
+      if (!testOnly) this.attachOrderAttempt(error, params);
+      throw error;
+    }
+    const { result, transport, fallbackReason } = response;
     return {
       ...result,
       testOnly,
@@ -1383,6 +1463,16 @@ class BinanceSpotClient extends EventEmitter {
       socket.on("pong", () => {
         if (this.tradingWsApiSocket === socket) {
           this.tradingWsApiHeartbeatAlive = true;
+          if (this.tradingWsApiHeartbeatStartedAt !== null) {
+            this.emitApiLatency({
+              operation: "ping/pong 心跳",
+              transport: "websocket-heartbeat",
+              startedAt: this.tradingWsApiHeartbeatStartedAt,
+              success: true,
+              background: true,
+            });
+            this.tradingWsApiHeartbeatStartedAt = null;
+          }
         }
       });
 
@@ -1431,13 +1521,32 @@ class BinanceSpotClient extends EventEmitter {
         return;
       }
       if (!this.tradingWsApiHeartbeatAlive) {
+        if (this.tradingWsApiHeartbeatStartedAt !== null) {
+          this.emitApiLatency({
+            operation: "ping/pong 心跳",
+            transport: "websocket-heartbeat",
+            startedAt: this.tradingWsApiHeartbeatStartedAt,
+            success: false,
+            background: true,
+          });
+          this.tradingWsApiHeartbeatStartedAt = null;
+        }
         socket.terminate();
         return;
       }
       this.tradingWsApiHeartbeatAlive = false;
+      this.tradingWsApiHeartbeatStartedAt = performance.now();
       try {
         socket.ping();
       } catch {
+        this.emitApiLatency({
+          operation: "ping/pong 心跳",
+          transport: "websocket-heartbeat",
+          startedAt: this.tradingWsApiHeartbeatStartedAt,
+          success: false,
+          background: true,
+        });
+        this.tradingWsApiHeartbeatStartedAt = null;
         socket.terminate();
       }
     }, WS_API_HEARTBEAT_INTERVAL_MS);
@@ -1447,6 +1556,7 @@ class BinanceSpotClient extends EventEmitter {
   stopTradingWebSocketHeartbeat() {
     clearInterval(this.tradingWsApiHeartbeatTimer);
     this.tradingWsApiHeartbeatTimer = null;
+    this.tradingWsApiHeartbeatStartedAt = null;
   }
 
   scheduleTradingWebSocketReconnect() {
@@ -1604,10 +1714,12 @@ class BinanceSpotClient extends EventEmitter {
       }
 
       const id = crypto.randomUUID();
+      const startedAt = performance.now();
       const timeoutId = setTimeout(() => {
         const pending = this.wsApiPendingRequests.get(id);
         if (!pending) return;
         this.wsApiPendingRequests.delete(id);
+        this.reportWsApiLatency(pending, { success: false });
         reject(this.createWsTransportError(
           "Binance WebSocket API 请求超时。",
           { method, url, requestSent: pending.requestSent }
@@ -1620,6 +1732,8 @@ class BinanceSpotClient extends EventEmitter {
         method,
         url,
         timeoutId,
+        startedAt,
+        latencyReported: false,
         requestSent: false,
         resolve,
         reject,
@@ -1632,6 +1746,7 @@ class BinanceSpotClient extends EventEmitter {
       } catch (error) {
         clearTimeout(timeoutId);
         this.wsApiPendingRequests.delete(id);
+        this.reportWsApiLatency(pending, { success: false });
         reject(this.createWsTransportError(
           `Binance WebSocket API 请求发送失败：${error.message}`,
           { cause: error.name, method, url, requestSent: false }
@@ -1648,12 +1763,15 @@ class BinanceSpotClient extends EventEmitter {
 
     clearTimeout(pending.timeoutId);
     this.wsApiPendingRequests.delete(message.id);
+    const success = !message.error &&
+      (message.status === undefined ||
+        (message.status >= 200 && message.status < 300));
+    this.reportWsApiLatency(pending, {
+      success,
+      status: message.status,
+    });
 
-    if (
-      message.error ||
-      (message.status !== undefined &&
-        (message.status < 200 || message.status >= 300))
-    ) {
+    if (!success) {
       const apiError = message.error || {};
       pending.reject(new BinanceApiError(
         apiError.msg || `Binance WebSocket API HTTP ${message.status}`,
@@ -1675,6 +1793,7 @@ class BinanceSpotClient extends EventEmitter {
       if (pending.socket !== socket) continue;
       clearTimeout(pending.timeoutId);
       this.wsApiPendingRequests.delete(id);
+      this.reportWsApiLatency(pending, { success: false });
       pending.reject(this.createWsTransportError(error.message, {
         ...error.data,
         method: pending.method,
@@ -1762,10 +1881,25 @@ class BinanceSpotClient extends EventEmitter {
     params.signature = this.createWsApiSignature(params);
 
     return new Promise((resolve, reject) => {
+      const subscriptionStartedAt = performance.now();
       const socket = new WebSocket(this.wsApiBase);
       let subscribed = false;
+      let latencyReported = false;
+      const reportSubscriptionLatency = (success, status) => {
+        if (latencyReported) return;
+        latencyReported = true;
+        this.emitApiLatency({
+          operation: "userDataStream.subscribe.signature",
+          transport: "websocket-api",
+          startedAt: subscriptionStartedAt,
+          success,
+          status,
+          background: true,
+        });
+      };
       let timeoutId = setTimeout(() => {
         if (!subscribed) {
+          reportSubscriptionLatency(false);
           reject(new BinanceApiError("账户事件订阅超时。"));
           socket.terminate();
         }
@@ -1806,6 +1940,7 @@ class BinanceSpotClient extends EventEmitter {
           if (message.error || (message.status && message.status >= 400)) {
             const apiError = message.error || {};
             clearTimeout(timeoutId);
+            reportSubscriptionLatency(false, message.status);
             reject(new BinanceApiError(apiError.msg || "账户事件订阅失败。", {
               status: message.status,
               code: apiError.code,
@@ -1818,6 +1953,7 @@ class BinanceSpotClient extends EventEmitter {
 
           subscribed = true;
           clearTimeout(timeoutId);
+          reportSubscriptionLatency(true, message.status);
           this.userDataSubscriptionId = message.result?.subscriptionId ?? null;
           this.userDataReconnectDelayMs = 1_000;
           const result = { subscriptionId: this.userDataSubscriptionId };
@@ -1846,12 +1982,14 @@ class BinanceSpotClient extends EventEmitter {
         });
         if (!subscribed) {
           clearTimeout(timeoutId);
+          reportSubscriptionLatency(false);
           reject(new BinanceApiError(`账户事件连接失败：${error.message}`));
         }
       });
 
       socket.on("close", (code, reasonBuffer) => {
         clearTimeout(timeoutId);
+        if (!subscribed) reportSubscriptionLatency(false);
         this.rejectWsApiRequestsForSocket(
           socket,
           new BinanceApiError("Binance WebSocket API 持久连接已关闭。", {
@@ -1951,11 +2089,26 @@ class BinanceSpotClient extends EventEmitter {
 
     const symbol = this.marketSymbol;
     const url = `${this.wsBase}/${symbol.toLowerCase()}@trade`;
+    const connectStartedAt = performance.now();
     const socket = this.createMarketWebSocket(url);
+    let connected = false;
+    let connectLatencyReported = false;
+    const reportConnectLatency = (success) => {
+      if (connectLatencyReported) return;
+      connectLatencyReported = true;
+      this.emitApiLatency({
+        operation: `${symbol.toLowerCase()}@trade 连接`,
+        transport: "websocket-stream",
+        startedAt: connectStartedAt,
+        success,
+      });
+    };
     this.tradeSocket = socket;
 
     socket.on("open", () => {
       if (this.tradeSocket === socket) {
+        connected = true;
+        reportConnectLatency(true);
         this.tradeReconnectDelayMs = 1_000;
         if (this.supportsAveragePriceStream) {
           socket.send(JSON.stringify({
@@ -2023,6 +2176,7 @@ class BinanceSpotClient extends EventEmitter {
     });
 
     socket.on("error", (error) => {
+      if (!connected) reportConnectLatency(false);
       this.emit("market-error", {
         message: `成交行情连接失败：${error.message}`,
         symbol,
@@ -2031,6 +2185,7 @@ class BinanceSpotClient extends EventEmitter {
     });
 
     socket.on("close", () => {
+      if (!connected) reportConnectLatency(false);
       if (this.tradeSocket === socket) {
         this.tradeSocket = null;
       }
@@ -2049,7 +2204,20 @@ class BinanceSpotClient extends EventEmitter {
     const symbol = this.marketSymbol;
     const streamName = this.getDepthStreamName(symbol);
     const url = `${this.wsBase}/${streamName}`;
+    const connectStartedAt = performance.now();
     const socket = this.createMarketWebSocket(url);
+    let connected = false;
+    let connectLatencyReported = false;
+    const reportConnectLatency = (success) => {
+      if (connectLatencyReported) return;
+      connectLatencyReported = true;
+      this.emitApiLatency({
+        operation: `${streamName} 连接`,
+        transport: "websocket-stream",
+        startedAt: connectStartedAt,
+        success,
+      });
+    };
 
     this.marketSocket = socket;
 
@@ -2058,6 +2226,8 @@ class BinanceSpotClient extends EventEmitter {
         return;
       }
 
+      connected = true;
+      reportConnectLatency(true);
       this.marketReconnectDelayMs = 1_000;
       this.emit("market-status", {
         status: "connected",
@@ -2109,6 +2279,7 @@ class BinanceSpotClient extends EventEmitter {
     });
 
     socket.on("error", (error) => {
+      if (!connected) reportConnectLatency(false);
       this.emit("market-error", {
         message: error.message,
         symbol,
@@ -2117,6 +2288,7 @@ class BinanceSpotClient extends EventEmitter {
     });
 
     socket.on("close", (code, reasonBuffer) => {
+      if (!connected) reportConnectLatency(false);
       if (this.marketSocket === socket) {
         this.marketSocket = null;
       }

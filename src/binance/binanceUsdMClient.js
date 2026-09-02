@@ -1,6 +1,7 @@
 const { execFile } = require("node:child_process");
 const https = require("node:https");
 const net = require("node:net");
+const { performance } = require("node:perf_hooks");
 const tls = require("node:tls");
 const { promisify } = require("node:util");
 const WebSocket = require("ws");
@@ -453,6 +454,8 @@ class BinanceUsdMClient extends BinanceSpotClient {
     );
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), this.publicMarketTimeoutMs);
+    const requestStartedAt = performance.now();
+    let latencyReported = false;
     try {
       const response = await this.publicMarketFetch(url, {
         method,
@@ -460,8 +463,24 @@ class BinanceUsdMClient extends BinanceSpotClient {
         signal: controller.signal,
       });
       const rawText = await response.text();
+      this.emitApiLatency({
+        operation: `${String(method).toUpperCase()} ${path}`,
+        transport: "electron-net",
+        startedAt: requestStartedAt,
+        success: response.status >= 200 && response.status < 300,
+        status: response.status,
+      });
+      latencyReported = true;
       return this.parsePublicMarketResponse(Number(response.status), rawText);
     } catch (error) {
+      if (!latencyReported) {
+        this.emitApiLatency({
+          operation: `${String(method).toUpperCase()} ${path}`,
+          transport: "electron-net",
+          startedAt: requestStartedAt,
+          success: false,
+        });
+      }
       if (error instanceof BinanceApiError) throw error;
       const message = controller.signal.aborted
         ? `Electron 原生网络请求超时（${this.publicMarketTimeoutMs} ms）`
@@ -511,7 +530,9 @@ class BinanceUsdMClient extends BinanceSpotClient {
     ];
     let stdout;
     let requestError;
+    let successfulRequestStartedAt = null;
     for (let attempt = 1; attempt <= 3; attempt += 1) {
+      const attemptStartedAt = performance.now();
       try {
         ({ stdout } = await this.executeFile(
           this.curlExecutable,
@@ -523,9 +544,16 @@ class BinanceUsdMClient extends BinanceSpotClient {
             windowsHide: true,
           }
         ));
+        successfulRequestStartedAt = attemptStartedAt;
         requestError = null;
         break;
       } catch (error) {
+        this.emitApiLatency({
+          operation: `${String(method).toUpperCase()} ${path}`,
+          transport: "curl",
+          startedAt: attemptStartedAt,
+          success: false,
+        });
         requestError = error;
         if (error.code === "ENOENT") break;
       }
@@ -544,10 +572,23 @@ class BinanceUsdMClient extends BinanceSpotClient {
     const marker = "\n__BINANCE_HTTP_STATUS__:";
     const markerIndex = stdout.lastIndexOf(marker);
     if (markerIndex < 0) {
+      this.emitApiLatency({
+        operation: `${String(method).toUpperCase()} ${path}`,
+        transport: "curl",
+        startedAt: successfulRequestStartedAt,
+        success: false,
+      });
       throw new BinanceApiError("Binance Futures 行情响应缺少 HTTP 状态。");
     }
     const rawText = stdout.slice(0, markerIndex);
     const statusCode = Number(stdout.slice(markerIndex + marker.length).trim());
+    this.emitApiLatency({
+      operation: `${String(method).toUpperCase()} ${path}`,
+      transport: "curl",
+      startedAt: successfulRequestStartedAt,
+      success: statusCode >= 200 && statusCode < 300,
+      status: statusCode,
+    });
     return this.parsePublicMarketResponse(statusCode, rawText);
   }
 
@@ -934,6 +975,7 @@ class BinanceUsdMClient extends BinanceSpotClient {
           ));
       }
     } catch (error) {
+      if (!testOnly) this.attachOrderAttempt(error, params);
       if (
         !positionModeRetry &&
         !order.positionSide &&
@@ -1246,10 +1288,24 @@ class BinanceUsdMClient extends BinanceSpotClient {
 
     return new Promise((resolve, reject) => {
       const url = `${this.wsBase}/${listenKey}`;
+      const connectStartedAt = performance.now();
       const socket = new WebSocket(url);
       let connected = false;
+      let connectLatencyReported = false;
+      const reportConnectLatency = (success) => {
+        if (connectLatencyReported) return;
+        connectLatencyReported = true;
+        this.emitApiLatency({
+          operation: "账户事件流连接",
+          transport: "websocket-stream",
+          startedAt: connectStartedAt,
+          success,
+          background: true,
+        });
+      };
       const timeoutId = setTimeout(() => {
         if (!connected) {
+          reportConnectLatency(false);
           reject(new BinanceApiError("永续账户事件连接超时。"));
           socket.terminate();
         }
@@ -1266,6 +1322,7 @@ class BinanceUsdMClient extends BinanceSpotClient {
       socket.on("open", () => {
         connected = true;
         clearTimeout(timeoutId);
+        reportConnectLatency(true);
         this.userDataReconnectDelayMs = 1_000;
         this.startListenKeyKeepAlive();
         const result = { subscriptionId: listenKey };
@@ -1304,12 +1361,14 @@ class BinanceUsdMClient extends BinanceSpotClient {
         });
         if (!connected) {
           clearTimeout(timeoutId);
+          reportConnectLatency(false);
           reject(new BinanceApiError(`永续账户事件连接失败：${error.message}`));
         }
       });
 
       socket.on("close", (code, reasonBuffer) => {
         clearTimeout(timeoutId);
+        if (!connected) reportConnectLatency(false);
         if (this.userDataSocket !== socket) return;
         this.userDataSocket = null;
         this.stopListenKeyKeepAlive();
