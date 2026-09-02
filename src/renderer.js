@@ -1,6 +1,6 @@
 
-const X = 50.5;
-const Y = 50.5;
+const X = 50;
+const Y = 50;
 
 
 let  VALUECOLOR ;
@@ -254,7 +254,7 @@ class Chart {
         const y = Y + 30;
         const _x = X + 50.5;
         const start = this.start;
-        ctx.clearRect(_x-2 , y - 5 ,this.width - 30 - _x, this.height);
+        ctx.clearRect(_x-2 , y - 4 ,this.width - 30 - _x, this.height);
         const barWidth = this.barWidth;
        
         let buyIndex = this.buyIndex - start;
@@ -1974,7 +1974,7 @@ chartDom.addEventListener('mousemove', function(e){
     }
 })
 document.addEventListener('dblclick', async function(){
-  debugger
+  
   if(left){
      const index = (left - 123 + 24) / 13
      let side 
