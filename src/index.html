@@ -682,7 +682,7 @@
         <section class="full">
           <h2>普通订单记录</h2>
           <p class="muted">
-            根据全局合约自动查询对应市场的普通订单，包括挂单、已撤单和已成交订单。组合订单功能仅适用于支持它的现货合约。
+            汇总当前账户最近 24 小时的现货与 U 本位普通订单；现货补查已知合约，U 本位直接查询全合约。
           </p>
           <div class="order-history-toolbar">
             <button id="refreshOrderHistoryButton">刷新订单记录</button>
@@ -693,6 +693,7 @@
               <thead>
                 <tr>
                   <th class="numeric">订单 ID</th>
+                  <th>市场</th>
                   <th>交易对</th>
                   <th>方向</th>
                   <th>类型</th>
@@ -704,7 +705,43 @@
                 </tr>
               </thead>
               <tbody id="orderHistoryBody">
-                <tr><td colspan="9">点击“刷新订单记录”加载数据</td></tr>
+                <tr><td colspan="10">点击“刷新订单记录”加载当前账户最近 24 小时订单</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="full">
+          <h2>交易回合</h2>
+          <p class="muted">
+            只按 Binance 已确认的实际成交增量计算。多向成交 = 开多 + 平空，空向成交 = 开空 + 平多；
+            两边手数相等时回合完成，超出的成交量自动进入该合约的下一个回合。
+          </p>
+          <div class="order-history-toolbar">
+            <button id="refreshTradingRoundsButton">刷新回合列表</button>
+            <span id="tradingRoundsStatus">尚未加载</span>
+          </div>
+          <div class="table-scroll">
+            <table class="order-history-table">
+              <thead>
+                <tr>
+                  <th>回合</th>
+                  <th>市场</th>
+                  <th>合约</th>
+                  <th>状态</th>
+                  <th>开多</th>
+                  <th>平空</th>
+                  <th>开空</th>
+                  <th>平多</th>
+                  <th>多向合计</th>
+                  <th>空向合计</th>
+                  <th>待匹配</th>
+                  <th>开始时间</th>
+                  <th>结束时间</th>
+                </tr>
+              </thead>
+              <tbody id="tradingRoundsBody">
+                <tr><td colspan="13">等待实际成交数据</td></tr>
               </tbody>
             </table>
           </div>
@@ -717,6 +754,16 @@
             <option value="BUY">BUY</option>
             <option value="SELL">SELL</option>
           </select>
+
+          <label for="positionEffect">仓位动作</label>
+          <select id="positionEffect">
+            <option value="AUTO">自动（兼容现有行为）</option>
+            <option value="OPEN">开仓</option>
+            <option value="CLOSE">平仓（U 本位自动 reduceOnly）</option>
+          </select>
+          <p class="muted">
+            现货会忽略仓位动作；U 本位“平仓”会阻止委托扩大当前持仓。
+          </p>
 
           <label for="orderType">委托类型</label>
           <select id="orderType">
@@ -798,14 +845,30 @@
             <dd id="accountEnvironment">读取中</dd>
             <dt>交易密钥</dt>
             <dd id="credentials">读取中</dd>
+            <dt>STP 跨子账号范围</dt>
+            <dd id="stpSafetyStatus">等待校验</dd>
             <dt>行情状态</dt>
             <dd id="marketStatus">未连接</dd>
             <dt>时间偏移</dt>
             <dd id="timeOffset">读取中</dd>
             <dt>深度配置</dt>
             <dd id="depthConfig">读取中</dd>
+            <dt>接口限流</dt>
+            <dd id="rateLimitStatus">等待 Binance 返回计数</dd>
           </dl>
           <button id="syncTimeButton">重新同步服务器时间</button>
+          <div class="toolbar">
+            <label for="futuresDeadManToggle">
+              <input id="futuresDeadManToggle" type="checkbox" />
+              U 本位断线自动撤单
+            </label>
+            <label for="futuresDeadManCountdown">倒计时(ms)</label>
+            <input id="futuresDeadManCountdown" type="number" value="120000"
+              min="5000" max="600000" step="1000" />
+          </div>
+          <p id="futuresDeadManStatus" class="muted">
+            未启用；启用后每 30 秒续期，心跳中断后由 Binance 撤销当前合约挂单。
+          </p>
         </section>
 
         <section class="full">

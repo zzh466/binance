@@ -74,9 +74,10 @@ function normalizeRecentOrder(order, context = {}, now = Date.now()) {
   );
   const environment = String(context.environment || "unknown");
   const accountFingerprint = String(context.accountFingerprint || "anonymous");
+  const algoOrder = order.algoOrder === true;
   const identity = orderId === undefined
     ? `client:${clientOrderId}`
-    : `order:${String(orderId)}`;
+    : `${algoOrder ? "algo" : "order"}:${String(orderId)}`;
 
   return {
     key: `${environment}:${accountFingerprint}:${marketType}:${symbol}:${identity}`,
@@ -85,7 +86,14 @@ function normalizeRecentOrder(order, context = {}, now = Date.now()) {
     marketType,
     symbol,
     orderId: orderId === undefined ? null : orderId,
+    actualOrderId: firstPresent(
+      order.actualOrderId,
+      order.actualOrderID,
+      order.actualOrder?.orderId,
+      null
+    ),
     clientOrderId,
+    algoOrder,
     side: String(firstPresent(order.side, order.S, "")).toUpperCase(),
     type: String(firstPresent(order.type, order.o, "")).toUpperCase(),
     timeInForce: String(firstPresent(order.timeInForce, order.f, "")).toUpperCase(),
@@ -107,6 +115,16 @@ function normalizeRecentOrder(order, context = {}, now = Date.now()) {
       order.ps,
       ""
     )).toUpperCase(),
+    positionEffect: String(firstPresent(
+      order.positionEffect,
+      ""
+    )).toUpperCase(),
+    reduceOnly:
+      firstPresent(order.reduceOnly, order.R, false) === true ||
+      String(firstPresent(order.reduceOnly, order.R, false)).toLowerCase() === "true",
+    closePosition:
+      firstPresent(order.closePosition, order.cp, false) === true ||
+      String(firstPresent(order.closePosition, order.cp, false)).toLowerCase() === "true",
     rejectReason: String(firstPresent(order.rejectReason, order.r, "")),
     createdAt,
     updatedAt,

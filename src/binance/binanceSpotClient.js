@@ -3,6 +3,13 @@ const { EventEmitter } = require("node:events");
 const https = require("node:https");
 const { performance } = require("node:perf_hooks");
 const WebSocket = require("ws");
+const {
+  alignDecimalToStep,
+  compareDecimal,
+  divideDecimalToStep,
+  isPositiveDecimal,
+  multiplyDecimal,
+} = require("./decimalMath");
 const REST_BASE = {
   testnet: "https://testnet.binance.vision/api",
   production: "https://data-api.binance.vision/api",
@@ -54,6 +61,7 @@ function requestHttps(url, options = {}) {
         resolve({
           statusCode: response.statusCode || 0,
           rawText: chunks.join(""),
+          headers: response.headers || {},
         });
       });
     });
@@ -87,6 +95,7 @@ class BinanceSpotClient extends EventEmitter {
     depthSpeed = "100ms",
     preflightBalanceCheck = false,
     brokerLinkId = "",
+    rateLimitCoordinator = null,
   } = {}) {
     super();
 
@@ -96,6 +105,7 @@ class BinanceSpotClient extends EventEmitter {
     this.marketType = "spot";
     this.selfTradePreventionMode = REQUIRED_SELF_TRADE_PREVENTION_MODE;
     this.brokerLinkId = String(brokerLinkId || "").trim();
+    this.rateLimitCoordinator = rateLimitCoordinator;
 
     this.restBase = this.testnet ? REST_BASE.testnet : REST_BASE.production;
     this.tradingRestBase = this.testnet
@@ -365,6 +375,33 @@ class BinanceSpotClient extends EventEmitter {
     return normalized;
   }
 
+  guardRateLimit({ operation, critical = false } = {}) {
+    if (!this.rateLimitCoordinator) return;
+    try {
+      this.rateLimitCoordinator.beforeRequest({ critical });
+    } catch (error) {
+      throw new BinanceApiError(error.message, {
+        status: 429,
+        code: -1003,
+        data: {
+          ...(error.data || {}),
+          localRateLimitGuard: true,
+          operation,
+        },
+      });
+    }
+  }
+
+  observeRateLimit(details = {}) {
+    if (!this.rateLimitCoordinator) return null;
+    const snapshot = this.rateLimitCoordinator.observe({
+      marketType: this.marketType,
+      ...details,
+    });
+    this.emit("rate-limit-update", snapshot);
+    return snapshot;
+  }
+
   async request(
     method,
     path,
@@ -372,6 +409,11 @@ class BinanceSpotClient extends EventEmitter {
     signed = false,
     baseUrl = this.restBase
   ) {
+    const upperMethod = String(method).toUpperCase();
+    const operation = `${upperMethod} ${path}`;
+    const critical = path.endsWith("/time") ||
+      (signed && ["POST", "PUT", "DELETE"].includes(upperMethod));
+    this.guardRateLimit({ operation, critical });
     const normalized = this.normalizeParams(params);
 
     if (signed) {
@@ -427,10 +469,14 @@ class BinanceSpotClient extends EventEmitter {
     }
 
     this.emitApiLatency({
-      operation: `${String(method).toUpperCase()} ${path}`,
+      operation,
       transport: "https-keepalive",
       startedAt: requestStartedAt,
       success: response.statusCode >= 200 && response.statusCode < 300,
+      status: response.statusCode,
+    });
+    this.observeRateLimit({
+      headers: response.headers,
       status: response.statusCode,
     });
 
@@ -596,34 +642,26 @@ class BinanceSpotClient extends EventEmitter {
   }
 
   alignToStep(value, step, mode = "floor") {
-    const numericValue = Number(value);
-    const numericStep = Number(step);
-    if (!Number.isFinite(numericValue) || numericValue <= 0 || !numericStep) {
+    if (!isPositiveDecimal(value) || !isPositiveDecimal(step)) {
       return String(value);
     }
-
-    const precision = this.decimalPlaces(step);
-    const scaled = numericValue / numericStep;
-    const aligned = (mode === "ceil" ? Math.ceil(scaled - 1e-12) : Math.floor(scaled + 1e-12)) * numericStep;
-    return aligned.toFixed(precision);
+    return alignDecimalToStep(value, step, mode);
   }
 
   assertFilterRange(name, value, min, max) {
-    const numeric = Number(value);
-    if (Number(min) > 0 && numeric < Number(min)) {
+    if (isPositiveDecimal(min) && compareDecimal(value, min) < 0) {
       throw new BinanceApiError(`${name} ${value} 小于当前环境允许的最小值 ${min}。`);
     }
-    if (Number(max) > 0 && numeric > Number(max)) {
+    if (isPositiveDecimal(max) && compareDecimal(value, max) > 0) {
       throw new BinanceApiError(`${name} ${value} 大于当前环境允许的最大值 ${max}。`);
     }
   }
 
   assertPositiveOrderAmount(name, value) {
-    const numeric = Number(value);
-    if (!Number.isFinite(numeric) || numeric <= 0) {
+    if (!isPositiveDecimal(value)) {
       throw new BinanceApiError(`${name} 必须是大于 0 的数字。`);
     }
-    return numeric;
+    return String(value);
   }
 
   requireSelfTradePrevention(symbolInfo) {
@@ -659,8 +697,8 @@ class BinanceSpotClient extends EventEmitter {
 
   async resolveTotalOrderReferencePrice(symbol, preferredPrices = []) {
     for (const candidate of preferredPrices) {
-      const price = Number(candidate?.value);
-      if (Number.isFinite(price) && price > 0) {
+      const price = String(candidate?.value ?? "");
+      if (isPositiveDecimal(price)) {
         return { price, source: candidate.source };
       }
     }
@@ -669,14 +707,14 @@ class BinanceSpotClient extends EventEmitter {
     if (
       cached &&
       Date.now() - cached.loadedAt <= DYNAMIC_PRICE_MAX_AGE_MS &&
-      Number(cached.price) > 0
+      isPositiveDecimal(cached.price)
     ) {
-      return { price: Number(cached.price), source: "最新成交价缓存" };
+      return { price: String(cached.price), source: "最新成交价缓存" };
     }
 
     const ticker = await this.request("GET", this.tickerPricePath, { symbol });
-    const price = Number(ticker.price);
-    if (!Number.isFinite(price) || price <= 0) {
+    const price = String(ticker.price ?? "");
+    if (!isPositiveDecimal(price)) {
       throw new BinanceApiError(`${symbol} 没有可用于总价换算的有效行情价格。`);
     }
     return { price, source: "ticker 最新价" };
@@ -787,9 +825,13 @@ class BinanceSpotClient extends EventEmitter {
         { value: params.price, source: "委托价" },
         { value: params.stopPrice, source: "触发价" },
       ]);
-      params.quantity = String(
-        Number(requestedQuoteOrderQty) / reference.price
-      );
+      params.quantity = quantityFilter
+        ? divideDecimalToStep(
+            requestedQuoteOrderQty,
+            reference.price,
+            quantityFilter.stepSize
+          )
+        : String(Number(requestedQuoteOrderQty) / Number(reference.price));
       delete params.quoteOrderQty;
       orderSizing = {
         mode: "quote-total",
@@ -819,7 +861,7 @@ class BinanceSpotClient extends EventEmitter {
       const original = params.icebergQty;
       params.icebergQty = this.alignToStep(params.icebergQty, filters.LOT_SIZE.stepSize);
       this.assertFilterRange("icebergQty", params.icebergQty, filters.LOT_SIZE.minQty, filters.LOT_SIZE.maxQty);
-      if (Number(params.icebergQty) > Number(params.quantity || 0)) {
+      if (compareDecimal(params.icebergQty, params.quantity || "0") > 0) {
         throw new BinanceApiError("icebergQty 不能大于订单 quantity。");
       }
       if (original !== params.icebergQty) adjustments.push(`icebergQty: ${original} -> ${params.icebergQty}`);
@@ -834,24 +876,24 @@ class BinanceSpotClient extends EventEmitter {
     // 动态价格区间最终由撮合引擎原子校验。行情连接会持续缓存 avgPrice，
     // 有新鲜缓存时才做本地预检，避免每笔委托前串行请求 /avgPrice。
     if (params.price && (percentBySide || percentPrice) && hasFreshAveragePrice) {
-      const referencePrice = Number(averagePrice.price);
-      if (percentBySide && referencePrice > 0) {
-        const upper = referencePrice * Number(side === "BUY" ? percentBySide.bidMultiplierUp : percentBySide.askMultiplierUp);
-        const lower = referencePrice * Number(side === "BUY" ? percentBySide.bidMultiplierDown : percentBySide.askMultiplierDown);
+      const referencePrice = averagePrice.price;
+      if (percentBySide && isPositiveDecimal(referencePrice)) {
+        const upper = multiplyDecimal(referencePrice, side === "BUY" ? percentBySide.bidMultiplierUp : percentBySide.askMultiplierUp);
+        const lower = multiplyDecimal(referencePrice, side === "BUY" ? percentBySide.bidMultiplierDown : percentBySide.askMultiplierDown);
         this.assertFilterRange("price", params.price, lower, upper);
-      } else if (percentPrice && referencePrice > 0) {
-        this.assertFilterRange("price", params.price, referencePrice * Number(percentPrice.multiplierDown), referencePrice * Number(percentPrice.multiplierUp));
+      } else if (percentPrice && isPositiveDecimal(referencePrice)) {
+        this.assertFilterRange("price", params.price, multiplyDecimal(referencePrice, percentPrice.multiplierDown), multiplyDecimal(referencePrice, percentPrice.multiplierUp));
       }
     }
 
-    const notionalReferencePrice = Number(
+    const notionalReferencePrice = String(
       params.price || params.stopPrice || orderSizing.referencePrice || 0
     );
     const notional = params.quoteOrderQty
-      ? Number(params.quoteOrderQty)
-      : notionalReferencePrice * Number(params.quantity || 0);
+      ? params.quoteOrderQty
+      : multiplyDecimal(notionalReferencePrice, params.quantity || "0");
     const notionalFilter = filters.NOTIONAL || filters.MIN_NOTIONAL;
-    if (notional > 0 && notionalFilter) {
+    if (isPositiveDecimal(notional) && notionalFilter) {
       this.assertFilterRange(
         "订单金额",
         notional,
@@ -949,11 +991,26 @@ class BinanceSpotClient extends EventEmitter {
     return { asset: quoteAsset, required, available };
   }
 
-  async cancelOrder({ symbol, orderId, origClientOrderId }) {
+  async cancelOrder({
+    symbol,
+    orderId,
+    origClientOrderId,
+    cancelRestrictions,
+  }) {
+    const normalizedRestriction = String(cancelRestrictions || "").toUpperCase();
+    if (
+      normalizedRestriction &&
+      !["ONLY_NEW", "ONLY_PARTIALLY_FILLED"].includes(normalizedRestriction)
+    ) {
+      throw new BinanceApiError(
+        "cancelRestrictions 只支持 ONLY_NEW 或 ONLY_PARTIALLY_FILLED。"
+      );
+    }
     const params = {
       symbol: this.validateSymbol(symbol),
       orderId,
       origClientOrderId,
+      cancelRestrictions: normalizedRestriction || undefined,
     };
 
     if (!orderId && !origClientOrderId) {
@@ -975,7 +1032,8 @@ class BinanceSpotClient extends EventEmitter {
           params,
           true,
           this.tradingRestBase
-        )
+        ),
+        { retrySafe: false, waitForWebSocketReady: true }
       );
     return {
       ...result,
@@ -1086,6 +1144,7 @@ class BinanceSpotClient extends EventEmitter {
     cancelOrderId,
     cancelOrigClientOrderId,
     cancelReplaceMode = "STOP_ON_FAILURE",
+    orderRateLimitExceededMode = "DO_NOTHING",
     ...order
   }) {
     if (!cancelOrderId && !cancelOrigClientOrderId) {
@@ -1095,6 +1154,7 @@ class BinanceSpotClient extends EventEmitter {
     const params = {
       ...preparedParams,
       cancelReplaceMode,
+      orderRateLimitExceededMode,
       cancelOrderId,
       cancelOrigClientOrderId,
     };
@@ -1705,6 +1765,16 @@ class BinanceSpotClient extends EventEmitter {
 
   requestWsApiOnSocket(socket, method, params, { url = this.wsApiBase } = {}) {
     return new Promise((resolve, reject) => {
+      try {
+        this.guardRateLimit({
+          operation: method,
+          critical: /(?:^|\.)(?:place|cancel|cancelAll|amend|modify)$/.test(method) ||
+            method === "order.cancelReplace",
+        });
+      } catch (error) {
+        reject(error);
+        return;
+      }
       if (socket.readyState !== WebSocket.OPEN) {
         reject(this.createWsTransportError(
           "Binance WebSocket API 持久连接不可用。",
@@ -1768,6 +1838,10 @@ class BinanceSpotClient extends EventEmitter {
         (message.status >= 200 && message.status < 300));
     this.reportWsApiLatency(pending, {
       success,
+      status: message.status,
+    });
+    this.observeRateLimit({
+      rateLimits: message.rateLimits,
       status: message.status,
     });
 

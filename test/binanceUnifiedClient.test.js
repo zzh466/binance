@@ -69,6 +69,27 @@ test("USDⓈ-M exchangeInfo 从 Futures 列表中解析指定合约", async () =
   client.close();
 });
 
+test("USDⓈ-M 全部订单查询允许省略 symbol", async () => {
+  const client = new BinanceUsdMClient({
+    apiKey: "future-key",
+    apiSecret: "future-secret",
+  });
+  let request;
+  client.signedRest = async (method, path, params) => {
+    request = { method, path, params };
+    return [];
+  };
+
+  await client.allOrders({ startTime: 100, endTime: 200, limit: 1_000 });
+
+  assert.equal(request.method, "GET");
+  assert.equal(request.path, "/fapi/v1/allOrders");
+  assert.equal(request.params.symbol, undefined);
+  assert.equal(request.params.startTime, 100);
+  assert.equal(request.params.endTime, 200);
+  client.close();
+});
+
 test("永续下单通过 WebSocket 并映射 Spot 风格止损限价类型", async () => {
   const client = new BinanceUsdMClient({
     apiKey: "future-key",
@@ -86,7 +107,13 @@ test("永续下单通过 WebSocket 并映射 Spot 风格止损限价类型", asy
       setImmediate(() => client.handleWsApiResponse({
         id: submitted.id,
         status: 200,
-        result: { symbol: submitted.params.symbol, orderId: 7, status: "NEW" },
+        result: {
+          symbol: submitted.params.symbol,
+          algoId: 7,
+          clientAlgoId: submitted.params.clientAlgoId,
+          orderType: submitted.params.type,
+          algoStatus: "NEW",
+        },
       }, socket));
     },
     close() {
@@ -108,7 +135,7 @@ test("永续下单通过 WebSocket 并映射 Spot 风格止损限价类型", asy
     timeInForce: "GTC",
   });
 
-  assert.equal(submitted.method, "order.place");
+  assert.equal(submitted.method, "algoOrder.place");
   assert.equal(submitted.params.type, "STOP");
   assert.equal(submitted.params.quantity, "0.031");
   assert.equal(submitted.params.price, "200.1");
@@ -116,10 +143,12 @@ test("永续下单通过 WebSocket 并映射 Spot 风格止损限价类型", asy
   assert.equal(submitted.params.newOrderRespType, "ACK");
   assert.equal(submitted.params.selfTradePreventionMode, "EXPIRE_MAKER");
   assert.match(
-    submitted.params.newClientOrderId,
+    submitted.params.clientAlgoId,
     /^x-tdk3UjFd-[0-9]{13}[a-f0-9]{8}$/
   );
-  assert.ok(submitted.params.newClientOrderId.length <= 36);
+  assert.ok(submitted.params.clientAlgoId.length <= 36);
+  assert.equal(submitted.params.algoType, "CONDITIONAL");
+  assert.equal(submitted.params.triggerPrice, "199.9");
   assert.equal(result.marketType, MARKET_FUTURES);
   assert.equal(result.transport, "websocket");
   assert.equal(result.selfTradePrevention.apiEffective, true);
@@ -169,6 +198,99 @@ test("统一客户端把现货和永续的延迟事件路由到同一出口", as
       background: true,
     },
   ]);
+  client.close();
+});
+
+test("最近 24 小时全账户同步汇总现货已知合约和 U 本位全合约订单", async () => {
+  const client = new BinanceUnifiedClient({
+    spotCredentials: { apiKey: "spot-key", apiSecret: "spot-secret" },
+    futuresCredentials: { apiKey: "futures-key", apiSecret: "futures-secret" },
+  });
+  const startTime = 1_000;
+  const endTime = startTime + 24 * 60 * 60 * 1000;
+  const queriedSpotSymbols = [];
+  let futuresQuery;
+  client.spot.openOrders = async () => ([{
+    symbol: "BTCUSDT",
+    orderId: 1,
+    status: "NEW",
+  }]);
+  client.spot.allOrders = async (options) => {
+    queriedSpotSymbols.push(options.symbol);
+    assert.equal(options.startTime, startTime);
+    assert.equal(options.endTime, endTime);
+    assert.equal(options.limit, 1_000);
+    return [{
+      symbol: options.symbol,
+      orderId: options.symbol === "BTCUSDT" ? 1 : 2,
+      status: options.symbol === "BTCUSDT" ? "NEW" : "FILLED",
+    }];
+  };
+  client.futures.allOrders = async (options) => {
+    futuresQuery = options;
+    return [{ symbol: "SOLUSDT", orderId: 3, status: "CANCELED" }];
+  };
+  client.futures.openAlgoOrders = async () => [];
+  client.futures.allAlgoOrders = async () => [];
+
+  const result = await client.recentAccountOrders({
+    startTime,
+    endTime,
+    knownSpotSymbols: ["ETHUSDT"],
+  });
+
+  assert.deepEqual(queriedSpotSymbols.sort(), ["BTCUSDT", "ETHUSDT"]);
+  assert.equal(futuresQuery.symbol, undefined);
+  assert.equal(futuresQuery.startTime, startTime);
+  assert.equal(result.orders.length, 3);
+  assert.deepEqual(
+    result.orders.map(({ marketType, symbol }) => [marketType, symbol]).sort(),
+    [
+      [MARKET_FUTURES, "SOLUSDT"],
+      [MARKET_SPOT, "BTCUSDT"],
+      [MARKET_SPOT, "ETHUSDT"],
+    ]
+  );
+  assert.equal(result.markets.spot.orderCount, 2);
+  assert.equal(result.markets.futures.orderCount, 1);
+  assert.deepEqual(result.warnings, []);
+  client.close();
+});
+
+test("U 本位测试服务要求 symbol 时按已知合约自动回退", async () => {
+  const client = new BinanceUnifiedClient({
+    futuresCredentials: { apiKey: "futures-key", apiSecret: "futures-secret" },
+  });
+  const queriedSymbols = [];
+  client.futures.openOrders = async () => ([{
+    symbol: "BTCUSDT",
+    orderId: 4,
+    status: "NEW",
+  }]);
+  client.futures.allOrders = async ({ symbol }) => {
+    if (!symbol) {
+      throw new BinanceApiError("Mandatory parameter 'symbol' was not sent.", {
+        status: 400,
+        code: -1102,
+        data: { code: -1102, msg: "Mandatory parameter 'symbol' was not sent." },
+      });
+    }
+    queriedSymbols.push(symbol);
+    return [{ symbol, orderId: symbol === "BTCUSDT" ? 4 : 5, status: "NEW" }];
+  };
+  client.futures.openAlgoOrders = async () => [];
+  client.futures.allAlgoOrders = async () => [];
+
+  const result = await client.recentAccountOrders({
+    startTime: 1_000,
+    endTime: 1_001,
+    knownFuturesSymbols: ["ETHUSDT"],
+  });
+
+  assert.deepEqual(queriedSymbols.sort(), ["BTCUSDT", "ETHUSDT"]);
+  assert.equal(result.markets.futures.queryMode, "per-symbol-fallback");
+  assert.equal(result.orders.length, 2);
+  assert.deepEqual(result.warnings, []);
   client.close();
 });
 
@@ -298,6 +420,198 @@ test("USDⓈ-M MARKET 按总价下单时复用最新成交价缓存", async () =
   assert.equal(result.params.selfTradePreventionMode, "EXPIRE_MAKER");
   assert.equal(result.orderSizing.referenceSource, "最新成交价缓存");
   assert.equal(result.orderSizing.referencePrice, "200");
+  client.close();
+});
+
+test("USDⓈ-M 平仓动作强制 reduceOnly，开仓动作不携带该参数", async () => {
+  const client = new BinanceUsdMClient({ testnet: true });
+  client.exchangeInfo = async () => ({ symbol: futuresSymbol() });
+  seedPositionMode(client);
+
+  const closing = await client.prepareOrder({
+    symbol: "SKHYUSDT",
+    side: "SELL",
+    type: "LIMIT",
+    quantity: "0.1",
+    price: "200",
+    positionEffect: "CLOSE",
+  });
+  const opening = await client.prepareOrder({
+    symbol: "SKHYUSDT",
+    side: "BUY",
+    type: "LIMIT",
+    quantity: "0.1",
+    price: "200",
+    positionEffect: "OPEN",
+  });
+
+  assert.equal(closing.params.reduceOnly, "true");
+  assert.equal(closing.positionEffect, "CLOSE");
+  assert.equal(opening.params.reduceOnly, undefined);
+  assert.equal(opening.positionEffect, "OPEN");
+  client.close();
+});
+
+test("USDⓈ-M 高级订单参数在发送前校验适用范围", async () => {
+  const client = new BinanceUsdMClient({ testnet: true });
+  client.exchangeInfo = async () => ({ symbol: futuresSymbol() });
+  seedPositionMode(client);
+
+  await assert.rejects(
+    client.prepareOrder({
+      symbol: "SKHYUSDT",
+      side: "BUY",
+      type: "MARKET",
+      quantity: "0.1",
+      priceMatch: "OPPONENT",
+    }),
+    /priceMatch 只适用于/
+  );
+  await assert.rejects(
+    client.prepareOrder({
+      symbol: "SKHYUSDT",
+      side: "BUY",
+      type: "LIMIT",
+      quantity: "0.1",
+      priceMatch: "nearest",
+    }),
+    /priceMatch 不支持/
+  );
+  client.close();
+});
+
+test("USDⓈ-M Algo Order 响应与 ALGO_UPDATE 统一为普通订单状态结构", () => {
+  const client = new BinanceUsdMClient({ testnet: true });
+  const order = client.normalizeAlgoOrder({
+    algoId: 77,
+    clientAlgoId: "algo-77",
+    symbol: "SKHYUSDT",
+    side: "SELL",
+    orderType: "STOP",
+    algoStatus: "NEW",
+    quantity: "0.1",
+    triggerPrice: "190",
+  });
+  const event = client.normalizeFuturesUserEvent({
+    e: "ALGO_UPDATE",
+    E: 100,
+    T: 99,
+    o: {
+      algoId: 77,
+      clientAlgoId: "algo-77",
+      symbol: "SKHYUSDT",
+      side: "SELL",
+      orderType: "STOP",
+      algoStatus: "CANCELED",
+      quantity: "0.1",
+      triggerPrice: "190",
+    },
+  });
+
+  assert.equal(order.orderId, 77);
+  assert.equal(order.algoOrder, true);
+  assert.equal(event.e, "executionReport");
+  assert.equal(event.X, "CANCELED");
+  assert.equal(event.algoOrder, true);
+  client.close();
+});
+
+test("USDⓈ-M Algo Order 撤单响应缺少 symbol 时沿用请求合约", async () => {
+  const client = new BinanceUsdMClient({
+    apiKey: "future-key",
+    apiSecret: "future-secret",
+  });
+  client.signedRest = async (method, path, params) => {
+    assert.equal(method, "DELETE");
+    assert.equal(path, "/fapi/v1/algoOrder");
+    assert.deepEqual(params, { algoId: 77, clientAlgoId: undefined });
+    return { algoId: 77, clientAlgoId: "algo-77", code: 200 };
+  };
+
+  const result = await client.cancelAlgoOrder({
+    symbol: "SKHYUSDT",
+    algoId: 77,
+  });
+
+  assert.equal(result.symbol, "SKHYUSDT");
+  assert.equal(result.status, "CANCELED");
+  assert.equal(result.algoOrder, true);
+  client.close();
+});
+
+test("USDⓈ-M 自动撤单倒计时调用 countdownCancelAll 并校验范围", async () => {
+  const client = new BinanceUsdMClient({
+    apiKey: "future-key",
+    apiSecret: "future-secret",
+  });
+  let submitted;
+  client.signedRest = async (method, path, params) => {
+    submitted = { method, path, params };
+    return { symbol: params.symbol, countdownTime: params.countdownTime };
+  };
+
+  await client.setCountdownCancelAll({
+    symbol: "SKHYUSDT",
+    countdownTime: 120_000,
+  });
+  assert.deepEqual(submitted, {
+    method: "POST",
+    path: "/fapi/v1/countdownCancelAll",
+    params: { symbol: "SKHYUSDT", countdownTime: 120_000 },
+  });
+  await assert.rejects(
+    client.setCountdownCancelAll({ symbol: "SKHYUSDT", countdownTime: 600_001 }),
+    /0-600000/
+  );
+  client.close();
+});
+
+test("最近订单查询达到上限时按时间二分补齐而不是截断", async () => {
+  const client = new BinanceUnifiedClient();
+  const source = [
+    { orderId: 1, updateTime: 10 },
+    { orderId: 2, updateTime: 20 },
+    { orderId: 3, updateTime: 30 },
+    { orderId: 4, updateTime: 40 },
+  ];
+  const queriedWindows = [];
+  const warnings = [];
+  const result = await client.queryCompleteOrderWindow({
+    fetchPage: async ({ startTime, endTime, limit }) => {
+      queriedWindows.push([startTime, endTime]);
+      return source.filter((order) =>
+        order.updateTime >= startTime && order.updateTime <= endTime
+      ).slice(0, limit);
+    },
+    startTime: 1,
+    endTime: 50,
+    limit: 2,
+    warningContext: { marketType: MARKET_FUTURES, operation: "allOrders" },
+    warnings,
+  });
+
+  assert.deepEqual(result.map((order) => order.orderId).sort(), [1, 2, 3, 4]);
+  assert.ok(queriedWindows.length > 1);
+  assert.deepEqual(warnings, []);
+  client.close();
+});
+
+test("STP 安全状态会识别 tradeGroupId=-1 与期望交易组不匹配", async () => {
+  const client = new BinanceUnifiedClient({
+    spotCredentials: { apiKey: "spot", apiSecret: "secret" },
+    futuresCredentials: { apiKey: "future", apiSecret: "secret" },
+    expectedSpotTradeGroupId: "8",
+    expectedFuturesTradeGroupId: "9",
+  });
+  client.spot.accountStatus = async () => ({ tradeGroupId: -1 });
+  client.futures.accountStatus = async () => ({ tradeGroupId: 7 });
+
+  const result = await client.tradingSafetyStatus();
+
+  assert.equal(result.crossAccountReady, false);
+  assert.equal(result.markets.spot.crossAccountProtected, false);
+  assert.equal(result.markets.futures.matchesExpected, false);
+  assert.equal(result.warnings.length, 2);
   client.close();
 });
 

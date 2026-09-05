@@ -9,12 +9,16 @@ const MARKET_SPOT = "spot";
 const MARKET_FUTURES = "futures";
 const MARKET_RESOLUTION_CACHE_TTL_MS = 300_000;
 const MARKET_RESOLUTION_REFRESH_RETRY_MS = 30_000;
+const RECENT_ORDER_WINDOW_MS = 24 * 60 * 60 * 1000;
+const MAX_ACCOUNT_ORDER_QUERY_LIMIT = 1_000;
+const GLOBAL_ALGO_DISCOVERY_TTL_MS = 300_000;
 const ROUTED_EVENTS = [
   "depth-update",
   "trade-update",
   "market-status",
   "market-error",
   "latency-update",
+  "rate-limit-update",
   "order-state-update",
   "user-data-event",
   "user-data-status",
@@ -31,6 +35,9 @@ class BinanceUnifiedClient extends EventEmitter {
     publicMarketFetch,
     spotBrokerLinkId,
     futuresBrokerLinkId,
+    expectedSpotTradeGroupId,
+    expectedFuturesTradeGroupId,
+    rateLimitCoordinator,
   } = {}) {
     super();
     this.testnet = Boolean(testnet);
@@ -38,6 +45,7 @@ class BinanceUnifiedClient extends EventEmitter {
       testnet: this.testnet,
       depthSpeed,
       preflightBalanceCheck,
+      rateLimitCoordinator,
     };
     this.spot = new BinanceSpotClient({
       ...common,
@@ -55,12 +63,17 @@ class BinanceUnifiedClient extends EventEmitter {
     this.spot.credentialsSource = spotCredentials.source || "";
     this.futures.credentialsSource = futuresCredentials.source || "";
     this.credentialsSource = this.spot.credentialsSource;
+    this.expectedTradeGroupIds = {
+      [MARKET_SPOT]: String(expectedSpotTradeGroupId ?? "").trim(),
+      [MARKET_FUTURES]: String(expectedFuturesTradeGroupId ?? "").trim(),
+    };
     this.activeMarketType = MARKET_SPOT;
     this.activeSymbol = null;
     this.marketResolutionCache = new Map();
     this.marketResolutionRefreshPromises = new Map();
     this.marketResolutionRefreshAttemptAt = new Map();
     this.futuresInitializationPromise = null;
+    this.lastGlobalAlgoDiscoveryAt = 0;
     this.bindChildEvents(this.spot, MARKET_SPOT);
     this.bindChildEvents(this.futures, MARKET_FUTURES);
   }
@@ -145,6 +158,116 @@ class BinanceUnifiedClient extends EventEmitter {
 
   isInvalidSymbolError(error) {
     return Number(error?.code) === -1121 || /invalid symbol/i.test(error?.message || "");
+  }
+
+  isMissingSymbolError(error) {
+    return Number(error?.code) === -1102 && /symbol/i.test(
+      `${error?.message || ""} ${error?.data?.msg || ""}`
+    );
+  }
+
+  hasTradingCredentials(marketClient) {
+    return Boolean(marketClient.apiKey && marketClient.apiSecret);
+  }
+
+  collectKnownSymbols(marketType, suppliedSymbols = []) {
+    const symbols = new Set();
+    const addSymbol = (symbol) => {
+      if (!symbol) return;
+      try {
+        symbols.add(this.validateSymbol(symbol));
+      } catch {
+        // 忽略已失效的本地合约记录，避免一次坏数据阻塞整个账户同步。
+      }
+    };
+
+    for (const symbol of suppliedSymbols) addSymbol(symbol);
+    if (this.activeMarketType === marketType) addSymbol(this.activeSymbol);
+    for (const resolution of this.marketResolutionCache.values()) {
+      if (resolution?.marketType === marketType) addSymbol(resolution.symbol);
+    }
+    return symbols;
+  }
+
+  serializeAccountSyncError(error, details = {}) {
+    return {
+      ...details,
+      name: error?.name || "Error",
+      message: error?.message || "未知错误",
+      status: error?.status,
+      code: error?.code,
+    };
+  }
+
+  async queryCompleteOrderWindow({
+    fetchPage,
+    startTime,
+    endTime,
+    limit,
+    warningContext,
+    warnings,
+    depth = 0,
+  }) {
+    const page = await fetchPage({ startTime, endTime, limit });
+    if (page.length < limit) return page;
+
+    // Binance 的 allOrders 只返回至多 1000 条。按时间区间二分，而不是
+    // 假定跨 symbol 的 orderId 全局连续；这样同样适用于全合约查询。
+    if (depth >= 20 || endTime - startTime <= 1) {
+      warnings.push({
+        ...warningContext,
+        name: "ResultLimitWarning",
+        message:
+          `${warningContext.symbol ? `${warningContext.symbol} ` : ""}` +
+          `在 ${startTime}-${endTime} 仍达到 ${limit} 条上限，极短区间可能被截断。`,
+      });
+      return page;
+    }
+
+    const middle = Math.floor((startTime + endTime) / 2);
+    const left = await this.queryCompleteOrderWindow({
+      fetchPage,
+      startTime,
+      endTime: middle,
+      limit,
+      warningContext,
+      warnings,
+      depth: depth + 1,
+    });
+    const right = await this.queryCompleteOrderWindow({
+      fetchPage,
+      startTime: middle + 1,
+      endTime,
+      limit,
+      warningContext,
+      warnings,
+      depth: depth + 1,
+    });
+    return [...left, ...right];
+  }
+
+  async mapSettledWithConcurrency(items, mapper, concurrency = 4) {
+    const results = new Array(items.length);
+    let cursor = 0;
+    const workers = Array.from(
+      { length: Math.min(concurrency, items.length) },
+      async () => {
+        while (cursor < items.length) {
+          const index = cursor;
+          cursor += 1;
+          try {
+            results[index] = {
+              status: "fulfilled",
+              value: await mapper(items[index], index),
+            };
+          } catch (reason) {
+            results[index] = { status: "rejected", reason };
+          }
+        }
+      }
+    );
+    await Promise.all(workers);
+    return results;
   }
 
   async initialize() {
@@ -444,6 +567,287 @@ class BinanceUnifiedClient extends EventEmitter {
     );
   }
 
+  async recentAccountOrders({
+    startTime,
+    endTime = Date.now(),
+    limit = MAX_ACCOUNT_ORDER_QUERY_LIMIT,
+    knownSpotSymbols = [],
+    knownFuturesSymbols = [],
+  } = {}) {
+    const normalizedEndTime = Number(endTime);
+    const normalizedStartTime = Number(
+      startTime ?? normalizedEndTime - RECENT_ORDER_WINDOW_MS
+    );
+    const normalizedLimit = Math.floor(Math.min(
+      MAX_ACCOUNT_ORDER_QUERY_LIMIT,
+      Math.max(1, Number(limit) || MAX_ACCOUNT_ORDER_QUERY_LIMIT)
+    ));
+    if (
+      !Number.isFinite(normalizedStartTime) ||
+      !Number.isFinite(normalizedEndTime) ||
+      normalizedStartTime >= normalizedEndTime ||
+      normalizedEndTime - normalizedStartTime > RECENT_ORDER_WINDOW_MS
+    ) {
+      throw new BinanceApiError("全账户订单同步的时间范围必须是不超过 24 小时的有效区间。");
+    }
+
+    const orders = [];
+    const warnings = [];
+    const markets = {
+      [MARKET_SPOT]: {
+        configured: this.hasTradingCredentials(this.spot),
+        queryMode: "per-symbol",
+        symbols: [],
+        orderCount: 0,
+      },
+      [MARKET_FUTURES]: {
+        configured: this.hasTradingCredentials(this.futures),
+        queryMode: "all-symbols",
+        symbols: [],
+        orderCount: 0,
+      },
+    };
+    if (!markets.spot.configured && !markets.futures.configured) {
+      throw new BinanceApiError(
+        "当前环境没有可用于查询账户订单的现货或 U 本位 API Key/Secret。"
+      );
+    }
+
+    if (markets.spot.configured) {
+      const spotSymbols = this.collectKnownSymbols(
+        MARKET_SPOT,
+        knownSpotSymbols
+      );
+      try {
+        const openOrders = await this.spot.openOrders({});
+        const typedOpenOrders = this.addMarketType(openOrders, MARKET_SPOT);
+        orders.push(...typedOpenOrders);
+        for (const order of typedOpenOrders) {
+          if (order.symbol) spotSymbols.add(order.symbol);
+        }
+      } catch (error) {
+        warnings.push(this.serializeAccountSyncError(error, {
+          marketType: MARKET_SPOT,
+          operation: "openOrders",
+        }));
+      }
+
+      const symbols = [...spotSymbols].sort();
+      markets.spot.symbols = symbols;
+      const results = await this.mapSettledWithConcurrency(
+        symbols,
+        (symbol) => this.queryCompleteOrderWindow({
+          fetchPage: ({ startTime, endTime, limit }) =>
+            this.spot.allOrders({ symbol, startTime, endTime, limit }),
+          startTime: normalizedStartTime,
+          endTime: normalizedEndTime,
+          limit: normalizedLimit,
+          warningContext: {
+            marketType: MARKET_SPOT,
+            operation: "allOrders",
+            symbol,
+          },
+          warnings,
+        }),
+        4
+      );
+      for (const [index, result] of results.entries()) {
+        const symbol = symbols[index];
+        if (result.status === "fulfilled") {
+          orders.push(...this.addMarketType(result.value, MARKET_SPOT));
+        } else {
+          warnings.push(this.serializeAccountSyncError(result.reason, {
+            marketType: MARKET_SPOT,
+            operation: "allOrders",
+            symbol,
+          }));
+        }
+      }
+      markets.spot.orderCount = orders.filter(
+        (order) => order.marketType === MARKET_SPOT
+      ).length;
+    }
+
+    if (markets.futures.configured) {
+      const futuresSymbols = this.collectKnownSymbols(
+        MARKET_FUTURES,
+        knownFuturesSymbols
+      );
+      try {
+        const futuresOrders = await this.queryCompleteOrderWindow({
+          fetchPage: ({ startTime, endTime, limit }) =>
+            this.futures.allOrders({ startTime, endTime, limit }),
+          startTime: normalizedStartTime,
+          endTime: normalizedEndTime,
+          limit: normalizedLimit,
+          warningContext: {
+            marketType: MARKET_FUTURES,
+            operation: "allOrders",
+          },
+          warnings,
+        });
+        const typedFuturesOrders = this.addMarketType(
+          futuresOrders,
+          MARKET_FUTURES
+        );
+        orders.push(...typedFuturesOrders);
+        for (const order of typedFuturesOrders) {
+          if (order.symbol) futuresSymbols.add(order.symbol);
+        }
+      } catch (error) {
+        if (!this.isMissingSymbolError(error)) {
+          warnings.push(this.serializeAccountSyncError(error, {
+            marketType: MARKET_FUTURES,
+            operation: "allOrders",
+          }));
+        } else {
+          markets.futures.queryMode = "per-symbol-fallback";
+          markets.futures.fallbackReason = error.message;
+          try {
+            const openOrders = await this.futures.openOrders({});
+            const typedOpenOrders = this.addMarketType(
+              openOrders,
+              MARKET_FUTURES
+            );
+            orders.push(...typedOpenOrders);
+            for (const order of typedOpenOrders) {
+              if (order.symbol) futuresSymbols.add(order.symbol);
+            }
+          } catch (openOrdersError) {
+            warnings.push(this.serializeAccountSyncError(openOrdersError, {
+              marketType: MARKET_FUTURES,
+              operation: "openOrders",
+            }));
+          }
+
+          const symbols = [...futuresSymbols].sort();
+          const results = await this.mapSettledWithConcurrency(
+            symbols,
+            (symbol) => this.queryCompleteOrderWindow({
+              fetchPage: ({ startTime, endTime, limit }) =>
+                this.futures.allOrders({ symbol, startTime, endTime, limit }),
+              startTime: normalizedStartTime,
+              endTime: normalizedEndTime,
+              limit: normalizedLimit,
+              warningContext: {
+                marketType: MARKET_FUTURES,
+                operation: "allOrders",
+                symbol,
+              },
+              warnings,
+            }),
+            4
+          );
+          for (const [index, result] of results.entries()) {
+            const symbol = symbols[index];
+            if (result.status === "fulfilled") {
+              orders.push(...this.addMarketType(result.value, MARKET_FUTURES));
+            } else {
+              warnings.push(this.serializeAccountSyncError(result.reason, {
+                marketType: MARKET_FUTURES,
+                operation: "allOrders",
+                symbol,
+              }));
+            }
+          }
+          if (!symbols.length) {
+            warnings.push({
+              marketType: MARKET_FUTURES,
+              operation: "allOrders",
+              name: "BinanceApiError",
+              message: "当前 U 本位服务要求传入 symbol，且本地没有可用于补查的已知合约。",
+              code: -1102,
+            });
+          }
+        }
+      }
+
+      // Algo Order 历史接口要求 symbol。先用全账户当前 Algo 挂单发现活跃
+      // 合约，再结合普通订单和本地已知合约逐一补齐最近 24 小时条件单。
+      if (Date.now() - this.lastGlobalAlgoDiscoveryAt >= GLOBAL_ALGO_DISCOVERY_TTL_MS) {
+        try {
+          const openAlgoOrders = await this.futures.openAlgoOrders({});
+          this.lastGlobalAlgoDiscoveryAt = Date.now();
+          const typedOpenAlgoOrders = this.addMarketType(
+            openAlgoOrders,
+            MARKET_FUTURES
+          );
+          orders.push(...typedOpenAlgoOrders);
+          for (const order of typedOpenAlgoOrders) {
+            if (order.symbol) futuresSymbols.add(order.symbol);
+          }
+        } catch (error) {
+          warnings.push(this.serializeAccountSyncError(error, {
+            marketType: MARKET_FUTURES,
+            operation: "openAlgoOrders",
+          }));
+        }
+      }
+      const algoSymbols = [...futuresSymbols].sort();
+      const algoResults = await this.mapSettledWithConcurrency(
+        algoSymbols,
+        (symbol) => this.queryCompleteOrderWindow({
+          fetchPage: ({ startTime, endTime, limit }) =>
+            this.futures.allAlgoOrders({
+              symbol,
+              startTime,
+              endTime,
+              limit,
+            }),
+          startTime: normalizedStartTime,
+          endTime: normalizedEndTime,
+          limit: normalizedLimit,
+          warningContext: {
+            marketType: MARKET_FUTURES,
+            operation: "allAlgoOrders",
+            symbol,
+          },
+          warnings,
+        }),
+        4
+      );
+      for (const [index, result] of algoResults.entries()) {
+        const symbol = algoSymbols[index];
+        if (result.status === "fulfilled") {
+          orders.push(...this.addMarketType(result.value, MARKET_FUTURES));
+        } else {
+          warnings.push(this.serializeAccountSyncError(result.reason, {
+            marketType: MARKET_FUTURES,
+            operation: "allAlgoOrders",
+            symbol,
+          }));
+        }
+      }
+      markets.futures.symbols = [...futuresSymbols].sort();
+      markets.futures.orderCount = orders.filter(
+        (order) => order.marketType === MARKET_FUTURES
+      ).length;
+    }
+
+    const uniqueOrders = new Map();
+    for (const order of orders) {
+      const identity = order.orderId !== undefined && order.orderId !== null
+        ? `${order.algoOrder ? "algo" : "order"}:${order.orderId}`
+        : `client:${order.clientOrderId || order.c || "unknown"}`;
+      uniqueOrders.set(
+        `${order.marketType}:${order.symbol || order.s}:${identity}`,
+        order
+      );
+    }
+    for (const marketType of [MARKET_SPOT, MARKET_FUTURES]) {
+      markets[marketType].orderCount = [...uniqueOrders.values()].filter(
+        (order) => order.marketType === marketType
+      ).length;
+    }
+    return {
+      startTime: normalizedStartTime,
+      endTime: normalizedEndTime,
+      orders: [...uniqueOrders.values()],
+      markets,
+      warnings,
+    };
+  }
+
   async myTrades(options) {
     return this.route(
       options.symbol,
@@ -462,6 +866,72 @@ class BinanceUnifiedClient extends EventEmitter {
     );
   }
 
+  async tradingSafetyStatus() {
+    const result = {
+      mode: "EXPIRE_MAKER",
+      markets: {},
+      warnings: [],
+    };
+    const candidates = [
+      [MARKET_SPOT, this.spot],
+      [MARKET_FUTURES, this.futures],
+    ];
+    const settled = await Promise.allSettled(candidates.map(([, marketClient]) =>
+      this.hasTradingCredentials(marketClient)
+        ? marketClient.accountStatus({ omitZeroBalances: false })
+        : Promise.resolve(null)
+    ));
+
+    for (const [index, settlement] of settled.entries()) {
+      const [marketType, marketClient] = candidates[index];
+      const expected = this.expectedTradeGroupIds[marketType];
+      if (!this.hasTradingCredentials(marketClient)) {
+        result.markets[marketType] = { configured: false };
+        continue;
+      }
+      if (settlement.status === "rejected") {
+        result.markets[marketType] = {
+          configured: true,
+          verified: false,
+          error: this.serializeAccountSyncError(settlement.reason),
+        };
+        result.warnings.push(
+          `${marketType === MARKET_SPOT ? "现货" : "U 本位"} STP 账户范围校验失败。`
+        );
+        continue;
+      }
+
+      const account = settlement.value || {};
+      const tradeGroupId = String(account.tradeGroupId ?? "-1");
+      const crossAccountProtected = tradeGroupId !== "-1";
+      const matchesExpected = expected ? tradeGroupId === expected : null;
+      result.markets[marketType] = {
+        configured: true,
+        verified: true,
+        tradeGroupId,
+        crossAccountProtected,
+        expectedTradeGroupId: expected || null,
+        matchesExpected,
+      };
+      if (!crossAccountProtected) {
+        result.warnings.push(
+          `${marketType === MARKET_SPOT ? "现货" : "U 本位"} tradeGroupId=-1，` +
+          "EXPIRE_MAKER 只能保证当前账号内部，不能覆盖不同子账号。"
+        );
+      } else if (matchesExpected === false) {
+        result.warnings.push(
+          `${marketType === MARKET_SPOT ? "现货" : "U 本位"} tradeGroupId=${tradeGroupId}，` +
+          `与配置期望值 ${expected} 不一致。`
+        );
+      }
+    }
+    result.crossAccountReady = Object.values(result.markets)
+      .filter((market) => market.configured)
+      .every((market) => market.verified && market.crossAccountProtected &&
+        market.matchesExpected !== false);
+    return result;
+  }
+
   async accountRateLimits(options = {}) {
     const symbol = options.symbol || this.activeSymbol;
     if (!symbol) return this.spot.accountRateLimits();
@@ -478,6 +948,15 @@ class BinanceUnifiedClient extends EventEmitter {
 
   async signTradFiPerpsAgreement() {
     const result = await this.futures.signTradFiPerpsAgreement();
+    return this.addMarketType(result, MARKET_FUTURES);
+  }
+
+  async setFuturesCountdownCancelAll(options) {
+    const resolution = await this.resolveMarket(options.symbol, options);
+    if (resolution.marketType !== MARKET_FUTURES) {
+      throw new BinanceApiError("自动撤单保护只适用于 U 本位永续合约。");
+    }
+    const result = await this.futures.setCountdownCancelAll(options);
     return this.addMarketType(result, MARKET_FUTURES);
   }
 

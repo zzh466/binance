@@ -13,11 +13,21 @@ const {
   readShortcutConfig,
   writeShortcutConfig,
 } = require("./shortcutConfigStore");
-const { RecentOrderStore } = require("./recentOrderStore");
+const {
+  RecentOrderStore,
+  recent24HourCutoff,
+} = require("./recentOrderStore");
 const {
   getAdditionalInstanceLaunch,
   getPackagedEnvironmentPath,
 } = require("./platformSupport");
+const {
+  SharedRateLimitCoordinator,
+} = require("./sharedRateLimitCoordinator");
+const {
+  TradingRoundStore,
+  compareRoundsNewestFirst,
+} = require("./tradingRoundStore");
 
 function loadEnvironmentFile() {
   const packagedEnvironmentPath = getPackagedEnvironmentPath({
@@ -61,6 +71,15 @@ const recentOrderStorePath = path.join(
   "recent-orders.json"
 );
 const recentOrderStore = new RecentOrderStore(recentOrderStorePath);
+const tradingRoundStore = new TradingRoundStore(
+  path.join(app.getPath("userData"), "trading-rounds.json")
+);
+const rateLimitCoordinator = new SharedRateLimitCoordinator(
+  path.join(app.getPath("appData"), "Binance统一交易台", "rate-limits"),
+  { instanceId: instanceId || `pid-${process.pid}` }
+);
+const unknownOrderReconciliationTimers = new Set();
+let futuresDeadManState = null;
 
 function fingerprintApiKey(apiKey) {
   const value = String(apiKey || "");
@@ -112,18 +131,43 @@ function trackOrderPayload(
   { targetClient = client, marketType, defaultStatus, source } = {}
 ) {
   const saved = [];
+  const affectedRoundIds = new Set();
   const rootMarketType = payload?.marketType || marketType;
   for (const order of collectOrderCandidates(payload)) {
     const resolvedMarketType = order.marketType || rootMarketType;
     if (!resolvedMarketType) continue;
+    const storeContext = getOrderStoreContext(
+      targetClient,
+      resolvedMarketType,
+      { defaultStatus, source }
+    );
     const result = recentOrderStore.upsert(
       order,
-      getOrderStoreContext(targetClient, resolvedMarketType, {
-        defaultStatus,
-        source,
-      })
+      storeContext
     );
-    if (result) saved.push(result);
+    if (result) {
+      saved.push(result);
+      const roundContext = {
+        ...storeContext,
+        updatedAt: result.updatedAt,
+      };
+      const roundUpdate =
+        tradingRoundStore.recordOrderExecution(order, roundContext) ||
+        tradingRoundStore.recordOrderExecution(result, roundContext);
+      for (const roundId of roundUpdate?.affectedRoundIds || []) {
+        affectedRoundIds.add(roundId);
+      }
+    }
+  }
+  if (affectedRoundIds.size && targetClient === client) {
+    const rounds = listTradingRounds({}, targetClient).filter((round) =>
+      affectedRoundIds.has(round.id)
+    );
+    sendToRenderer("binance:trading-rounds-update", {
+      rounds,
+      partial: true,
+      time: Date.now(),
+    });
   }
   return saved;
 }
@@ -134,32 +178,261 @@ async function trackOrderCall(action, options = {}) {
     trackOrderPayload(data, options);
     return data;
   } catch (error) {
+    trackOrderPayload(error?.data, {
+      ...options,
+      source: `${options.source || "order-call"}-partial-result`,
+    });
     if (error?.data?.orderAttempt) {
       trackOrderPayload(error.data.orderAttempt, {
         ...options,
         defaultStatus: error.data.orderAttempt.status || "REJECTED",
         source: "place-order-rejected",
       });
+      scheduleUnknownOrderReconciliation(
+        error.data.orderAttempt,
+        options.targetClient || client
+      );
     }
     throw error;
   }
+}
+
+function scheduleUnknownOrderReconciliation(orderAttempt, targetClient = client) {
+  if (orderAttempt?.status !== "UNKNOWN") return;
+  const symbol = orderAttempt.symbol || orderAttempt.s;
+  const origClientOrderId =
+    orderAttempt.clientOrderId ||
+    orderAttempt.newClientOrderId ||
+    orderAttempt.clientAlgoId ||
+    orderAttempt.c;
+  if (!symbol || !origClientOrderId) return;
+
+  const delays = [150, 500, 1_500, 3_000, 8_000];
+  const tryQuery = (index) => {
+    if (index >= delays.length || targetClient !== client) return;
+    const timer = setTimeout(async () => {
+      unknownOrderReconciliationTimers.delete(timer);
+      if (targetClient !== client) return;
+      try {
+        const order = await targetClient.queryOrder({
+          symbol,
+          origClientOrderId,
+          marketType: orderAttempt.marketType,
+        });
+        trackOrderPayload(order, {
+          targetClient,
+          marketType: orderAttempt.marketType,
+          source: "unknown-order-reconciliation",
+        });
+        sendToRenderer("binance:recent-orders-synced", {
+          reason: "unknown-order-reconciled",
+          orders: listRecentOrders({}, targetClient),
+        });
+      } catch {
+        tryQuery(index + 1);
+      }
+    }, delays[index]);
+    timer.unref?.();
+    unknownOrderReconciliationTimers.add(timer);
+  };
+  tryQuery(0);
+}
+
+function clearFuturesDeadManTimer() {
+  if (futuresDeadManState?.timer) {
+    clearInterval(futuresDeadManState.timer);
+  }
+  futuresDeadManState = null;
+}
+
+async function configureFuturesDeadMan(payload = {}, targetClient = client) {
+  const enabled = Boolean(payload.enabled);
+  const previousState = futuresDeadManState;
+  const symbol = targetClient.validateSymbol(
+    enabled ? payload.symbol : previousState?.symbol || payload.symbol
+  );
+  if (!enabled) {
+    const result = await targetClient.setFuturesCountdownCancelAll({
+      symbol,
+      countdownTime: 0,
+    });
+    clearFuturesDeadManTimer();
+    const status = { enabled: false, symbol, result, time: Date.now() };
+    if (targetClient === client) {
+      sendToRenderer("binance:futures-dead-man-status", status);
+    }
+    return status;
+  }
+
+  const countdownTime = Math.min(
+    600_000,
+    Math.max(5_000, Math.floor(Number(payload.countdownTime) || 120_000))
+  );
+  const heartbeatMs = Math.min(
+    Math.floor(countdownTime / 2),
+    Math.max(1_000, Math.floor(Number(payload.heartbeatMs) || 30_000))
+  );
+  if (previousState?.symbol && previousState.symbol !== symbol) {
+    await targetClient.setFuturesCountdownCancelAll({
+      symbol: previousState.symbol,
+      countdownTime: 0,
+    });
+  }
+  const initialResult = await targetClient.setFuturesCountdownCancelAll({
+    symbol,
+    countdownTime,
+  });
+  clearFuturesDeadManTimer();
+  let heartbeatInFlight = false;
+  const heartbeat = async () => {
+    if (targetClient !== client) {
+      clearFuturesDeadManTimer();
+      return;
+    }
+    if (heartbeatInFlight) return;
+    heartbeatInFlight = true;
+    try {
+      const result = await targetClient.setFuturesCountdownCancelAll({
+        symbol,
+        countdownTime,
+      });
+      sendToRenderer("binance:futures-dead-man-status", {
+        enabled: true,
+        symbol,
+        countdownTime,
+        heartbeatMs,
+        result,
+        time: Date.now(),
+      });
+    } catch (error) {
+      sendToRenderer("binance:futures-dead-man-status", {
+        enabled: true,
+        symbol,
+        countdownTime,
+        heartbeatMs,
+        error: serializeError(error),
+        time: Date.now(),
+      });
+    } finally {
+      heartbeatInFlight = false;
+    }
+  };
+  const timer = setInterval(heartbeat, heartbeatMs);
+  timer.unref?.();
+  futuresDeadManState = {
+    enabled: true,
+    symbol,
+    countdownTime,
+    heartbeatMs,
+    timer,
+  };
+  const status = {
+    ...futuresDeadManState,
+    timer: undefined,
+    result: initialResult,
+    time: Date.now(),
+  };
+  if (targetClient === client) {
+    sendToRenderer("binance:futures-dead-man-status", status);
+  }
+  return status;
 }
 
 function listRecentOrders(payload = {}, targetClient = client) {
   const marketTypes = payload.marketType
     ? [payload.marketType]
     : ["spot", "futures"];
-  const accountFingerprints = marketTypes
-    .map((marketType) => fingerprintApiKey(
+  return marketTypes.flatMap((marketType) => {
+    const accountFingerprint = fingerprintApiKey(
       targetClient.getClient(marketType).apiKey
-    ))
-    .filter(Boolean);
-  return recentOrderStore.list({
+    );
+    if (!accountFingerprint) return [];
+    return recentOrderStore.list({
+      environment: targetClient.testnet ? "testnet" : "production",
+      accountFingerprints: [accountFingerprint],
+      marketType,
+      symbol: payload.symbol,
+    });
+  }).sort((left, right) => Number(right.updatedAt) - Number(left.updatedAt));
+}
+
+function listTradingRounds(payload = {}, targetClient = client) {
+  const marketTypes = payload.marketType
+    ? [payload.marketType]
+    : ["spot", "futures"];
+  return marketTypes.flatMap((marketType) => {
+    const accountFingerprint = fingerprintApiKey(
+      targetClient.getClient(marketType).apiKey
+    );
+    if (!accountFingerprint) return [];
+    return tradingRoundStore.list({
+      environment: targetClient.testnet ? "testnet" : "production",
+      accountFingerprints: [accountFingerprint],
+      marketType,
+      symbol: payload.symbol,
+    });
+  }).sort(compareRoundsNewestFirst);
+}
+
+function listKnownOrderSymbols(marketType, targetClient = client) {
+  const marketClient = targetClient.getClient(marketType);
+  const accountFingerprint = fingerprintApiKey(marketClient.apiKey);
+  if (!accountFingerprint) return [];
+  return [...new Set(recentOrderStore.list({
     environment: targetClient.testnet ? "testnet" : "production",
-    accountFingerprints,
-    marketType: payload.marketType,
-    symbol: payload.symbol,
+    accountFingerprints: [accountFingerprint],
+    marketType,
+  }).map((order) => order.symbol).filter(Boolean))];
+}
+
+async function syncRecentAccountOrders(payload = {}, targetClient = client) {
+  const endTime = Date.now();
+  const startTime = recent24HourCutoff(endTime);
+  const knownSpotSymbols = listKnownOrderSymbols("spot", targetClient);
+  const knownFuturesSymbols = listKnownOrderSymbols("futures", targetClient);
+  if (payload.marketType === "spot" && payload.symbol) {
+    knownSpotSymbols.push(payload.symbol);
+  }
+  if (payload.marketType === "futures" && payload.symbol) {
+    knownFuturesSymbols.push(payload.symbol);
+  }
+  if (!payload.marketType && payload.symbol) {
+    try {
+      const resolution = await targetClient.resolveMarket(payload.symbol);
+      if (resolution.marketType === "spot") {
+        knownSpotSymbols.push(resolution.symbol);
+      } else if (resolution.marketType === "futures") {
+        knownFuturesSymbols.push(resolution.symbol);
+      }
+    } catch {
+      // 当前输入框的合约无效时，仍继续同步账户中已经发现的其他合约。
+    }
+  }
+
+  const result = await targetClient.recentAccountOrders({
+    startTime,
+    endTime,
+    limit: 1_000,
+    knownSpotSymbols,
+    knownFuturesSymbols,
   });
+  const chronologicalOrders = [...result.orders].sort((left, right) => {
+    const leftTime = Number(
+      left.time ?? left.updateTime ?? left.transactTime ?? left.T ?? left.E ?? 0
+    );
+    const rightTime = Number(
+      right.time ?? right.updateTime ?? right.transactTime ?? right.T ?? right.E ?? 0
+    );
+    return leftTime - rightTime;
+  });
+  trackOrderPayload(chronologicalOrders, {
+    targetClient,
+    source: "recent-account-orders",
+  });
+  return {
+    ...result,
+    orders: listRecentOrders({}, targetClient),
+  };
 }
 
 function getEnvironmentCredentials(testnet) {
@@ -211,6 +484,11 @@ function createBinanceClient(testnet) {
     depthSpeed: process.env.BINANCE_DEPTH_SPEED || "100ms",
     spotBrokerLinkId: process.env.BINANCE_SPOT_LINK_ID || "",
     futuresBrokerLinkId: process.env.BINANCE_FUTURES_LINK_ID || "",
+    expectedSpotTradeGroupId:
+      process.env.BINANCE_SPOT_EXPECTED_TRADE_GROUP_ID || "",
+    expectedFuturesTradeGroupId:
+      process.env.BINANCE_FUTURES_EXPECTED_TRADE_GROUP_ID || "",
+    rateLimitCoordinator,
     publicMarketFetch: (url, options) => net.fetch(url, options),
     preflightBalanceCheck:
       process.env.BINANCE_PREFLIGHT_BALANCE_CHECK === "true",
@@ -399,6 +677,15 @@ function getClientStatus() {
     depthMode: client.depthMode,
     depthStreamLevels: client.depthStreamLevels,
     depthDisplayLevels: client.depthDisplayLevels,
+    rateLimits: rateLimitCoordinator.snapshot(),
+    futuresDeadMan: futuresDeadManState
+      ? {
+          enabled: true,
+          symbol: futuresDeadManState.symbol,
+          countdownTime: futuresDeadManState.countdownTime,
+          heartbeatMs: futuresDeadManState.heartbeatMs,
+        }
+      : { enabled: false },
     activeMarketType: client.activeMarketType,
     activeSymbol: client.activeSymbol,
     markets: {
@@ -433,6 +720,7 @@ async function switchClientEnvironment(testnet) {
   }
 
   const previousClient = client;
+  clearFuturesDeadManTimer();
   const nextClient = createBinanceClient(testnet);
   bindClientEvents(nextClient);
   client = nextClient;
@@ -589,12 +877,24 @@ function registerIpcHandlers() {
     return safeCall(async () => listRecentOrders(payload || {}));
   });
 
+  ipcMain.handle("binance:trading-rounds", async (_event, payload) => {
+    return safeCall(async () => listTradingRounds(payload || {}));
+  });
+
+  ipcMain.handle("binance:sync-recent-orders", async (_event, payload) => {
+    return safeCall(() => syncRecentAccountOrders(payload || {}));
+  });
+
   ipcMain.handle("binance:my-trades", async (_event, payload) => {
     return safeCall(() => client.myTrades(payload || {}));
   });
 
   ipcMain.handle("binance:account-status", async (_event, payload) => {
     return safeCall(() => client.accountStatus(payload || {}));
+  });
+
+  ipcMain.handle("binance:trading-safety-status", async () => {
+    return safeCall(() => client.tradingSafetyStatus());
   });
 
   ipcMain.handle("binance:account-rate-limits", async (_event, payload) => {
@@ -607,6 +907,10 @@ function registerIpcHandlers() {
 
   ipcMain.handle("binance:sign-tradfi-perps-agreement", async () => {
     return safeCall(() => client.signTradFiPerpsAgreement());
+  });
+
+  ipcMain.handle("binance:set-futures-dead-man", async (_event, payload) => {
+    return safeCall(() => configureFuturesDeadMan(payload || {}));
   });
 
   ipcMain.handle("binance:query-order-list", async (_event, payload) => {
@@ -655,6 +959,7 @@ function registerIpcHandlers() {
 }
 
 function bindClientEvents(targetClient) {
+  let accountReconciliationTimer = null;
   const tradeUpdateCoalescer = createLatestUpdateCoalescer({
     intervalMs: 32,
     send: (data) => {
@@ -694,6 +999,12 @@ function bindClientEvents(targetClient) {
     latencyUpdateCoalescer.push(data);
   });
 
+  targetClient.on("rate-limit-update", (data) => {
+    if (targetClient === client) {
+      sendToRenderer("binance:rate-limit-update", data);
+    }
+  });
+
   targetClient.on("order-state-update", (data) => {
     if (targetClient !== client) return;
     trackOrderPayload(data, {
@@ -717,7 +1028,31 @@ function bindClientEvents(targetClient) {
   });
 
   targetClient.on("user-data-status", (data) => {
-    if (targetClient === client) sendToRenderer("binance:user-data-status", data);
+    if (targetClient !== client) return;
+    sendToRenderer("binance:user-data-status", data);
+    if (data.status === "connected") {
+      clearTimeout(accountReconciliationTimer);
+      accountReconciliationTimer = setTimeout(() => {
+        if (targetClient !== client) return;
+        syncRecentAccountOrders({}, targetClient).then((result) => {
+          if (targetClient === client) {
+            sendToRenderer("binance:recent-orders-synced", {
+              reason: "user-data-connected",
+              ...result,
+            });
+          }
+        }).catch((error) => {
+          if (targetClient === client) {
+            sendToRenderer("binance:user-data-error", {
+              ...serializeError(error),
+              message: `账户事件重连后的订单对账失败：${error.message}`,
+              time: Date.now(),
+            });
+          }
+        });
+      }, 750);
+      accountReconciliationTimer.unref?.();
+    }
   });
 
   targetClient.on("user-data-error", (data) => {
@@ -746,7 +1081,12 @@ app.whenReady().then(async () => {
 });
 
 app.on("before-quit", () => {
+  clearFuturesDeadManTimer();
+  for (const timer of unknownOrderReconciliationTimers) clearTimeout(timer);
+  unknownOrderReconciliationTimers.clear();
   recentOrderStore.close();
+  tradingRoundStore.close();
+  rateLimitCoordinator.close();
   client.close();
 });
 

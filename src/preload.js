@@ -59,16 +59,24 @@ contextBridge.exposeInMainWorld("binance", {
     ipcRenderer.invoke("binance:all-orders", options || {}),
   recentOrders: (options) =>
     ipcRenderer.invoke("binance:recent-orders", options || {}),
+  tradingRounds: (options) =>
+    ipcRenderer.invoke("binance:trading-rounds", options || {}),
+  syncRecentOrders: (options) =>
+    ipcRenderer.invoke("binance:sync-recent-orders", options || {}),
   myTrades: (options) =>
     ipcRenderer.invoke("binance:my-trades", options || {}),
   accountStatus: (options) =>
     ipcRenderer.invoke("binance:account-status", options || {}),
+  tradingSafetyStatus: () =>
+    ipcRenderer.invoke("binance:trading-safety-status"),
   accountRateLimits: (options) =>
     ipcRenderer.invoke("binance:account-rate-limits", options || {}),
   accountCommission: (options) =>
     ipcRenderer.invoke("binance:account-commission", options || {}),
   signTradFiPerpsAgreement: () =>
     ipcRenderer.invoke("binance:sign-tradfi-perps-agreement"),
+  setFuturesDeadMan: (options) =>
+    ipcRenderer.invoke("binance:set-futures-dead-man", options || {}),
   queryOrderList: (options) =>
     ipcRenderer.invoke("binance:query-order-list", options || {}),
   openOrderLists: (options) =>
@@ -96,10 +104,18 @@ contextBridge.exposeInMainWorld("binance", {
     subscribe("binance:market-error", callback),
   onLatencyUpdate: (callback) =>
     subscribe("binance:latency-update", callback),
+  onRateLimitUpdate: (callback) =>
+    subscribe("binance:rate-limit-update", callback),
   onUserDataEvent: (callback) =>
     subscribe("binance:user-data-event", callback),
   onUserDataStatus: (callback) =>
     subscribe("binance:user-data-status", callback),
   onUserDataError: (callback) =>
     subscribe("binance:user-data-error", callback),
+  onRecentOrdersSynced: (callback) =>
+    subscribe("binance:recent-orders-synced", callback),
+  onTradingRoundsUpdate: (callback) =>
+    subscribe("binance:trading-rounds-update", callback),
+  onFuturesDeadManStatus: (callback) =>
+    subscribe("binance:futures-dead-man-status", callback),
 });

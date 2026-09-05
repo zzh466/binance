@@ -10,6 +10,11 @@ const {
   BinanceSpotClient,
   BinanceApiError,
 } = require("./binanceSpotClient");
+const {
+  divideDecimalToStep,
+  isPositiveDecimal,
+  multiplyDecimal,
+} = require("./decimalMath");
 
 const FUTURES_REST_BASE = {
   testnet: "https://demo-fapi.binance.com",
@@ -140,6 +145,23 @@ const FUTURES_TYPE_MAP = {
   TAKE_PROFIT_LIMIT: { type: "TAKE_PROFIT" },
   TAKE_PROFIT: { type: "TAKE_PROFIT_MARKET" },
 };
+const FUTURES_ALGO_ORDER_TYPES = new Set([
+  "STOP",
+  "STOP_MARKET",
+  "TAKE_PROFIT",
+  "TAKE_PROFIT_MARKET",
+  "TRAILING_STOP_MARKET",
+]);
+const FUTURES_PRICE_MATCH_MODES = new Set([
+  "OPPONENT",
+  "OPPONENT_5",
+  "OPPONENT_10",
+  "OPPONENT_20",
+  "QUEUE",
+  "QUEUE_5",
+  "QUEUE_10",
+  "QUEUE_20",
+]);
 
 class BinanceUsdMClient extends BinanceSpotClient {
   constructor(options = {}) {
@@ -182,6 +204,8 @@ class BinanceUsdMClient extends BinanceSpotClient {
     this.positionModeCache = null;
     this.positionModePromise = null;
     this.positionModeEnforcementPromise = null;
+    this.knownAlgoOrderIds = new Set();
+    this.knownAlgoClientOrderIds = new Set();
   }
 
   async initialize() {
@@ -407,6 +431,10 @@ class BinanceUsdMClient extends BinanceSpotClient {
   }
 
   async requestPublicMarketData(method, path, params = {}) {
+    this.guardRateLimit({
+      operation: `${String(method).toUpperCase()} ${path}`,
+      critical: false,
+    });
     const failures = [];
     const transports = {
       electron: () => this.requestPublicMarketDataWithElectron(
@@ -468,6 +496,12 @@ class BinanceUsdMClient extends BinanceSpotClient {
         transport: "electron-net",
         startedAt: requestStartedAt,
         success: response.status >= 200 && response.status < 300,
+        status: response.status,
+      });
+      this.observeRateLimit({
+        headers: response.headers?.entries
+          ? Object.fromEntries(response.headers.entries())
+          : {},
         status: response.status,
       });
       latencyReported = true;
@@ -792,6 +826,7 @@ class BinanceUsdMClient extends BinanceSpotClient {
       "STOP_MARKET",
       "TAKE_PROFIT",
       "TAKE_PROFIT_MARKET",
+      "TRAILING_STOP_MARKET",
     ]);
 
     if (!["BUY", "SELL"].includes(side)) {
@@ -803,8 +838,31 @@ class BinanceUsdMClient extends BinanceSpotClient {
     if (order.icebergQty) {
       throw new BinanceApiError("当前永续接口不支持页面里的 icebergQty 参数。");
     }
-    if (order.trailingDelta) {
+    if (order.trailingDelta && !order.callbackRate) {
       throw new BinanceApiError("永续跟踪止损使用 callbackRate，不能直接使用 Spot trailingDelta。");
+    }
+
+    const positionEffect = String(order.positionEffect || "AUTO").toUpperCase();
+    if (!["AUTO", "OPEN", "CLOSE"].includes(positionEffect)) {
+      throw new BinanceApiError(
+        `U 本位仓位动作只支持 AUTO、OPEN 或 CLOSE，当前值：${positionEffect}`
+      );
+    }
+    const explicitReduceOnly = order.reduceOnly === true ||
+      String(order.reduceOnly || "").toLowerCase() === "true";
+    const closePosition = order.closePosition === true ||
+      String(order.closePosition || "").toLowerCase() === "true";
+    const reduceOnly = positionEffect === "CLOSE" || explicitReduceOnly;
+    if (positionEffect === "OPEN" && explicitReduceOnly) {
+      throw new BinanceApiError("U 本位开仓不能同时启用 reduceOnly。");
+    }
+    if (
+      closePosition &&
+      !["STOP_MARKET", "TAKE_PROFIT_MARKET"].includes(type)
+    ) {
+      throw new BinanceApiError(
+        "closePosition 只适用于 STOP_MARKET 或 TAKE_PROFIT_MARKET 条件平仓。"
+      );
     }
 
     const [positionMode, info] = await Promise.all([
@@ -830,22 +888,85 @@ class BinanceUsdMClient extends BinanceSpotClient {
       positionSide: positionMode.positionSide,
       type,
       selfTradePreventionMode: this.requireSelfTradePrevention(symbolInfo),
-      timeInForce: mapped.timeInForce || order.timeInForce,
+      timeInForce: String(mapped.timeInForce || order.timeInForce || "")
+        .toUpperCase() || undefined,
       quantity: order.quantity,
       quoteOrderQty: order.quoteOrderQty,
       price: order.price,
       stopPrice: order.stopPrice,
+      reduceOnly: reduceOnly && !closePosition ? true : undefined,
+      closePosition: closePosition ? true : undefined,
+      workingType: String(order.workingType || "").toUpperCase() || undefined,
+      priceProtect: order.priceProtect,
+      activationPrice: order.activationPrice,
+      callbackRate: order.callbackRate,
+      goodTillDate: order.goodTillDate,
+      priceMatch: String(order.priceMatch || "").toUpperCase() || undefined,
       newClientOrderId: this.buildBrokerClientOrderId(order.newClientOrderId),
       newOrderRespType: order.newOrderRespType || "ACK",
     });
 
+    if (
+      params.workingType &&
+      !["MARK_PRICE", "CONTRACT_PRICE"].includes(params.workingType)
+    ) {
+      throw new BinanceApiError(
+        "workingType 只支持 MARK_PRICE 或 CONTRACT_PRICE。"
+      );
+    }
+    if (params.priceProtect && !["true", "false"].includes(params.priceProtect)) {
+      throw new BinanceApiError("priceProtect 必须是 true 或 false。");
+    }
+    if (params.priceMatch && !FUTURES_PRICE_MATCH_MODES.has(params.priceMatch)) {
+      throw new BinanceApiError(`U 本位 priceMatch 不支持当前值：${params.priceMatch}`);
+    }
+    if (params.priceMatch && params.price) {
+      throw new BinanceApiError("U 本位 priceMatch 不能与 price 同时发送。");
+    }
+    if (
+      params.priceMatch &&
+      !["LIMIT", "STOP", "TAKE_PROFIT"].includes(type)
+    ) {
+      throw new BinanceApiError("priceMatch 只适用于 LIMIT、STOP 或 TAKE_PROFIT。");
+    }
+    if (
+      (params.activationPrice || params.callbackRate) &&
+      type !== "TRAILING_STOP_MARKET"
+    ) {
+      throw new BinanceApiError(
+        "activationPrice 和 callbackRate 只适用于 TRAILING_STOP_MARKET。"
+      );
+    }
+    if (
+      params.priceProtect &&
+      !["STOP", "STOP_MARKET", "TAKE_PROFIT", "TAKE_PROFIT_MARKET"].includes(type)
+    ) {
+      throw new BinanceApiError("priceProtect 只适用于止损或止盈条件单。");
+    }
+    if (params.goodTillDate && params.timeInForce !== "GTD") {
+      throw new BinanceApiError("goodTillDate 只能与 timeInForce=GTD 一起使用。");
+    }
+    if (params.timeInForce === "GTD") {
+      const goodTillDate = Number(params.goodTillDate);
+      if (!Number.isFinite(goodTillDate) || goodTillDate <= Date.now() + 600_000) {
+        throw new BinanceApiError(
+          "GTD 委托的 goodTillDate 必须晚于当前时间至少 600 秒。"
+        );
+      }
+      params.goodTillDate = String(Math.floor(goodTillDate / 1_000) * 1_000);
+    }
+
     if (type === "LIMIT" || type === "STOP" || type === "TAKE_PROFIT") {
       params.timeInForce ||= "GTC";
     }
-    if ((type === "LIMIT" || type === "STOP" || type === "TAKE_PROFIT") && !params.price) {
+    if (
+      (type === "LIMIT" || type === "STOP" || type === "TAKE_PROFIT") &&
+      !params.price &&
+      !params.priceMatch
+    ) {
       throw new BinanceApiError(`${requestedType} 委托必须提供 price。`);
     }
-    if (!params.quantity && !params.quoteOrderQty) {
+    if (!closePosition && !params.quantity && !params.quoteOrderQty) {
       throw new BinanceApiError("永续委托必须提供 quantity 或 quoteOrderQty。");
     }
     if (params.quantity && params.quoteOrderQty) {
@@ -855,7 +976,17 @@ class BinanceUsdMClient extends BinanceSpotClient {
       this.assertPositiveOrderAmount("订单总价 quoteOrderQty", params.quoteOrderQty);
     }
     if ((type.includes("STOP") || type.includes("TAKE_PROFIT")) && !params.stopPrice) {
-      throw new BinanceApiError(`${requestedType} 委托必须提供 stopPrice。`);
+      if (type !== "TRAILING_STOP_MARKET") {
+        throw new BinanceApiError(`${requestedType} 委托必须提供 stopPrice。`);
+      }
+    }
+    if (type === "TRAILING_STOP_MARKET" && !params.callbackRate) {
+      throw new BinanceApiError("TRAILING_STOP_MARKET 委托必须提供 callbackRate。");
+    }
+    if (closePosition) {
+      delete params.quantity;
+      delete params.quoteOrderQty;
+      delete params.reduceOnly;
     }
     if (type === "MARKET" || type.endsWith("_MARKET")) {
       delete params.price;
@@ -887,7 +1018,34 @@ class BinanceUsdMClient extends BinanceSpotClient {
     if (params.stopPrice && filters.PRICE_FILTER) {
       const original = params.stopPrice;
       params.stopPrice = this.alignToStep(params.stopPrice, filters.PRICE_FILTER.tickSize);
+      this.assertFilterRange(
+        "stopPrice",
+        params.stopPrice,
+        filters.PRICE_FILTER.minPrice,
+        filters.PRICE_FILTER.maxPrice
+      );
       if (original !== params.stopPrice) adjustments.push(`stopPrice: ${original} -> ${params.stopPrice}`);
+    }
+    if (params.activationPrice && filters.PRICE_FILTER) {
+      const original = params.activationPrice;
+      params.activationPrice = this.alignToStep(
+        params.activationPrice,
+        filters.PRICE_FILTER.tickSize
+      );
+      this.assertFilterRange(
+        "activationPrice",
+        params.activationPrice,
+        filters.PRICE_FILTER.minPrice,
+        filters.PRICE_FILTER.maxPrice
+      );
+      if (original !== params.activationPrice) {
+        adjustments.push(
+          `activationPrice: ${original} -> ${params.activationPrice}`
+        );
+      }
+    }
+    if (params.callbackRate) {
+      this.assertFilterRange("callbackRate", params.callbackRate, "0.1", "10");
     }
 
     if (params.quoteOrderQty) {
@@ -896,9 +1054,13 @@ class BinanceUsdMClient extends BinanceSpotClient {
         { value: params.price, source: "委托价" },
         { value: params.stopPrice, source: "触发价" },
       ]);
-      params.quantity = String(
-        Number(requestedQuoteOrderQty) / reference.price
-      );
+      params.quantity = quantityFilter
+        ? divideDecimalToStep(
+            requestedQuoteOrderQty,
+            reference.price,
+            quantityFilter.stepSize
+          )
+        : String(Number(requestedQuoteOrderQty) / Number(reference.price));
       delete params.quoteOrderQty;
       orderSizing = {
         mode: "quote-total",
@@ -909,7 +1071,7 @@ class BinanceUsdMClient extends BinanceSpotClient {
       };
     }
 
-    if (quantityFilter) {
+    if (params.quantity && quantityFilter) {
       const original = params.quantity;
       params.quantity = this.alignToStep(params.quantity, quantityFilter.stepSize);
       this.assertFilterRange(
@@ -931,15 +1093,101 @@ class BinanceUsdMClient extends BinanceSpotClient {
     }
 
     const minNotional = filters.MIN_NOTIONAL?.notional || filters.MIN_NOTIONAL?.minNotional;
-    const notionalReferencePrice = Number(
+    const notionalReferencePrice = String(
       params.price || params.stopPrice || orderSizing.referencePrice || 0
     );
-    const notional = notionalReferencePrice * Number(params.quantity || 0);
-    if (notional > 0 && Number(minNotional) > 0) {
+    const notional = multiplyDecimal(
+      notionalReferencePrice,
+      params.quantity || "0"
+    );
+    if (isPositiveDecimal(notional) && isPositiveDecimal(minNotional)) {
       this.assertFilterRange("订单金额", notional, minNotional, undefined);
     }
 
-    return { params, adjustments, symbolInfo, orderSizing, positionMode };
+    return {
+      params,
+      adjustments,
+      symbolInfo,
+      orderSizing,
+      positionMode,
+      positionEffect,
+      isAlgoOrder: FUTURES_ALGO_ORDER_TYPES.has(type),
+    };
+  }
+
+  toAlgoOrderParams(params) {
+    return this.normalizeParams({
+      algoType: "CONDITIONAL",
+      symbol: params.symbol,
+      side: params.side,
+      positionSide: params.positionSide,
+      type: params.type,
+      timeInForce: params.timeInForce,
+      quantity: params.quantity,
+      reduceOnly: params.reduceOnly,
+      price: params.price,
+      triggerPrice: params.stopPrice,
+      workingType: params.workingType,
+      priceProtect: params.priceProtect,
+      clientAlgoId: params.newClientOrderId,
+      newOrderRespType: params.newOrderRespType,
+      closePosition: params.closePosition,
+      activatePrice: params.activationPrice,
+      callbackRate: params.callbackRate,
+      priceMatch: params.priceMatch,
+      selfTradePreventionMode: params.selfTradePreventionMode,
+      goodTillDate: params.goodTillDate,
+    });
+  }
+
+  normalizeAlgoOrder(order = {}, overrides = {}) {
+    const normalized = {
+      ...order,
+      orderId: order.algoId ?? order.ai ?? order.aid ?? order.orderId,
+      actualOrderId:
+        order.actualOrderId ?? order.actualOrderID ?? order.actualOrder?.orderId,
+      clientOrderId:
+        order.clientAlgoId ?? order.caid ?? order.clientOrderId ?? order.c,
+      symbol: order.symbol ?? order.s,
+      side: order.side ?? order.S,
+      type: order.orderType ?? order.type ?? order.o,
+      status: order.algoStatus ?? order.status ?? order.X,
+      price: order.price ?? order.p ?? "0",
+      stopPrice: order.triggerPrice ?? order.stopPrice ?? order.sp ?? "0",
+      origQty: order.quantity ?? order.origQty ?? order.q ?? "0",
+      executedQty:
+        order.executedQty ?? order.actualExecutedQty ?? order.z ?? "0",
+      reduceOnly: order.reduceOnly ?? order.R,
+      closePosition: order.closePosition ?? order.cp,
+      updateTime:
+        order.updateTime ?? order.T ?? order.E ?? order.createTime ?? Date.now(),
+      algoOrder: true,
+      marketType: this.marketType,
+      ...overrides,
+    };
+    if (normalized.orderId !== undefined && normalized.orderId !== null) {
+      this.knownAlgoOrderIds.add(String(normalized.orderId));
+    }
+    if (normalized.clientOrderId) {
+      this.knownAlgoClientOrderIds.add(String(normalized.clientOrderId));
+    }
+    return normalized;
+  }
+
+  isKnownAlgoOrder({ orderId, origClientOrderId, algoId, clientAlgoId } = {}) {
+    const resolvedOrderId = algoId ?? orderId;
+    const resolvedClientOrderId = clientAlgoId ?? origClientOrderId;
+    return Boolean(
+      (resolvedOrderId !== undefined &&
+        this.knownAlgoOrderIds.has(String(resolvedOrderId))) ||
+      (resolvedClientOrderId &&
+        this.knownAlgoClientOrderIds.has(String(resolvedClientOrderId)))
+    );
+  }
+
+  isOrderNotFoundError(error) {
+    return [-2011, -2013].includes(Number(error?.code)) ||
+      /unknown order|order does not exist/i.test(error?.message || "");
   }
 
   async placeOrder(
@@ -950,7 +1198,14 @@ class BinanceUsdMClient extends BinanceSpotClient {
       forcePositionModeRefresh = false,
     } = {}
   ) {
-    const { params, adjustments, orderSizing, positionMode } =
+    const {
+      params,
+      adjustments,
+      orderSizing,
+      positionMode,
+      positionEffect,
+      isAlgoOrder,
+    } =
       await this.prepareOrder(order, { forcePositionModeRefresh });
     let result;
     let transport;
@@ -959,6 +1214,22 @@ class BinanceUsdMClient extends BinanceSpotClient {
       if (testOnly) {
         result = await this.signedRest("POST", "/fapi/v1/order/test", params);
         transport = "https-keepalive";
+      } else if (isAlgoOrder) {
+        const algoParams = this.toAlgoOrderParams(params);
+        ({ result, transport, fallbackReason } =
+          await this.requestWsApiWithRestFallback(
+            "algoOrder.place",
+            algoParams,
+            () => this.request(
+              "POST",
+              "/fapi/v1/algoOrder",
+              algoParams,
+              true,
+              this.tradingRestBase
+            ),
+            { retrySafe: false, waitForWebSocketReady: true }
+          ));
+        result = this.normalizeAlgoOrder(result);
       } else {
         ({ result, transport, fallbackReason } =
           await this.requestWsApiWithRestFallback(
@@ -998,6 +1269,9 @@ class BinanceUsdMClient extends BinanceSpotClient {
       orderSizing,
       positionMode: positionMode.positionMode,
       positionSide: positionMode.positionSide,
+      positionEffect,
+      reduceOnly: params.reduceOnly === "true",
+      algoOrder: isAlgoOrder && !testOnly,
       selfTradePrevention: {
         mode: this.selfTradePreventionMode,
         enforced: true,
@@ -1020,8 +1294,16 @@ class BinanceUsdMClient extends BinanceSpotClient {
       orderId,
       origClientOrderId,
     };
-    const { result, transport, fallbackReason } =
-      await this.requestWsApiWithRestFallback(
+    if (this.isKnownAlgoOrder(params)) {
+      return this.cancelAlgoOrder({
+        symbol: params.symbol,
+        algoId: orderId,
+        clientAlgoId: origClientOrderId,
+      });
+    }
+    let response;
+    try {
+      response = await this.requestWsApiWithRestFallback(
         "order.cancel",
         params,
         () => this.request(
@@ -1032,6 +1314,15 @@ class BinanceUsdMClient extends BinanceSpotClient {
           this.tradingRestBase
         )
       );
+    } catch (error) {
+      if (!this.isOrderNotFoundError(error)) throw error;
+      return this.cancelAlgoOrder({
+        symbol: params.symbol,
+        algoId: orderId,
+        clientAlgoId: origClientOrderId,
+      });
+    }
+    const { result, transport, fallbackReason } = response;
     return {
       ...result,
       marketType: this.marketType,
@@ -1044,25 +1335,52 @@ class BinanceUsdMClient extends BinanceSpotClient {
     if (!orderId && !origClientOrderId) {
       throw new BinanceApiError("查询单笔订单必须提供 orderId 或 origClientOrderId。");
     }
-    return this.signedWsOrRest("order.status", "GET", "/fapi/v1/order", {
-      symbol: this.validateSymbol(symbol),
-      orderId,
-      origClientOrderId,
-    });
+    if (this.isKnownAlgoOrder({ orderId, origClientOrderId })) {
+      return this.queryAlgoOrder({
+        algoId: orderId,
+        clientAlgoId: origClientOrderId,
+      });
+    }
+    try {
+      return await this.signedWsOrRest("order.status", "GET", "/fapi/v1/order", {
+        symbol: this.validateSymbol(symbol),
+        orderId,
+        origClientOrderId,
+      });
+    } catch (error) {
+      if (!this.isOrderNotFoundError(error)) throw error;
+      return this.queryAlgoOrder({
+        algoId: orderId,
+        clientAlgoId: origClientOrderId,
+      });
+    }
   }
 
   async openOrders({ symbol } = {}) {
-    return this.signedRest("GET", "/fapi/v1/openOrders", {
-      symbol: symbol ? this.validateSymbol(symbol) : undefined,
-    });
+    const normalizedSymbol = symbol ? this.validateSymbol(symbol) : undefined;
+    const [regularOrders, algoOrders] = await Promise.all([
+      this.signedRest("GET", "/fapi/v1/openOrders", {
+        symbol: normalizedSymbol,
+      }),
+      this.openAlgoOrders({ symbol: normalizedSymbol }),
+    ]);
+    return [
+      ...regularOrders,
+      ...algoOrders,
+    ];
   }
 
   async cancelAllOpenOrders({ symbol }) {
     const normalizedSymbol = this.validateSymbol(symbol);
     const existing = await this.openOrders({ symbol: normalizedSymbol });
-    await this.signedRest("DELETE", "/fapi/v1/allOpenOrders", {
-      symbol: normalizedSymbol,
-    });
+    await Promise.all([
+      this.signedRest("DELETE", "/fapi/v1/allOpenOrders", {
+        symbol: normalizedSymbol,
+      }),
+      this.signedRest("DELETE", "/fapi/v1/algoOpenOrders", {
+        symbol: normalizedSymbol,
+      }),
+    ]);
     return existing.map((order) => ({
       ...order,
       status: "CANCELED",
@@ -1127,12 +1445,68 @@ class BinanceUsdMClient extends BinanceSpotClient {
 
   async allOrders({ symbol, orderId, startTime, endTime, limit = 100 } = {}) {
     return this.signedRest("GET", "/fapi/v1/allOrders", {
-      symbol: this.validateSymbol(symbol),
+      symbol: symbol ? this.validateSymbol(symbol) : undefined,
       orderId,
       startTime,
       endTime,
       limit,
     });
+  }
+
+  async queryAlgoOrder({ algoId, clientAlgoId } = {}) {
+    if (!algoId && !clientAlgoId) {
+      throw new BinanceApiError(
+        "查询 U 本位 Algo Order 必须提供 algoId 或 clientAlgoId。"
+      );
+    }
+    const order = await this.signedRest("GET", "/fapi/v1/algoOrder", {
+      algoId,
+      clientAlgoId,
+    });
+    return this.normalizeAlgoOrder(order);
+  }
+
+  async cancelAlgoOrder({ symbol, algoId, clientAlgoId } = {}) {
+    if (!algoId && !clientAlgoId) {
+      throw new BinanceApiError(
+        "撤销 U 本位 Algo Order 必须提供 algoId 或 clientAlgoId。"
+      );
+    }
+    const result = await this.signedRest("DELETE", "/fapi/v1/algoOrder", {
+      algoId,
+      clientAlgoId,
+    });
+    return this.normalizeAlgoOrder(result, {
+      symbol: symbol ? this.validateSymbol(symbol) : result.symbol,
+      status: "CANCELED",
+      updateTime: Date.now(),
+    });
+  }
+
+  async openAlgoOrders({ symbol, algoId } = {}) {
+    const orders = await this.signedRest("GET", "/fapi/v1/openAlgoOrders", {
+      algoType: "CONDITIONAL",
+      symbol: symbol ? this.validateSymbol(symbol) : undefined,
+      algoId,
+    });
+    return orders.map((order) => this.normalizeAlgoOrder(order));
+  }
+
+  async allAlgoOrders({
+    symbol,
+    algoId,
+    startTime,
+    endTime,
+    limit = 100,
+  } = {}) {
+    const orders = await this.signedRest("GET", "/fapi/v1/allAlgoOrders", {
+      symbol: this.validateSymbol(symbol),
+      algoId,
+      startTime,
+      endTime,
+      limit,
+    });
+    return orders.map((order) => this.normalizeAlgoOrder(order));
   }
 
   async myTrades({ symbol, orderId, startTime, endTime, fromId, limit = 100 } = {}) {
@@ -1222,7 +1596,88 @@ class BinanceUsdMClient extends BinanceSpotClient {
     return this.signedRest("GET", "/fapi/v1/rateLimit/order");
   }
 
+  async setCountdownCancelAll({ symbol, countdownTime }) {
+    const normalizedCountdown = Math.floor(Number(countdownTime));
+    if (
+      !Number.isFinite(normalizedCountdown) ||
+      normalizedCountdown < 0 ||
+      normalizedCountdown > 600_000
+    ) {
+      throw new BinanceApiError(
+        "U 本位自动撤单 countdownTime 必须是 0-600000 毫秒。"
+      );
+    }
+    return this.signedRest("POST", "/fapi/v1/countdownCancelAll", {
+      symbol: this.validateSymbol(symbol),
+      countdownTime: normalizedCountdown,
+    });
+  }
+
   normalizeFuturesUserEvent(message) {
+    if (message.e === "ALGO_UPDATE") {
+      const order = message.o || message.ao || message.a || {};
+      const normalized = this.normalizeAlgoOrder(order, {
+        updateTime: order.updateTime ?? order.T ?? message.T ?? message.E,
+      });
+      return {
+        e: "executionReport",
+        E: message.E,
+        T: message.T ?? normalized.updateTime,
+        s: normalized.symbol,
+        c: normalized.clientOrderId,
+        S: normalized.side,
+        o: normalized.type,
+        f: order.timeInForce ?? order.f,
+        q: normalized.origQty,
+        p: normalized.price,
+        P: normalized.stopPrice,
+        x: order.executionType ?? order.x ?? normalized.status,
+        X: normalized.status,
+        i: normalized.orderId,
+        actualOrderId: normalized.actualOrderId,
+        l: order.lastExecutedQty ?? order.l ?? "0",
+        z: normalized.executedQty,
+        L: order.lastExecutedPrice ?? order.L ?? "0",
+        ps: order.positionSide ?? order.ps,
+        positionSide: order.positionSide ?? order.ps,
+        R: order.reduceOnly ?? order.R,
+        reduceOnly: order.reduceOnly ?? order.R,
+        cp: order.closePosition ?? order.cp,
+        closePosition: order.closePosition ?? order.cp,
+        algoOrder: true,
+        marketType: this.marketType,
+        rawEvent: message,
+      };
+    }
+    if (message.e === "CONDITIONAL_ORDER_TRIGGER_REJECT") {
+      const order = message.or || message.o || message.order || {};
+      const normalized = this.normalizeAlgoOrder(order, {
+        status: "REJECTED",
+        updateTime: message.T ?? message.E,
+      });
+      return {
+        e: "executionReport",
+        E: message.E,
+        T: message.T ?? message.E,
+        s: normalized.symbol,
+        c: normalized.clientOrderId,
+        S: normalized.side,
+        o: normalized.type,
+        q: normalized.origQty,
+        p: normalized.price,
+        P: normalized.stopPrice,
+        x: "REJECTED",
+        X: "REJECTED",
+        i: normalized.orderId,
+        r: order.rejectReason ?? order.r ?? message.r ?? "条件单触发被拒绝",
+        algoOrder: true,
+        marketType: this.marketType,
+        rawEvent: message,
+      };
+    }
+    if (message.e === "TRADE_LITE") {
+      return { ...message, marketType: this.marketType, lite: true };
+    }
     if (message.e !== "ORDER_TRADE_UPDATE" || !message.o) return message;
     const order = message.o;
     return {
@@ -1248,6 +1703,10 @@ class BinanceUsdMClient extends BinanceSpotClient {
       t: order.t,
       ps: order.ps,
       positionSide: order.ps,
+      R: order.R,
+      reduceOnly: order.R,
+      cp: order.cp,
+      closePosition: order.cp,
       marketType: this.marketType,
       rawEvent: message,
     };

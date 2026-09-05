@@ -8,22 +8,27 @@
 - 根据唯一的“全局合约”自动识别 Spot / USDⓈ-M，并将行情、普通下单、撤单和查询路由到对应市场；只存在于 Futures 的 `SKHYUSDT` 无需手动选择市场。
 - `exchangeInfo` 交易规则与过滤器展示。
 - 最新价、最优买卖、平均价、24 小时行情、最近成交、聚合成交和 K 线。
-- REST 深度快照 + WebSocket 增量维护本地订单簿。
+- 行情深度使用 Binance 原生 `@depth10@100ms` 十档部分深度流，不再维护默认 1000 档订单簿；最新成交价使用独立逐笔成交流更新。
 - `LIMIT`、`MARKET`、`LIMIT_MAKER`、止盈止损类普通订单。
 - 普通下单可选择“按数量”或“按总价”：现货 `MARKET` 直接发送 `quoteOrderQty`；现货其他类型和 USDⓈ-M 按委托价、触发价或最新成交价换算并按 `stepSize` 修正数量。USDⓈ-M 总价表示名义价值，不是保证金金额。
 - 所有普通委托、撤单重报和 Spot OCO/OTO/OTOCO 固定携带 `selfTradePreventionMode=EXPIRE_MAKER`。账户信息会显示当前市场账户接口返回的 `tradeGroupId`：跨子账号现货 STP 只有在各账号属于相同且非 `-1` 的交易组时生效。USDⓈ-M 官方只保证该模式在 `IOC/GTC/GTD` 下有效，因此 `MARKET` 和映射为 `GTX` 的 `LIMIT_MAKER` 不应被视为具有同等保护。
 - 正式环境支持为当前 U 本位 API Key 所属子账号签署 TradFi-Perps 协议；可在“账户信息”中主动签署，下单收到 `Please sign TradFi-Perps agreement contract fapi` 时也会弹出二次确认并在签署成功后重试原委托。协议不会在程序启动时静默签署，Testnet 不调用该正式环境接口。
 - `/api/v3/order/test` 测试下单（只校验，不进入撮合引擎）。
-- 下单前按 `PRICE_FILTER`、`LOT_SIZE`、`MIN_NOTIONAL/NOTIONAL`、`PERCENT_PRICE(_BY_SIDE)` 校验，并按 tickSize/stepSize 修正精度。
+- 下单前按 `PRICE_FILTER`、`LOT_SIZE`、`MIN_NOTIONAL/NOTIONAL`、`PERCENT_PRICE(_BY_SIDE)` 校验，并使用十进制定点运算按 tickSize/stepSize 修正精度，避免 JavaScript 浮点误差改变价格、数量或名义价值。
 - 单笔撤单、全部撤单、当前挂单、单笔订单、全部订单、减量改单、撤单重报。
 - 账户信息、成交历史、手续费率和下单限频。
 - OCO、OTO、OTOCO 创建；组合订单历史、当前组合挂单、单笔查询和撤销。
-- Spot 与 USDⓈ-M User Data Stream 实时接收订单、成交和账户事件，永续订单事件会转换为页面统一使用的 `executionReport`，断线自动重连。
+- Spot 与 USDⓈ-M User Data Stream 实时接收订单、成交和账户事件，永续普通订单、Algo 条件单及轻量成交事件会转换为页面统一使用的订单状态；断线重连后自动执行最近 24 小时全账户快照对账，补齐断线期间的事件。
+- 当前账户最近 24 小时订单统一保存在本地状态库：U 本位补齐普通订单及 Algo 条件单，现货从全市场挂单发现合约，再并发补查本地已知合约的历史订单；查询达到单次上限时按时间区间继续拆分，避免静默截断。
+- “交易回合”按实际成交增量持久化：开多与平空计入多向，开空与平多计入空向；同一合约两向成交量相等时结束当前回合，反向超出的成交量自动进入下一回合。部分成交按累计成交量差额记账，重复 WebSocket 事件、手动刷新和程序重启不会重复累计。
+- U 本位止损、止盈和追踪止损使用 Binance Algo Order 接口，页面查询与撤单会自动识别普通订单或 Algo Order。
 - Spot 与 USDⓈ-M 分别维护独立的交易 WebSocket API 持久连接；官方支持的下单、撤单、改单、订单及账户查询优先走 WebSocket，连接不可用时自动回退到 HTTPS Keep-Alive，并在后台指数退避重连。若真实下单已经写入 WebSocket 但响应丢失，程序不会用 HTTP 盲目重报，以避免重复委托，而是返回 `UNKNOWN` 提醒查询订单状态。
 - 报单和撤单只在收到 Binance 成功响应或 `executionReport` 后更新行情图，不使用本地乐观状态；确认后立即重绘。
-- 页面顶部提供“系统 / 配置”菜单；“配置 → 快捷键”以列表维护按键、动作、方向、超价和手数，支持新增、编辑、删除与恢复默认。设置保存在本机的 `~/Library/Application Support/Binance统一交易台/shortcut-settings.json`。
+- 页面顶部提供“系统 / 配置”菜单；“配置 → 快捷键”以列表维护按键、动作、方向、超价和手数，支持新增、编辑、删除与恢复默认。设置保存在系统应用数据目录的 `Binance统一交易台/shortcut-settings.json`（macOS 为 Application Support，Windows 为 AppData）。
 - 行情图上方只保留一个“全局合约”输入框；行情、下单、撤单、订单与成交查询、手续费和组合订单等功能统一读取该合约，点击“切换行情”或按 Enter 可重连行情。
 - 所有请求在“执行结果与错误”展示毫秒级耗时。
+- 多开实例通过系统应用数据目录中的独立快照共享 Binance 请求权重和订单频率计数；接近上限时只暂缓非关键查询，为下单与撤单预留容量，收到 418/429 时按 `Retry-After` 统一暂停请求。
+- U 本位可选“断线自动撤单”：程序周期续期 `/fapi/v1/countdownCancelAll`，网络或进程停止后由 Binance 在倒计时到期时撤销指定合约挂单。
 
 ## 配置
 
@@ -44,11 +49,13 @@ BINANCE_TESTNET_FUTURES_API_SECRET=你的_Futures_Testnet_API_Secret
 BINANCE_PRODUCTION_FUTURES_API_KEY=你的_Futures_正式环境_API_Key
 BINANCE_PRODUCTION_FUTURES_API_SECRET=你的_Futures_正式环境_API_Secret
 BINANCE_PREFLIGHT_BALANCE_CHECK=false
+BINANCE_SPOT_EXPECTED_TRADE_GROUP_ID=
+BINANCE_FUTURES_EXPECTED_TRADE_GROUP_ID=
 ```
 
 `BINANCE_TESTNET` 决定程序启动时的默认环境。页面最上方的“环境切换”开关可以在当前运行期间切换 Testnet 和正式环境：程序会关闭旧环境的 Spot / USDⓈ-M 连接，清空页面中的旧环境状态，再自动识别并重连当前合约。切换到正式环境前会弹出确认提示。
 
-Testnet 和正式环境的 API Key 不通用，因此推荐分别配置。USDⓈ-M Testnet 通常还需要单独申请 Futures Demo Key；未填写 Futures 专用变量时，程序会尝试复用同环境凭证。为兼容旧版，`BINANCE_API_KEY` 和 `BINANCE_API_SECRET` 仍可使用，但只会应用于 `BINANCE_TESTNET` 指定的启动默认环境。未配置目标市场密钥时仍能查看公开行情，但不能查询私有账户、下单或撤单。
+Testnet 和正式环境的 API Key 不通用，因此推荐分别配置。USDⓈ-M Testnet 通常还需要单独申请 Futures Demo Key；未填写 Futures 专用变量时，程序会尝试复用同环境凭证。为兼容旧版，`BINANCE_API_KEY` 和 `BINANCE_API_SECRET` 仍可使用，但只会应用于 `BINANCE_TESTNET` 指定的启动默认环境。未配置目标市场密钥时仍能查看公开行情，但不能查询私有账户、下单或撤单。多子账号使用 STP 时，可填写两个 `EXPECTED_TRADE_GROUP_ID`，程序会将账户接口返回值与预期交易组核对；这只能发现配置问题，不能替代 Binance 后台为子账号配置相同交易组。
 
 仅凭 `BTCUSDT` 这样的文本无法区分同名 Spot 与永续市场。为保持现有交易行为，symbol 同时存在于两个市场时默认选择 Spot；只存在于 USDⓈ-M 的 symbol 会自动选择 Futures。Futures Testnet 的合约列表不保证与正式环境一致，因此 `SKHYUSDT` 可能只能在正式环境查看。
 
@@ -105,7 +112,7 @@ npm run build:win
 ## 当前边界
 
 - USDⓈ-M 已覆盖行情、普通下单、测试下单、撤单、当前挂单、订单历史、成交历史、账户与手续费；OCO、OTO、OTOCO 仍为 Spot 专属功能。
-- 不包含 COIN-M、杠杆账户和持仓模式/杠杆倍数配置界面；永续下单沿用账户当前的持仓模式和杠杆设置。
-- 没有数据库持久化、跨进程审计日志和多账户管理。
+- 不包含 COIN-M、杠杆账户和杠杆倍数配置界面；U 本位交易固定使用单向持仓模式，下单窗口可明确选择开仓或只减仓平仓。
+- 最近 24 小时订单、交易回合、快捷键和跨实例限流快照会保存为本地 JSON；仍没有长期数据库、完整审计日志和应用内多账户切换管理。
 - 未实现 SOR、OPO/OPOCO、批量订单、FIX/SBE 等专业接口。
 - 页面提供 OCO/OTO/OTOCO 常用参数组合；更复杂的追踪止损、冰山及挂钩价格参数仍需扩展表单。

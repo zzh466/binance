@@ -809,10 +809,15 @@ const elements = {
   tradeHistoryEnvironment: document.querySelector("#tradeHistoryEnvironment"),
   accountEnvironment: document.querySelector("#accountEnvironment"),
   credentials: document.querySelector("#credentials"),
+  stpSafetyStatus: document.querySelector("#stpSafetyStatus"),
   chartOpenOrderStatus: document.querySelector("#chartOpenOrderStatus"),
   marketStatus: document.querySelector("#marketStatus"),
   timeOffset: document.querySelector("#timeOffset"),
   depthConfig: document.querySelector("#depthConfig"),
+  rateLimitStatus: document.querySelector("#rateLimitStatus"),
+  futuresDeadManToggle: document.querySelector("#futuresDeadManToggle"),
+  futuresDeadManCountdown: document.querySelector("#futuresDeadManCountdown"),
+  futuresDeadManStatus: document.querySelector("#futuresDeadManStatus"),
   klineInterval: document.querySelector("#klineInterval"),
   overviewStatus: document.querySelector("#overviewStatus"),
   overviewLastPrice: document.querySelector("#overviewLastPrice"),
@@ -840,6 +845,7 @@ const elements = {
   bidRows: document.querySelector("#bidRows"),
   askRows: document.querySelector("#askRows"),
   side: document.querySelector("#side"),
+  positionEffect: document.querySelector("#positionEffect"),
   orderType: document.querySelector("#orderType"),
   orderSizingMode: document.querySelector("#orderSizingMode"),
   quantityOrderLabel: document.querySelector("#quantityOrderLabel"),
@@ -859,6 +865,11 @@ const elements = {
   ),
   orderHistoryStatus: document.querySelector("#orderHistoryStatus"),
   orderHistoryBody: document.querySelector("#orderHistoryBody"),
+  refreshTradingRoundsButton: document.querySelector(
+    "#refreshTradingRoundsButton"
+  ),
+  tradingRoundsStatus: document.querySelector("#tradingRoundsStatus"),
+  tradingRoundsBody: document.querySelector("#tradingRoundsBody"),
   refreshTradeHistoryButton: document.querySelector(
     "#refreshTradeHistoryButton"
   ),
@@ -900,6 +911,7 @@ const elements = {
 let activeEnvironmentTestnet = true;
 let environmentSwitchBusy = false;
 let tradFiAgreementBusy = false;
+const tradingRoundsById = new Map();
 
 function printResult(title, result) {
   const elapsedMs = Number(result?.elapsedMs);
@@ -1043,8 +1055,8 @@ function renderOrders(orders, container = elements.orderHistoryBody) {
   if (!orders.length) {
     const row = document.createElement("tr");
     const cell = document.createElement("td");
-    cell.colSpan = 9;
-    cell.textContent = "当前交易对没有可展示的普通订单";
+    cell.colSpan = 10;
+    cell.textContent = "当前账户最近 24 小时没有可展示的普通订单";
     row.append(cell);
     container.append(row);
     return;
@@ -1053,6 +1065,7 @@ function renderOrders(orders, container = elements.orderHistoryBody) {
   for (const order of orders) {
     const row = document.createElement("tr");
     const orderId = document.createElement("td");
+    const marketType = document.createElement("td");
     const symbol = document.createElement("td");
     const side = document.createElement("td");
     const type = document.createElement("td");
@@ -1064,6 +1077,7 @@ function renderOrders(orders, container = elements.orderHistoryBody) {
 
     orderId.className = "numeric";
     orderId.textContent = order.orderId ?? "-";
+    marketType.textContent = getMarketLabel(order.marketType);
     symbol.textContent = order.symbol || "-";
     side.textContent = order.side || "-";
     type.textContent = order.type || "-";
@@ -1077,6 +1091,7 @@ function renderOrders(orders, container = elements.orderHistoryBody) {
 
     row.append(
       orderId,
+      marketType,
       symbol,
       side,
       type,
@@ -1087,6 +1102,71 @@ function renderOrders(orders, container = elements.orderHistoryBody) {
       updateTime
     );
     container.append(row);
+  }
+}
+
+function formatRoundRemainder(round) {
+  if (round.status === "COMPLETED") return "已配平";
+  if (round.remainingDirection === "LONG") {
+    return `还需空向 ${round.remainingQty}`;
+  }
+  if (round.remainingDirection === "SHORT") {
+    return `还需多向 ${round.remainingQty}`;
+  }
+  return "-";
+}
+
+function renderTradingRounds(rounds, { merge = false } = {}) {
+  if (!merge) tradingRoundsById.clear();
+  for (const round of rounds) {
+    if (round?.id) tradingRoundsById.set(round.id, round);
+  }
+  const visibleRounds = [...tradingRoundsById.values()].sort(
+    (left, right) => {
+      const createdAtDifference =
+        Number(right.createdAt || 0) - Number(left.createdAt || 0);
+      if (createdAtDifference !== 0) return createdAtDifference;
+      const sequenceDifference =
+        Number(right.creationSequence || 0) -
+        Number(left.creationSequence || 0);
+      if (sequenceDifference !== 0) return sequenceDifference;
+      return String(right.id || "").localeCompare(String(left.id || ""));
+    }
+  );
+  elements.tradingRoundsBody.replaceChildren();
+  if (!visibleRounds.length) {
+    const row = document.createElement("tr");
+    const cell = document.createElement("td");
+    cell.colSpan = 13;
+    cell.textContent = "当前账户还没有记录到实际成交回合";
+    row.append(cell);
+    elements.tradingRoundsBody.append(row);
+    return;
+  }
+
+  for (const round of visibleRounds) {
+    const row = document.createElement("tr");
+    const values = [
+      String(round.id || "-").slice(0, 8),
+      getMarketLabel(round.marketType),
+      round.symbol || "-",
+      round.status === "COMPLETED" ? "已完成" : "进行中",
+      round.openLongQty || "0",
+      round.closeShortQty || "0",
+      round.openShortQty || "0",
+      round.closeLongQty || "0",
+      round.longQty || "0",
+      round.shortQty || "0",
+      formatRoundRemainder(round),
+      formatOrderTime(round.createdAt),
+      round.completedAt ? formatOrderTime(round.completedAt) : "-",
+    ];
+    for (const value of values) {
+      const cell = document.createElement("td");
+      cell.textContent = value;
+      row.append(cell);
+    }
+    elements.tradingRoundsBody.append(row);
   }
 }
 
@@ -1357,6 +1437,7 @@ function readOrderForm() {
   const order = {
     symbol: getSelectedSymbol(),
     side: elements.side.value,
+    positionEffect: elements.positionEffect.value,
     type,
     price: elements.price.value.trim(),
     stopPrice: elements.stopPrice.value.trim(),
@@ -1386,6 +1467,33 @@ function updateOrderSizingFields() {
 
 elements.orderSizingMode.addEventListener("change", updateOrderSizingFields);
 updateOrderSizingFields();
+
+elements.futuresDeadManToggle.addEventListener("change", async () => {
+  const enabled = elements.futuresDeadManToggle.checked;
+  if (enabled && !window.confirm(
+    "启用后，如果程序或网络停止续期，Binance 会自动撤销当前 U 本位合约的挂单。是否继续？"
+  )) {
+    elements.futuresDeadManToggle.checked = false;
+    return;
+  }
+  elements.futuresDeadManToggle.disabled = true;
+  const result = await window.binance.setFuturesDeadMan({
+    enabled,
+    symbol: getSelectedSymbol(),
+    countdownTime: elements.futuresDeadManCountdown.value,
+    heartbeatMs: 30_000,
+  });
+  elements.futuresDeadManToggle.disabled = false;
+  if (!result.ok) {
+    elements.futuresDeadManToggle.checked = !enabled;
+    elements.futuresDeadManStatus.textContent = formatError(result);
+    printResult("U 本位断线自动撤单设置失败", result);
+    return;
+  }
+  elements.futuresDeadManStatus.textContent = enabled
+    ? `${result.data.symbol} 已启用，倒计时 ${result.data.countdownTime} ms`
+    : `${result.data.symbol} 已停用`;
+});
 
 async function loadStatus() {
   const result = await window.binance.getStatus();
@@ -1417,7 +1525,7 @@ async function loadStatus() {
     ? "Binance Testnet"
     : "Binance Production";
   elements.tradingEnvironment.textContent = "按全局合约自动路由";
-  elements.orderHistoryEnvironment.textContent = "按全局合约自动路由";
+  elements.orderHistoryEnvironment.textContent = "现货 + U 本位全账户汇总";
   elements.tradeHistoryEnvironment.textContent = "按全局合约自动路由";
   elements.accountEnvironment.textContent = "按全局合约自动路由";
   const spotCredentialsReady = Boolean(
@@ -1435,6 +1543,53 @@ async function loadStatus() {
   elements.depthConfig.textContent =
     `${status.depthSpeed} / 部分深度流 ${status.depthStreamLevels || 10} 档 / ` +
     `显示 ${status.depthDisplayLevels || 10} 档`;
+  renderRateLimitStatus(status.rateLimits);
+  elements.futuresDeadManToggle.checked = Boolean(status.futuresDeadMan?.enabled);
+  elements.futuresDeadManStatus.textContent = status.futuresDeadMan?.enabled
+    ? `${status.futuresDeadMan.symbol} 已启用，倒计时 ${status.futuresDeadMan.countdownTime} ms`
+    : "未启用；断线后 Binance 不会自动撤单";
+
+  window.binance.tradingSafetyStatus().then((safetyResult) => {
+    if (!safetyResult.ok) {
+      elements.stpSafetyStatus.textContent = `校验失败：${formatError(safetyResult)}`;
+      return;
+    }
+    const safety = safetyResult.data;
+    const labels = ["spot", "futures"].map((marketType) => {
+      const market = safety.markets?.[marketType];
+      const label = getMarketLabel(marketType);
+      if (!market?.configured) return `${label} 未配置`;
+      if (!market.verified) return `${label} 校验失败`;
+      return `${label} tradeGroupId=${market.tradeGroupId}`;
+    });
+    elements.stpSafetyStatus.textContent = [
+      ...labels,
+      safety.crossAccountReady ? "跨子账号已就绪" : "请检查警告",
+      ...(safety.warnings || []),
+    ].join(" / ");
+  }).catch((error) => {
+    elements.stpSafetyStatus.textContent = `校验异常：${error.message}`;
+  });
+}
+
+function renderRateLimitStatus(snapshot) {
+  const limits = Array.isArray(snapshot?.limits) ? snapshot.limits : [];
+  if (!limits.length) {
+    elements.rateLimitStatus.textContent = "等待 Binance 返回计数";
+    return;
+  }
+  const items = limits.map((limit) => {
+    const label = limit.rateLimitType === "ORDERS" ? "订单" : "请求权重";
+    const maximum = limit.limit || "?";
+    const stale = limit.active === false ? "（上一周期）" : "";
+    return `${getMarketLabel(limit.marketType)} ${label} ${limit.count}/${maximum}${stale}`;
+  });
+  if (snapshot.banUntil) {
+    items.push(`限制至 ${new Date(snapshot.banUntil).toLocaleTimeString("zh-CN", { hour12: false })}`);
+  } else if (snapshot.nearLimit) {
+    items.push("接近上限，非关键查询已暂缓");
+  }
+  elements.rateLimitStatus.textContent = items.join(" / ");
 }
 
 elements.environmentSwitch.addEventListener("change", async () => {
@@ -1691,40 +1846,72 @@ document
     if (result.ok) applyOpenOrderUpdate(result.data);
   });
 
-async function refreshOrderHistory(symbol, { showResult = true } = {}) {
+async function refreshOrderHistory(
+  symbol,
+  { showResult = true, syncAccount = true } = {}
+) {
   elements.refreshOrderHistoryButton.disabled = true;
   elements.orderHistoryStatus.textContent = "加载中…";
 
   try {
-    const result = await window.binance.allOrders({
-      symbol,
-      limit: 100,
-    });
-    if (showResult) printResult("普通订单记录结果", result);
+    const syncResult = syncAccount
+      ? await window.binance.syncRecentOrders({
+        symbol,
+        ...(chartMarketType ? { marketType: chartMarketType } : {}),
+      })
+      : null;
+    if (showResult && syncResult) {
+      const printableResult = syncResult.ok
+        ? {
+          ...syncResult,
+          data: {
+            ...syncResult.data,
+            orderCount: syncResult.data.orders?.length || 0,
+            orders: undefined,
+          },
+        }
+        : syncResult;
+      printResult("最近 24 小时全账户订单同步结果", printableResult);
+    }
 
-    const storedResult = await window.binance.recentOrders({
-      symbol,
-      ...(chartMarketType ? { marketType: chartMarketType } : {}),
-    });
+    const storedResult = syncResult?.ok
+      ? { ok: true, data: syncResult.data.orders }
+      : await window.binance.recentOrders({});
     if (storedResult.ok) {
       const storedOrders = Array.isArray(storedResult.data)
         ? storedResult.data
         : [];
       renderOrders(storedOrders);
-      elements.orderHistoryStatus.textContent = result.ok
-        ? `本地保存最近 24 小时 ${storedOrders.length} 条 / ${new Date().toLocaleString()}`
-        : `已显示本地保存的 ${storedOrders.length} 条；Binance 同步失败：${formatError(result)}`;
+      if (!syncResult) {
+        elements.orderHistoryStatus.textContent =
+          `订单事件已更新，本地最近 24 小时 ${storedOrders.length} 条 / ${new Date().toLocaleString()}`;
+      } else if (syncResult.ok) {
+        const spotMarket = syncResult.data.markets?.spot || {};
+        const futuresMarket = syncResult.data.markets?.futures || {};
+        const spotText = spotMarket.configured
+          ? `现货已知合约 ${spotMarket.symbols?.length || 0} 个`
+          : "现货未配置";
+        const futuresText = !futuresMarket.configured
+          ? "U 本位未配置"
+          : futuresMarket.queryMode === "all-symbols"
+            ? "U 本位全合约"
+            : `U 本位已知合约 ${futuresMarket.symbols?.length || 0} 个`;
+        const warningCount = syncResult.data.warnings?.length || 0;
+        elements.orderHistoryStatus.textContent = [
+          `全账户最近 24 小时 ${storedOrders.length} 条`,
+          spotText,
+          futuresText,
+          warningCount ? `${warningCount} 项同步警告` : "同步完成",
+          new Date().toLocaleString(),
+        ].join(" / ");
+      } else {
+        elements.orderHistoryStatus.textContent =
+          `已显示本地保存的 ${storedOrders.length} 条；Binance 全账户同步失败：${formatError(syncResult)}`;
+      }
       return;
     }
 
-    if (!result.ok) {
-      elements.orderHistoryStatus.textContent = formatError(result);
-      return;
-    }
-
-    const orders = Array.isArray(result.data) ? result.data : [];
-    renderOrders(orders);
-    elements.orderHistoryStatus.textContent = `已加载 ${orders.length} 条 / ${new Date().toLocaleString()}`;
+    elements.orderHistoryStatus.textContent = formatError(storedResult);
   } catch (error) {
     elements.orderHistoryStatus.textContent = error.message || "加载失败";
     printResult("读取普通订单记录异常", { message: error.message });
@@ -1735,6 +1922,35 @@ async function refreshOrderHistory(symbol, { showResult = true } = {}) {
 
 elements.refreshOrderHistoryButton.addEventListener("click", () => {
   refreshOrderHistory(getSelectedSymbol());
+});
+
+async function refreshTradingRounds({ showResult = false } = {}) {
+  elements.refreshTradingRoundsButton.disabled = true;
+  elements.tradingRoundsStatus.textContent = "加载中…";
+  try {
+    const result = await window.binance.tradingRounds({});
+    if (showResult) printResult("交易回合列表", result);
+    if (!result.ok) {
+      elements.tradingRoundsStatus.textContent = formatError(result);
+      return;
+    }
+    const rounds = Array.isArray(result.data) ? result.data : [];
+    renderTradingRounds(rounds);
+    const openCount = rounds.filter((round) => round.status === "OPEN").length;
+    const completedCount = rounds.length - openCount;
+    elements.tradingRoundsStatus.textContent =
+      `进行中 ${openCount} 个 / 已完成 ${completedCount} 个 / ` +
+      new Date().toLocaleString();
+  } catch (error) {
+    elements.tradingRoundsStatus.textContent = error.message || "加载失败";
+    printResult("读取交易回合异常", { message: error.message });
+  } finally {
+    elements.refreshTradingRoundsButton.disabled = false;
+  }
+}
+
+elements.refreshTradingRoundsButton.addEventListener("click", () => {
+  refreshTradingRounds({ showResult: true });
 });
 
 async function refreshTradeHistory(symbol, { showResult = true } = {}) {
@@ -2489,6 +2705,7 @@ async function placeOrderFromNumpad(shortcut) {
   }
 
   elements.side.value = side;
+  elements.positionEffect.value = "OPEN";
   elements.orderType.value = "LIMIT";
   elements.orderSizingMode.value = quoteTotalMode ? "quote-total" : "quantity";
   updateOrderSizingFields();
@@ -2502,6 +2719,7 @@ async function placeOrderFromNumpad(shortcut) {
   const order = {
     symbol,
     side,
+    positionEffect: "OPEN",
     type: "LIMIT",
     price,
     timeInForce: "GTC",
@@ -2617,7 +2835,10 @@ function scheduleExecutionReportRefresh() {
     const symbol = getSelectedSymbol();
     if (!symbol) return;
     Promise.all([
-      refreshOrderHistory(symbol, { showResult: false }),
+      refreshOrderHistory(symbol, {
+        showResult: false,
+        syncAccount: false,
+      }),
       refreshTradeHistory(symbol, { showResult: false }),
     ]).catch((error) => {
       printResult("账户事件自动刷新异常", {
@@ -2629,7 +2850,8 @@ function scheduleExecutionReportRefresh() {
 }
 
 function openOrderKey(order) {
-  return `${order.marketType || "auto"}:${order.symbol}:${order.orderId}`;
+  return `${order.marketType || "auto"}:${order.symbol}:` +
+    `${order.algoOrder ? "algo" : "order"}:${order.orderId}`;
 }
 
 function normalizeOpenOrder(order, receivedAt = Date.now()) {
@@ -2647,6 +2869,7 @@ function normalizeOpenOrder(order, receivedAt = Date.now()) {
     executedQty: String(order.executedQty ?? order.z ?? "0"),
     updateTime: Number(order.updateTime ?? order.T ?? order.E ?? Date.now()),
     receivedAt,
+    algoOrder: order.algoOrder === true,
   };
 
   return normalized.symbol && normalized.orderId !== undefined
@@ -2918,6 +3141,10 @@ window.binance.onLatencyUpdate((latency) => {
   elements.binanceLatencyBar.title = text;
 });
 
+window.binance.onRateLimitUpdate((snapshot) => {
+  renderRateLimitStatus(snapshot);
+});
+
 window.binance.onUserDataEvent((payload) => {
   prependUserDataEvent(payload);
   if (payload.event?.e === "executionReport") {
@@ -2940,6 +3167,40 @@ window.binance.onUserDataEvent((payload) => {
     applyOpenOrderUpdate(routedEvent, payload.receivedAt);
     scheduleExecutionReportRefresh(payload.event);
   }
+  if (payload.event?.e === "TRADE_LITE") {
+    scheduleExecutionReportRefresh(payload.event);
+  }
+});
+
+window.binance.onRecentOrdersSynced((payload) => {
+  if (!Array.isArray(payload?.orders)) return;
+  renderOrders(payload.orders, elements.orderHistoryBody, { includeMarket: true });
+  elements.orderHistoryStatus.textContent =
+    `后台对账完成，共 ${payload.orders.length} 笔最近 24 小时订单`;
+});
+
+window.binance.onTradingRoundsUpdate((payload) => {
+  if (!Array.isArray(payload?.rounds)) return;
+  renderTradingRounds(payload.rounds, { merge: Boolean(payload.partial) });
+  const allRounds = [...tradingRoundsById.values()];
+  const openCount = allRounds.filter(
+    (round) => round.status === "OPEN"
+  ).length;
+  elements.tradingRoundsStatus.textContent =
+    `成交已更新 / 进行中 ${openCount} 个 / ` +
+    `${new Date(payload.time || Date.now()).toLocaleString()}`;
+});
+
+window.binance.onFuturesDeadManStatus((status) => {
+  if (status.error) {
+    elements.futuresDeadManStatus.textContent =
+      `${status.symbol} 续期失败：${status.error.message}`;
+    return;
+  }
+  elements.futuresDeadManStatus.textContent = status.enabled
+    ? `${status.symbol} 已续期；倒计时 ${status.countdownTime} ms；` +
+      `最近心跳 ${new Date(status.time).toLocaleTimeString("zh-CN", { hour12: false })}`
+    : `${status.symbol} 已停用`;
 });
 
 window.binance.onUserDataStatus((status) => {
@@ -2982,6 +3243,7 @@ window.binance.onUserDataError((error) => {
 async function initializeApp() {
   await initializeShortcutSettings();
   await loadStatus();
+  await refreshTradingRounds();
 
   const switchResultText = sessionStorage.getItem(
     "binanceEnvironmentSwitchResult"
