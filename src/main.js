@@ -28,6 +28,15 @@ const {
   TradingRoundStore,
   compareRoundsNewestFirst,
 } = require("./tradingRoundStore");
+const {
+  CLIENT_VERSION,
+  ManagerClientService,
+  getAccountChoices,
+  getAccountApiKey,
+  resolveSelectedAccount,
+  sanitizeManagerUserInfo,
+} = require("./managerClientService");
+const { buildAccountOverview } = require("./accountOverview");
 
 function loadEnvironmentFile() {
   const packagedEnvironmentPath = getPackagedEnvironmentPath({
@@ -59,7 +68,13 @@ if (instanceId) {
 }
 
 let mainWindow = null;
+let loginWindow = null;
 let latestBinanceLatency = null;
+let runtimeAccountCredentials = null;
+let runtimeBrokerLinkIds = null;
+let authenticatedManagerSession = null;
+let authenticatedManagerUserInfo = null;
+let pendingManagerLogin = null;
 const defaultTestnet = process.env.BINANCE_TESTNET !== "false";
 const shortcutConfigPath = path.join(
   app.getPath("appData"),
@@ -80,6 +95,9 @@ const rateLimitCoordinator = new SharedRateLimitCoordinator(
 );
 const unknownOrderReconciliationTimers = new Set();
 let futuresDeadManState = null;
+const managerClientService = new ManagerClientService({
+  fetchImpl: (url, options) => net.fetch(url, options),
+});
 
 function fingerprintApiKey(apiKey) {
   const value = String(apiKey || "");
@@ -436,6 +454,13 @@ async function syncRecentAccountOrders(payload = {}, targetClient = client) {
 }
 
 function getEnvironmentCredentials(testnet) {
+  if (runtimeAccountCredentials) {
+    return {
+      ...runtimeAccountCredentials,
+      source: "MANAGER_ACCOUNT",
+    };
+  }
+
   const prefix = testnet ? "BINANCE_TESTNET" : "BINANCE_PRODUCTION";
   const apiKey = process.env[`${prefix}_API_KEY`] || "";
   const apiSecret = process.env[`${prefix}_API_SECRET`] || "";
@@ -458,6 +483,13 @@ function getEnvironmentCredentials(testnet) {
 }
 
 function getFuturesCredentials(testnet) {
+  if (runtimeAccountCredentials) {
+    return {
+      ...runtimeAccountCredentials,
+      source: "MANAGER_ACCOUNT（Spot 与 USDⓈ-M 共用）",
+    };
+  }
+
   const prefix = testnet ? "BINANCE_TESTNET" : "BINANCE_PRODUCTION";
   const apiKey = process.env[`${prefix}_FUTURES_API_KEY`] || "";
   const apiSecret = process.env[`${prefix}_FUTURES_API_SECRET`] || "";
@@ -482,8 +514,12 @@ function createBinanceClient(testnet) {
     futuresCredentials,
     testnet,
     depthSpeed: process.env.BINANCE_DEPTH_SPEED || "100ms",
-    spotBrokerLinkId: process.env.BINANCE_SPOT_LINK_ID || "",
-    futuresBrokerLinkId: process.env.BINANCE_FUTURES_LINK_ID || "",
+    spotBrokerLinkId:
+      runtimeBrokerLinkIds?.BINANCE_SPOT_LINK_ID ||
+      process.env.BINANCE_SPOT_LINK_ID || "",
+    futuresBrokerLinkId:
+      runtimeBrokerLinkIds?.BINANCE_FUTURES_LINK_ID ||
+      process.env.BINANCE_FUTURES_LINK_ID || "",
     expectedSpotTradeGroupId:
       process.env.BINANCE_SPOT_EXPECTED_TRADE_GROUP_ID || "",
     expectedFuturesTradeGroupId:
@@ -495,7 +531,7 @@ function createBinanceClient(testnet) {
   });
 }
 
-let client = createBinanceClient(defaultTestnet);
+let client = null;
 
 function openAdditionalInstances(count = 2) {
   const normalizedCount = Math.min(2, Math.max(1, Number(count) || 2));
@@ -530,6 +566,11 @@ function openAdditionalInstances(count = 2) {
 }
 
 function createWindow() {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.show();
+    mainWindow.focus();
+    return mainWindow;
+  }
   mainWindow = new BrowserWindow({
     width: 1080,
     height: 820,
@@ -549,6 +590,7 @@ function createWindow() {
     if (latestBinanceLatency) {
       sendToRenderer("binance:latency-update", latestBinanceLatency);
     }
+    sendAccountOverviewToRenderer();
     const activeClient = client;
     if (hasAnyTradingCredentials(activeClient)) {
       connectUserDataInBackground(activeClient);
@@ -558,6 +600,98 @@ function createWindow() {
   mainWindow.on("closed", () => {
     mainWindow = null;
   });
+  return mainWindow;
+}
+
+function createLoginWindow() {
+  if (loginWindow && !loginWindow.isDestroyed()) {
+    loginWindow.show();
+    loginWindow.focus();
+    return loginWindow;
+  }
+  loginWindow = new BrowserWindow({
+    width: 520,
+    height: 520,
+    minWidth: 440,
+    minHeight: 460,
+    resizable: true,
+    show: false,
+    webPreferences: {
+      preload: path.join(__dirname, "loginPreload.js"),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+    },
+  });
+  loginWindow.loadFile(path.join(__dirname, "login.html"));
+  loginWindow.once("ready-to-show", () => loginWindow.show());
+  loginWindow.on("closed", () => {
+    loginWindow = null;
+    pendingManagerLogin = null;
+  });
+  return loginWindow;
+}
+
+function getManagerAccountSummary(loginResponse, userInfo, account, device) {
+  return {
+    id: userInfo.vtpUserId ?? loginResponse.id,
+    userNm: userInfo.vtpUserNm ?? loginResponse.userNm,
+    userAccount: loginResponse.userAccount ?? userInfo.vtpUserAccount,
+    groupId: userInfo.groupId ?? loginResponse.groupId,
+    locked: loginResponse.locked ?? userInfo.vtpLocked,
+    thrRealProfit:
+      loginResponse.thrRealProfit ?? userInfo.vtpThrRealProfit,
+    realProfit: loginResponse.realProfit ?? userInfo.realProfit,
+    futureAccountId: account.id,
+    futureUserName: account.futureUserName,
+    clientVersion: CLIENT_VERSION,
+    networkInterface: device.name,
+    userMAC: device.mac,
+  };
+}
+
+async function enterTradingConsole(loginResponse, userInfo, account, device) {
+  const apiKey = getAccountApiKey(account);
+  const apiSecret = String(account.futureUserPwd || "").trim();
+  if (!apiKey || !apiSecret) {
+    throw new TypeError("所选账号缺少 Binance API Key 或 Secret。");
+  }
+
+  const tradingConfiguration =
+    await managerClientService.getTradingConfiguration();
+  runtimeAccountCredentials = { apiKey, apiSecret };
+  runtimeBrokerLinkIds = tradingConfiguration;
+
+  const nextClient = createBinanceClient(defaultTestnet);
+  client = nextClient;
+  bindClientEvents(nextClient);
+  let initializationWarning = null;
+  try {
+    await nextClient.initialize();
+  } catch (error) {
+    initializationWarning = serializeError(error);
+  }
+
+  authenticatedManagerSession = getManagerAccountSummary(
+    loginResponse,
+    userInfo,
+    account,
+    device
+  );
+  authenticatedManagerUserInfo = sanitizeManagerUserInfo(
+    userInfo,
+    String(account.futureUserName || "")
+  );
+  pendingManagerLogin = null;
+  createWindow();
+  setImmediate(() => {
+    if (loginWindow && !loginWindow.isDestroyed()) loginWindow.close();
+  });
+  return {
+    authenticated: true,
+    account: authenticatedManagerSession,
+    initializationWarning,
+  };
 }
 
 function getUserDataEventStatus(event = {}) {
@@ -629,6 +763,18 @@ function sendToRenderer(channel, payload) {
   }
 }
 
+function getAccountOverview() {
+  return buildAccountOverview({
+    session: authenticatedManagerSession,
+    userInfo: authenticatedManagerUserInfo,
+    latency: latestBinanceLatency,
+  });
+}
+
+function sendAccountOverviewToRenderer() {
+  sendToRenderer("manager:account-overview-update", getAccountOverview());
+}
+
 function serializeError(error) {
   return {
     name: error?.name || "Error",
@@ -661,6 +807,10 @@ async function safeCall(action) {
 
 function getClientStatus() {
   return {
+    clientVersion: CLIENT_VERSION,
+    managerAccount: authenticatedManagerSession,
+    managerUserInfo: authenticatedManagerUserInfo,
+    accountOverview: getAccountOverview(),
     testnet: client.testnet,
     restBase: client.restBase,
     tradingRestBase: client.tradingRestBase,
@@ -726,6 +876,7 @@ async function switchClientEnvironment(testnet) {
   client = nextClient;
   latestBinanceLatency = null;
   sendToRenderer("binance:latency-update", null);
+  sendAccountOverviewToRenderer();
   previousClient.close();
 
   let initializationWarning = null;
@@ -747,6 +898,75 @@ async function switchClientEnvironment(testnet) {
 }
 
 function registerIpcHandlers() {
+  ipcMain.handle("manager:login-context", async () => {
+    return safeCall(async () => {
+      const device = managerClientService.getDeviceIdentity();
+      return {
+        clientVersion: CLIENT_VERSION,
+        networkInterface: device.name,
+        userMAC: device.mac,
+      };
+    });
+  });
+
+  ipcMain.handle("manager:login", async (_event, payload) => {
+    return safeCall(async () => {
+      pendingManagerLogin = null;
+      const { response, userInfo, device } = await managerClientService.login({
+        userNm: payload?.userNm,
+        userPwd: payload?.userPwd,
+      });
+      const accounts = getAccountChoices(userInfo);
+      if (accounts.length === 1) {
+        const account = resolveSelectedAccount(userInfo, accounts[0].accountKey);
+        return enterTradingConsole(response, userInfo, account, device);
+      }
+
+      const selectionToken = crypto.randomUUID();
+      pendingManagerLogin = {
+        selectionToken,
+        response,
+        userInfo,
+        device,
+      };
+      return {
+        authenticated: false,
+        requiresSelection: true,
+        selectionToken,
+        accounts,
+      };
+    });
+  });
+
+  ipcMain.handle("manager:select-account", async (_event, payload) => {
+    return safeCall(async () => {
+      if (
+        !pendingManagerLogin ||
+        payload?.selectionToken !== pendingManagerLogin.selectionToken
+      ) {
+        throw new TypeError("账号选择已失效，请重新登录。");
+      }
+      const { response, userInfo, device } = pendingManagerLogin;
+      const account = resolveSelectedAccount(userInfo, payload?.accountKey);
+      return enterTradingConsole(response, userInfo, account, device);
+    });
+  });
+
+  ipcMain.handle("manager:user-info", async () => {
+    return safeCall(async () => {
+      if (!authenticatedManagerSession || !client) {
+        throw new TypeError("当前客户端尚未登录管理端。");
+      }
+      const userInfo = await managerClientService.getUserInfo();
+      authenticatedManagerUserInfo = sanitizeManagerUserInfo(
+        userInfo,
+        authenticatedManagerSession.futureUserName
+      );
+      sendAccountOverviewToRenderer();
+      return authenticatedManagerUserInfo;
+    });
+  });
+
   ipcMain.handle("app:load-shortcut-settings", async (_event, payload) => {
     return safeCall(async () => ({
       settings: readShortcutConfig(shortcutConfigPath, {
@@ -973,6 +1193,7 @@ function bindClientEvents(targetClient) {
     send: (data) => {
       if (targetClient === client) {
         sendToRenderer("binance:latency-update", data);
+        sendAccountOverviewToRenderer();
       }
     },
   });
@@ -1060,22 +1281,18 @@ function bindClientEvents(targetClient) {
   });
 }
 
-bindClientEvents(client);
-
 registerIpcHandlers();
 
-app.whenReady().then(async () => {
-  try {
-    await client.initialize();
-  } catch (error) {
-    console.error("Binance server time synchronization failed:", error);
-  }
-
-  createWindow();
+app.whenReady().then(() => {
+  createLoginWindow();
 
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) {
-      createWindow();
+      if (authenticatedManagerSession && client) {
+        createWindow();
+      } else {
+        createLoginWindow();
+      }
     }
   });
 });
@@ -1087,7 +1304,7 @@ app.on("before-quit", () => {
   recentOrderStore.close();
   tradingRoundStore.close();
   rateLimitCoordinator.close();
-  client.close();
+  client?.close();
 });
 
 app.on("window-all-closed", () => {

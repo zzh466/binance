@@ -4,6 +4,10 @@
 
 ## 已实现功能
 
+- 启动时先登录新期管理端，客户端版本固定为 `990812b`；登录请求自动选择本机网卡 MAC，Windows 优先“以太网/以太网 2”，macOS 优先 `en0/en1` 并避开 WireGuard 等虚拟网卡。
+- 管理端只返回一个 Binance 账号时直接进入主窗口；返回多个账号时只向选择窗口展示 `futureUserName`，用户确认后才创建 Binance 客户端。API Key/Secret 只保存在主进程内存，不下发页面、不写入本地配置。
+- 登录成功后立即调用管理端 `/user/info`，账号选择和运行时凭证以该接口返回的完整账号列表为准；`futureUserID`、`futureUserPwd` 分别作为 API Key、Secret。主页面可刷新并展示余额、保证金、持仓/平仓盈利、实际盈利、开仓量、委托量和手续费，但不会接收密钥或授权码。
+- 现货和 U 本位 LinkID 从管理端系统配置 `BINANCE_SPOT_LINK_ID`、`BINANCE_FUTURES_LINK_ID` 动态读取。
 - REST 连通性和服务器时间同步。
 - 根据唯一的“全局合约”自动识别 Spot / USDⓈ-M，并将行情、普通下单、撤单和查询路由到对应市场；只存在于 Futures 的 `SKHYUSDT` 无需手动选择市场。
 - `exchangeInfo` 交易规则与过滤器展示。
@@ -56,6 +60,8 @@ BINANCE_FUTURES_EXPECTED_TRADE_GROUP_ID=
 `BINANCE_TESTNET` 决定程序启动时的默认环境。页面最上方的“环境切换”开关可以在当前运行期间切换 Testnet 和正式环境：程序会关闭旧环境的 Spot / USDⓈ-M 连接，清空页面中的旧环境状态，再自动识别并重连当前合约。切换到正式环境前会弹出确认提示。
 
 Testnet 和正式环境的 API Key 不通用，因此推荐分别配置。USDⓈ-M Testnet 通常还需要单独申请 Futures Demo Key；未填写 Futures 专用变量时，程序会尝试复用同环境凭证。为兼容旧版，`BINANCE_API_KEY` 和 `BINANCE_API_SECRET` 仍可使用，但只会应用于 `BINANCE_TESTNET` 指定的启动默认环境。未配置目标市场密钥时仍能查看公开行情，但不能查询私有账户、下单或撤单。多子账号使用 STP 时，可填写两个 `EXPECTED_TRADE_GROUP_ID`，程序会将账户接口返回值与预期交易组核对；这只能发现配置问题，不能替代 Binance 后台为子账号配置相同交易组。
+
+正常启动必须先通过新期管理端登录。登录成功后，所选管理端账号在当前会话中覆盖本地全部 Binance 凭证，管理端系统配置覆盖本地两个 LinkID；切换 Testnet/正式环境只改变服务地址，不会暗中切换回 `.env` 中的其他账号。不属于目标环境的 Key 会由 Binance 明确拒绝。当前管理端地址为 HTTP，用户名、密码和返回的交易密钥在传输链路上没有 HTTPS 加密，生产使用前应由服务端升级为 HTTPS。
 
 仅凭 `BTCUSDT` 这样的文本无法区分同名 Spot 与永续市场。为保持现有交易行为，symbol 同时存在于两个市场时默认选择 Spot；只存在于 USDⓈ-M 的 symbol 会自动选择 Futures。Futures Testnet 的合约列表不保证与正式环境一致，因此 `SKHYUSDT` 可能只能在正式环境查看。
 

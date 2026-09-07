@@ -803,6 +803,19 @@ const elements = {
   environmentSwitch: document.querySelector("#environmentSwitch"),
   environmentSwitchStatus: document.querySelector("#environmentSwitchStatus"),
   environmentWarning: document.querySelector("#environmentWarning"),
+  accountOverviewBody: document.querySelector("#accountOverviewBody"),
+  managerAccount: document.querySelector("#managerAccount"),
+  refreshManagerUserInfoButton: document.querySelector(
+    "#refreshManagerUserInfoButton"
+  ),
+  managerUserInfoStatus: document.querySelector("#managerUserInfoStatus"),
+  managerUserName: document.querySelector("#managerUserName"),
+  managerUserAccount: document.querySelector("#managerUserAccount"),
+  managerGroupId: document.querySelector("#managerGroupId"),
+  managerProfitThreshold: document.querySelector("#managerProfitThreshold"),
+  managerPoints: document.querySelector("#managerPoints"),
+  managerRealProfit: document.querySelector("#managerRealProfit"),
+  managerAccountsBody: document.querySelector("#managerAccountsBody"),
   environment: document.querySelector("#environment"),
   tradingEnvironment: document.querySelector("#tradingEnvironment"),
   orderHistoryEnvironment: document.querySelector("#orderHistoryEnvironment"),
@@ -1505,6 +1518,19 @@ async function loadStatus() {
   }
 
   const status = result.data;
+  const managerAccount = status.managerAccount || {};
+  elements.managerAccount.textContent = [
+    managerAccount.userNm || managerAccount.userAccount || "未知用户",
+    managerAccount.futureUserName || "未知交易账号",
+    managerAccount.groupId === undefined || managerAccount.groupId === null
+      ? null
+      : `组 ${managerAccount.groupId}`,
+    `客户端 ${status.clientVersion || "未知版本"}`,
+  ].filter(Boolean).join(" / ");
+  renderManagerUserInfo(status.managerUserInfo || {});
+  renderAccountOverview(status.accountOverview);
+  elements.managerUserInfoStatus.textContent =
+    `登录时已加载 ${status.managerUserInfo?.accounts?.length || 0} 个账号`;
   activeEnvironmentTestnet = Boolean(status.testnet);
   elements.signTradFiAgreementButton.disabled = activeEnvironmentTestnet;
   elements.tradFiAgreementStatus.textContent = activeEnvironmentTestnet
@@ -1591,6 +1617,148 @@ function renderRateLimitStatus(snapshot) {
   }
   elements.rateLimitStatus.textContent = items.join(" / ");
 }
+
+function formatManagerMetric(value) {
+  return value === undefined || value === null || value === ""
+    ? "-"
+    : String(value);
+}
+
+function renderAccountOverview(overview) {
+  elements.accountOverviewBody.replaceChildren();
+  if (!overview) {
+    const row = document.createElement("tr");
+    const cell = document.createElement("td");
+    cell.colSpan = 11;
+    cell.textContent = "尚未获取到账号信息";
+    row.append(cell);
+    elements.accountOverviewBody.append(row);
+    return;
+  }
+
+  const row = document.createElement("tr");
+  const valuesBeforeConnection = [
+    overview.account,
+    overview.managementStatus,
+    overview.currentAccount,
+  ];
+  for (const value of valuesBeforeConnection) {
+    const cell = document.createElement("td");
+    cell.textContent = formatManagerMetric(value);
+    row.append(cell);
+  }
+
+  const connectionCell = document.createElement("td");
+  const connectionStatus = document.createElement("span");
+  const allowedTones = new Set(["fast", "medium", "slow", "offline"]);
+  const connectionTone = allowedTones.has(overview.connectionTone)
+    ? overview.connectionTone
+    : "offline";
+  connectionStatus.className =
+    `account-connection-status account-connection-${connectionTone}`;
+  connectionStatus.textContent = overview.connectionStatus || "离线";
+  const latencyMs = Number(overview.connectionLatencyMs);
+  connectionStatus.title = Number.isFinite(latencyMs)
+    ? `最近一次 Binance 接口延迟：${latencyMs.toFixed(3)} ms`
+    : "尚未建立 Binance 连接或最近一次连接失败";
+  connectionCell.append(connectionStatus);
+  row.append(connectionCell);
+
+  const valuesAfterConnection = [
+    overview.commission,
+    overview.currentAccountProfit,
+    overview.settlementError,
+    overview.actualProfit,
+    overview.liquidationLine,
+    overview.availableFunds,
+    overview.totalActualProfit,
+  ];
+  for (const value of valuesAfterConnection) {
+    const cell = document.createElement("td");
+    cell.textContent = formatManagerMetric(value);
+    row.append(cell);
+  }
+  elements.accountOverviewBody.append(row);
+}
+
+function renderManagerUserInfo(userInfo = {}) {
+  elements.managerUserName.textContent = formatManagerMetric(userInfo.vtpUserNm);
+  elements.managerUserAccount.textContent = formatManagerMetric(
+    userInfo.vtpUserAccount
+  );
+  elements.managerGroupId.textContent = formatManagerMetric(userInfo.groupId);
+  elements.managerProfitThreshold.textContent = formatManagerMetric(
+    userInfo.vtpThrRealProfit
+  );
+  elements.managerPoints.textContent = formatManagerMetric(userInfo.vtpPoints);
+  elements.managerRealProfit.textContent = formatManagerMetric(
+    userInfo.realProfit
+  );
+
+  const accounts = Array.isArray(userInfo.accounts) ? userInfo.accounts : [];
+  elements.managerAccountsBody.replaceChildren();
+  if (!accounts.length) {
+    const row = document.createElement("tr");
+    const cell = document.createElement("td");
+    cell.colSpan = 14;
+    cell.textContent = "管理端没有返回账号信息";
+    row.append(cell);
+    elements.managerAccountsBody.append(row);
+    return;
+  }
+
+  for (const account of accounts) {
+    const row = document.createElement("tr");
+    if (account.selected) row.className = "manager-selected-account";
+    const values = [
+      account.selected ? "当前" : "-",
+      account.futureUserName,
+      account.futureAccountStatus,
+      account.staticBalance,
+      account.balance,
+      account.available,
+      account.margin,
+      account.positionProfit,
+      account.closeProfit,
+      account.realProfit,
+      account.openVolume,
+      account.orderVolume,
+      account.qryCommission,
+      account.tradeProxyCode,
+    ];
+    for (const value of values) {
+      const cell = document.createElement("td");
+      cell.textContent = formatManagerMetric(value);
+      row.append(cell);
+    }
+    elements.managerAccountsBody.append(row);
+  }
+}
+
+async function refreshManagerUserInfo({ showResult = true } = {}) {
+  elements.refreshManagerUserInfoButton.disabled = true;
+  elements.managerUserInfoStatus.textContent = "正在从管理端刷新…";
+  try {
+    const result = await window.binance.managerUserInfo();
+    if (showResult) printResult("管理端用户与账户信息", result);
+    if (!result.ok) {
+      elements.managerUserInfoStatus.textContent = formatError(result);
+      return;
+    }
+    renderManagerUserInfo(result.data);
+    elements.managerUserInfoStatus.textContent =
+      `已加载 ${result.data.accounts?.length || 0} 个账号 / ` +
+      new Date().toLocaleString();
+  } catch (error) {
+    elements.managerUserInfoStatus.textContent = error?.message || "刷新失败";
+  } finally {
+    elements.refreshManagerUserInfoButton.disabled = false;
+  }
+}
+
+elements.refreshManagerUserInfoButton.addEventListener("click", () => {
+  refreshManagerUserInfo();
+});
 
 elements.environmentSwitch.addEventListener("change", async () => {
   if (environmentSwitchBusy) return;
@@ -3139,6 +3307,10 @@ window.binance.onLatencyUpdate((latency) => {
   const text = parts.join(" · ");
   elements.binanceLatencyBar.textContent = text;
   elements.binanceLatencyBar.title = text;
+});
+
+window.binance.onAccountOverviewUpdate((overview) => {
+  renderAccountOverview(overview);
 });
 
 window.binance.onRateLimitUpdate((snapshot) => {

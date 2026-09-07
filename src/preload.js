@@ -20,6 +20,7 @@ contextBridge.exposeInMainWorld("binance", {
     ipcRenderer.invoke("app:load-shortcut-settings", { fallbackSettings }),
   saveShortcutSettings: (settings) =>
     ipcRenderer.invoke("app:save-shortcut-settings", { settings }),
+  managerUserInfo: () => ipcRenderer.invoke("manager:user-info"),
   getStatus: () => ipcRenderer.invoke("binance:get-status"),
   switchEnvironment: (testnet) =>
     ipcRenderer.invoke("binance:switch-environment", { testnet }),
@@ -104,6 +105,8 @@ contextBridge.exposeInMainWorld("binance", {
     subscribe("binance:market-error", callback),
   onLatencyUpdate: (callback) =>
     subscribe("binance:latency-update", callback),
+  onAccountOverviewUpdate: (callback) =>
+    subscribe("manager:account-overview-update", callback),
   onRateLimitUpdate: (callback) =>
     subscribe("binance:rate-limit-update", callback),
   onUserDataEvent: (callback) =>

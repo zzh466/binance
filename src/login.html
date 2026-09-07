@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'none'; img-src 'self' data:"
+    />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>登录新期币安交易客户端</title>
+    <style>
+      :root {
+        font-family: Inter, "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+        color-scheme: light dark;
+      }
+
+      * { box-sizing: border-box; }
+
+      body {
+        min-height: 100vh;
+        margin: 0;
+        display: grid;
+        place-items: center;
+        padding: 28px;
+        background:
+          radial-gradient(circle at 18% 10%, rgb(22 119 255 / 18%), transparent 38%),
+          Canvas;
+        color: CanvasText;
+      }
+
+      main {
+        width: min(420px, 100%);
+        padding: 28px;
+        border: 1px solid color-mix(in srgb, CanvasText 20%, transparent);
+        border-radius: 16px;
+        background: color-mix(in srgb, Canvas 96%, CanvasText 4%);
+        box-shadow: 0 22px 60px rgb(0 0 0 / 22%);
+      }
+
+      h1 { margin: 0 0 8px; font-size: 24px; }
+      .subtitle { margin: 0 0 24px; opacity: 0.68; }
+      label { display: block; margin: 14px 0 6px; font-weight: 600; }
+
+      input, button {
+        width: 100%;
+        min-height: 42px;
+        border: 1px solid color-mix(in srgb, CanvasText 28%, transparent);
+        border-radius: 8px;
+        font: inherit;
+      }
+
+      input { padding: 9px 11px; background: Canvas; color: CanvasText; }
+      button { margin-top: 20px; border: 0; background: #1677ff; color: white; font-weight: 700; cursor: pointer; }
+      button:disabled { cursor: wait; opacity: 0.58; }
+
+      .device {
+        margin-top: 20px;
+        padding: 10px 12px;
+        border-radius: 8px;
+        background: color-mix(in srgb, CanvasText 7%, transparent);
+        font-size: 13px;
+        line-height: 1.7;
+      }
+
+      .status { min-height: 22px; margin: 14px 0 0; color: #d71920; font-size: 13px; }
+      .status.success { color: #14804a; }
+      .security-note { margin: 12px 0 0; font-size: 12px; opacity: 0.58; }
+
+      dialog {
+        width: min(440px, calc(100vw - 40px));
+        padding: 0;
+        border: 1px solid color-mix(in srgb, CanvasText 24%, transparent);
+        border-radius: 14px;
+        background: Canvas;
+        color: CanvasText;
+        box-shadow: 0 24px 70px rgb(0 0 0 / 35%);
+      }
+      dialog::backdrop { background: rgb(0 0 0 / 55%); }
+      .account-content { padding: 22px; }
+      .account-content h2 { margin: 0 0 6px; }
+      .account-list { display: grid; gap: 8px; margin-top: 18px; }
+      .account-option {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        margin: 0;
+        padding: 11px;
+        border: 1px solid color-mix(in srgb, CanvasText 20%, transparent);
+        border-radius: 8px;
+        cursor: pointer;
+      }
+      .account-option input { width: auto; min-height: auto; margin: 0; }
+      .dialog-actions { display: flex; gap: 10px; }
+      .dialog-actions button { margin-top: 18px; }
+      .secondary { background: color-mix(in srgb, CanvasText 12%, Canvas); color: CanvasText; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>新期币安交易客户端</h1>
+      <p class="subtitle">登录管理端后加载您的 Binance 交易账号</p>
+
+      <form id="loginForm" autocomplete="off">
+        <label for="userName">用户名</label>
+        <input id="userName" name="userNm" autocomplete="off" required autofocus />
+
+        <label for="password">用户密码</label>
+        <input id="password" name="userPwd" type="password" autocomplete="off" required />
+
+        <button id="loginButton" type="submit">登录</button>
+      </form>
+
+      <div class="device">
+        <div>客户端版本：<span id="clientVersion">读取中…</span></div>
+        <div>登录设备：<span id="deviceIdentity">读取中…</span></div>
+      </div>
+      <p id="loginStatus" class="status" role="status"></p>
+      <p class="security-note">登录密码和交易密钥仅保存在当前客户端进程内存中。</p>
+    </main>
+
+    <dialog id="accountDialog">
+      <div class="account-content">
+        <h2>选择交易账号</h2>
+        <p class="subtitle">当前用户关联了多个账号，请选择本次要使用的账号。</p>
+        <form id="accountForm">
+          <div id="accountList" class="account-list"></div>
+          <p id="accountStatus" class="status" role="status"></p>
+          <div class="dialog-actions">
+            <button id="cancelAccountButton" class="secondary" type="button">返回</button>
+            <button id="confirmAccountButton" type="submit">确认</button>
+          </div>
+        </form>
+      </div>
+    </dialog>
+
+    <script src="loginRenderer.js"></script>
+  </body>
+</html>

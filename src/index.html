@@ -169,6 +169,60 @@
         opacity: 0.72;
       }
 
+      .manager-selected-account {
+        background: color-mix(in srgb, #1677ff 12%, transparent);
+      }
+
+      .account-overview-panel {
+        box-sizing: border-box;
+        width: 100%;
+        margin: 0 0 16px;
+      }
+
+      .account-overview-panel h2 {
+        margin-bottom: 12px;
+      }
+
+      .account-overview-table {
+        min-width: 1260px;
+      }
+
+      .account-overview-table th,
+      .account-overview-table td {
+        padding: 8px 10px;
+        text-align: left;
+        white-space: nowrap;
+      }
+
+      .account-connection-status {
+        display: inline-block;
+        min-width: 42px;
+        padding: 3px 8px;
+        border-radius: 999px;
+        text-align: center;
+        font-weight: 800;
+      }
+
+      .account-connection-fast {
+        color: #138a3d;
+        background: color-mix(in srgb, #20c05c 16%, transparent);
+      }
+
+      .account-connection-medium {
+        color: #c58b00;
+        background: color-mix(in srgb, #ffc107 18%, transparent);
+      }
+
+      .account-connection-slow {
+        color: #ef6f73;
+        background: color-mix(in srgb, #ef6f73 17%, transparent);
+      }
+
+      .account-connection-offline {
+        color: #8b0000;
+        background: color-mix(in srgb, #8b0000 18%, transparent);
+      }
+
       .shortcut-grid {
         display: grid;
         grid-template-columns: 1fr 1fr;
@@ -658,6 +712,31 @@
       <div id="environmentWarning" class="warning">
         默认连接 Binance Testnet。输入合约后，后台自动识别 Spot 或 USDⓈ-M，并选择对应接口。
       </div>
+      <section class="account-overview-panel">
+        <h2>账号信息</h2>
+        <div class="table-scroll">
+          <table class="account-overview-table">
+            <thead>
+              <tr>
+                <th>账号</th>
+                <th>账户状态</th>
+                <th>当前账户</th>
+                <th>账户状态</th>
+                <th>手续费</th>
+                <th>当前账户盈亏</th>
+                <th>隔结误差</th>
+                <th>实际盈亏</th>
+                <th>强平线</th>
+                <th>可用资金</th>
+                <th>总实际盈亏</th>
+              </tr>
+            </thead>
+            <tbody id="accountOverviewBody">
+              <tr><td colspan="11">正在读取账号信息…</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
       <div class="chart-symbol-toolbar">
         <label for="chartSymbolInput">全局合约</label>
         <input id="chartSymbolInput" value=" MUUSDT" autocomplete="off" spellcheck="false" />
@@ -833,6 +912,8 @@
         <section>
           <h2>运行状态</h2>
           <dl>
+            <dt>管理端登录</dt>
+            <dd id="managerAccount">读取中</dd>
             <dt>环境</dt>
             <dd id="environment">读取中</dd>
             <dt>交易接口</dt>
@@ -869,6 +950,50 @@
           <p id="futuresDeadManStatus" class="muted">
             未启用；启用后每 30 秒续期，心跳中断后由 Binance 撤销当前合约挂单。
           </p>
+        </section>
+
+        <section class="full">
+          <h2>管理端用户与账户信息</h2>
+          <p class="muted">
+            登录后从新期管理端读取。交易密钥和授权码不会显示在页面中。
+          </p>
+          <div class="toolbar">
+            <button id="refreshManagerUserInfoButton">刷新管理端账户信息</button>
+            <span id="managerUserInfoStatus">尚未加载</span>
+          </div>
+          <dl>
+            <dt>用户名称</dt><dd id="managerUserName">-</dd>
+            <dt>用户账号</dt><dd id="managerUserAccount">-</dd>
+            <dt>用户组</dt><dd id="managerGroupId">-</dd>
+            <dt>盈利阈值</dt><dd id="managerProfitThreshold">-</dd>
+            <dt>积分</dt><dd id="managerPoints">-</dd>
+            <dt>实际盈利</dt><dd id="managerRealProfit">-</dd>
+          </dl>
+          <div class="table-scroll">
+            <table class="order-history-table">
+              <thead>
+                <tr>
+                  <th>当前</th>
+                  <th>Binance 账号</th>
+                  <th>状态</th>
+                  <th>静态权益</th>
+                  <th>余额</th>
+                  <th>可用</th>
+                  <th>保证金</th>
+                  <th>持仓盈亏</th>
+                  <th>平仓盈亏</th>
+                  <th>实际盈利</th>
+                  <th>开仓量</th>
+                  <th>委托量</th>
+                  <th>手续费</th>
+                  <th>代理代码</th>
+                </tr>
+              </thead>
+              <tbody id="managerAccountsBody">
+                <tr><td colspan="14">登录后自动加载</td></tr>
+              </tbody>
+            </table>
+          </div>
         </section>
 
         <section class="full">
