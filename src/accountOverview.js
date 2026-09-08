@@ -53,15 +53,20 @@ function getManagementAccountStatus(session, selectedAccount, userInfo) {
   return status;
 }
 
-function buildAccountOverview({ session, userInfo, latency } = {}) {
+function buildAccountOverview({
+  session,
+  userInfo,
+  latency,
+  accountMetrics,
+} = {}) {
   if (!session) return null;
   const accounts = Array.isArray(userInfo?.accounts) ? userInfo.accounts : [];
   const selectedAccount = accounts.find((account) => account.selected) ||
     accounts.find(
       (account) => account.futureUserName === session.futureUserName
     ) || null;
-  const allAccountsRealProfit = sumRealProfit(accounts);
   const connection = classifyBinanceLatency(latency);
+  const binanceRealProfit = displayValue(accountMetrics?.realProfit);
 
   return {
     account: displayValue(session.userAccount),
@@ -77,12 +82,17 @@ function buildAccountOverview({ session, userInfo, latency } = {}) {
     connectionTone: connection.tone,
     connectionLatencyMs: connection.elapsedMs,
     commission: displayValue(selectedAccount?.qryCommission),
-    currentAccountProfit: displayValue(selectedAccount?.realProfit),
+    currentAccountProfit: binanceRealProfit,
     settlementError: "0",
-    actualProfit: allAccountsRealProfit,
+    actualProfit: binanceRealProfit,
     liquidationLine: displayValue(session.thrRealProfit),
-    availableFunds: allAccountsRealProfit,
+    availableFunds: displayValue(accountMetrics?.available),
     totalActualProfit: displayValue(session.realProfit),
+    metricsUpdatedAt: accountMetrics?.updatedAt ?? null,
+    metricsCurrency: accountMetrics?.currency || "USDT",
+    metricsWarnings: Array.isArray(accountMetrics?.warnings)
+      ? accountMetrics.warnings
+      : [],
   };
 }
 

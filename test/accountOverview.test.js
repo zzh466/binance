@@ -27,7 +27,7 @@ test("账号实际盈亏使用十进制精确求和", () => {
   ]), "0.3");
 });
 
-test("账号信息行采用登录数据、当前账号和所有账号盈利合计", () => {
+test("账号信息行采用管理端身份和 Binance 实时账户指标", () => {
   const overview = buildAccountOverview({
     session: {
       userAccount: "XQDAThz",
@@ -50,6 +50,12 @@ test("账号信息行采用登录数据、当前账号和所有账号盈利合�
       ],
     },
     latency: { success: true, elapsedMs: 83.5 },
+    accountMetrics: {
+      realProfit: "7.25",
+      available: "88.5",
+      currency: "USDT",
+      updatedAt: 123456,
+    },
   });
 
   assert.equal(overview.account, "XQDAThz");
@@ -57,9 +63,10 @@ test("账号信息行采用登录数据、当前账号和所有账号盈利合�
   assert.equal(overview.currentAccount, "account-b");
   assert.equal(overview.connectionTone, "medium");
   assert.equal(overview.commission, "0.002");
-  assert.equal(overview.currentAccountProfit, "21.15");
-  assert.equal(overview.actualProfit, "31.25");
-  assert.equal(overview.availableFunds, "31.25");
+  assert.equal(overview.currentAccountProfit, "7.25");
+  assert.equal(overview.actualProfit, "7.25");
+  assert.equal(overview.availableFunds, "88.5");
   assert.equal(overview.liquidationLine, "100000");
   assert.equal(overview.totalActualProfit, "31.25");
+  assert.equal(overview.metricsUpdatedAt, 123456);
 });

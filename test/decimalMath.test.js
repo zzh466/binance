@@ -4,6 +4,7 @@ const {
   addDecimal,
   alignDecimalToStep,
   compareDecimal,
+  divideDecimal,
   divideDecimalToStep,
   multiplyDecimal,
   parseDecimal,
@@ -28,4 +29,10 @@ test("名义金额乘法和边界比较保持十进制精度", () => {
   assert.equal(multiplyDecimal("333.3", "0.300"), "99.99");
   assert.equal(compareDecimal("0.100000000000000001", "0.1"), 1);
   assert.deepEqual(parseDecimal("1e3"), { coefficient: 1000n, scale: 0 });
+});
+
+test("十进制除法不会经过 IEEE-754 浮点数", () => {
+  assert.equal(divideDecimal("1", "4"), "0.25");
+  assert.equal(divideDecimal("10.5", "3", 6), "3.5");
+  assert.throws(() => divideDecimal("1", "0"), /除数不能为 0/);
 });

@@ -113,6 +113,22 @@ function multiplyDecimal(left, right) {
   );
 }
 
+function divideDecimal(left, right, precision = 18) {
+  const parsedLeft = parseDecimal(left, "被除数");
+  const parsedRight = parseDecimal(right, "除数");
+  const normalizedPrecision = Math.max(
+    0,
+    Math.min(30, Math.floor(Number(precision) || 0))
+  );
+  if (parsedRight.coefficient === 0n) {
+    throw new TypeError("除数不能为 0。");
+  }
+  const numerator =
+    parsedLeft.coefficient * pow10(parsedRight.scale + normalizedPrecision);
+  const denominator = parsedRight.coefficient * pow10(parsedLeft.scale);
+  return formatScaled(numerator / denominator, normalizedPrecision);
+}
+
 function divideDecimalToStep(total, price, step, origin = "0") {
   const parsedTotal = parseDecimal(total, "订单总价");
   const parsedPrice = parseDecimal(price, "参考价格");
@@ -150,6 +166,7 @@ module.exports = {
   addDecimal,
   alignDecimalToStep,
   compareDecimal,
+  divideDecimal,
   divideDecimalToStep,
   formatScaled,
   isPositiveDecimal,

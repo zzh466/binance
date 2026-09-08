@@ -127,6 +127,53 @@ function getAccountApiKey(account = {}) {
   ).trim();
 }
 
+function mergeNonNullFields(base = {}, extra = {}) {
+  const merged = { ...base };
+  for (const [key, value] of Object.entries(extra || {})) {
+    if (value !== undefined && value !== null) {
+      merged[key] = value;
+    } else if (!(key in merged)) {
+      merged[key] = value;
+    }
+  }
+  return merged;
+}
+
+function mergeManagerAccountInfo(loginResponse = {}, userInfo = {}) {
+  const loginAccounts = Array.isArray(loginResponse.futureAccountVOList)
+    ? loginResponse.futureAccountVOList
+    : [];
+  const detailAccounts = Array.isArray(userInfo.futureAccountVOList)
+    ? userInfo.futureAccountVOList
+    : [];
+  const detailByApiKey = new Map();
+
+  for (const detailAccount of detailAccounts) {
+    const apiKey = getAccountApiKey(detailAccount);
+    if (apiKey) detailByApiKey.set(apiKey, detailAccount);
+  }
+
+  const matchedDetailAccounts = new Set();
+  const mergedAccounts = loginAccounts.map((loginAccount) => {
+    const apiKey = getAccountApiKey(loginAccount);
+    const detailAccount = apiKey ? detailByApiKey.get(apiKey) : null;
+    if (!detailAccount) return { ...loginAccount };
+    matchedDetailAccounts.add(detailAccount);
+    return mergeNonNullFields(loginAccount, detailAccount);
+  });
+
+  for (const detailAccount of detailAccounts) {
+    if (!matchedDetailAccounts.has(detailAccount)) {
+      mergedAccounts.push({ ...detailAccount });
+    }
+  }
+
+  return {
+    ...userInfo,
+    futureAccountVOList: mergedAccounts,
+  };
+}
+
 function resolveSelectedAccount(loginResponse = {}, accountKey) {
   const accounts = Array.isArray(loginResponse.futureAccountVOList)
     ? loginResponse.futureAccountVOList
@@ -168,22 +215,21 @@ function sanitizeManagerUserInfo(userInfo = {}, selectedFutureUserName = "") {
       : 0,
     accounts: accounts.map((account, index) => ({
       accountKey: String(account.id ?? index),
+      id: account.id,
       selected: String(account.futureUserName || "") === selectedFutureUserName,
       futureUserName: account.futureUserName,
-      futureAccountStatus: account.futureAccountStatus,
+      accountStatus: account.accountStatus,
+      futureAccountStatus:
+        account.futureAccountStatus ?? account.accountStatus,
+      roleCode: account.roleCode,
       regular: account.regular,
       puppet: account.puppet,
       tradeProxyCode: account.tradeProxyCode,
-      futureBrokerId: account.futureBrokerId,
-      futureAppId: account.futureAppId,
+      futureBrokerId: account.futureBrokerId ?? account.brokerId,
+      futureAppId: account.futureAppId ?? account.appId,
       tradeAddr: account.tradeAddr,
-      staticBalance: account.staticBalance,
-      balance: account.balance,
-      available: account.available,
       margin: account.margin,
-      positionProfit: account.positionProfit,
       closeProfit: account.closeProfit,
-      realProfit: account.realProfit,
       openVolume: account.openVolume,
       orderVolume: account.orderVolume,
       qryCommission: account.qryCommission,
@@ -278,10 +324,11 @@ class ManagerClientService {
     if (response.locked === true) {
       throw new ManagerApiError("当前用户已被锁定，请联系管理端管理员。");
     }
-    const userInfo = await this.getUserInfo();
-    if (userInfo.vtpLocked === true) {
+    const rawUserInfo = await this.getUserInfo();
+    if (rawUserInfo.vtpLocked === true) {
       throw new ManagerApiError("当前用户已被锁定，请联系管理端管理员。");
     }
+    const userInfo = mergeManagerAccountInfo(response, rawUserInfo);
     if (!getAccountChoices(userInfo).length) {
       throw new ManagerApiError(
         "用户信息接口没有返回可用的 Binance 交易账号。"
@@ -334,6 +381,7 @@ module.exports = {
   interfaceNamePriority,
   normalizeMacAddress,
   normalizePropertyValue,
+  mergeManagerAccountInfo,
   resolveSelectedAccount,
   sanitizeManagerUserInfo,
   selectPreferredMac,

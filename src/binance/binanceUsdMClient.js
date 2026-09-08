@@ -1530,7 +1530,7 @@ class BinanceUsdMClient extends BinanceSpotClient {
     const account = await this.signedWsOrRest(
       "account.status",
       "GET",
-      "/fapi/v2/account"
+      "/fapi/v3/account"
     );
     let assets = Array.isArray(account.assets) ? account.assets : [];
     if (omitZeroBalances) {
@@ -1553,6 +1553,24 @@ class BinanceUsdMClient extends BinanceSpotClient {
         unrealizedProfit: asset.unrealizedProfit,
       })),
     };
+  }
+
+  async incomeHistory({
+    incomeType,
+    symbol,
+    startTime,
+    endTime,
+    page = 1,
+    limit = 1000,
+  } = {}) {
+    return this.signedRest("GET", "/fapi/v1/income", {
+      incomeType,
+      symbol: symbol ? this.validateSymbol(symbol) : undefined,
+      startTime,
+      endTime,
+      page: Math.max(1, Math.floor(Number(page) || 1)),
+      limit: Math.min(1000, Math.max(1, Math.floor(Number(limit) || 1000))),
+    });
   }
 
   async signTradFiPerpsAgreement() {

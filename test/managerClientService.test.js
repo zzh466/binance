@@ -4,6 +4,7 @@ const {
   CLIENT_VERSION,
   ManagerClientService,
   getAccountChoices,
+  mergeManagerAccountInfo,
   resolveSelectedAccount,
   sanitizeManagerUserInfo,
   selectPreferredMac,
@@ -70,7 +71,11 @@ test("登录请求包含用户输入、硬编码版本号和首选 MAC", async (
       return jsonResponse({
         code: "REQ_SUCCESS",
         locked: false,
-        futureAccountVOList: [{ id: 233, futureUserName: "test4bn01" }],
+        futureAccountVOList: [{
+          id: 233,
+          futureInvestorId: "api-key",
+          futureUserName: "test4bn01",
+        }],
       });
     },
   });
@@ -81,6 +86,11 @@ test("登录请求包含用户输入、硬编码版本号和首选 MAC", async (
   });
   assert.equal(result.device.mac, "00:1c:42:d4:1b:33");
   assert.equal(requests.length, 2);
+  assert.equal(result.userInfo.futureAccountVOList[0].id, 233);
+  assert.equal(
+    result.userInfo.futureAccountVOList[0].futureInvestorId,
+    "api-key"
+  );
   assert.equal(requests[0].options.method, "POST");
   assert.equal(requests[0].options.useSessionCookies, true);
   assert.equal(requests[1].options.method, "GET");
@@ -91,6 +101,70 @@ test("登录请求包含用户输入、硬编码版本号和首选 MAC", async (
     appVersion: CLIENT_VERSION,
     userMAC: "00:1c:42:d4:1b:33",
   });
+});
+
+test("登录账号与用户详情按 futureInvestorId 匹配而不是数组顺序", () => {
+  const merged = mergeManagerAccountInfo({
+    futureAccountVOList: [
+      {
+        id: 233,
+        accountStatus: 1,
+        futureInvestorId: "api-key-a",
+        futureUserName: "account-a",
+        brokerId: "0000",
+      },
+      {
+        id: 234,
+        accountStatus: 2,
+        futureInvestorId: "api-key-b",
+        futureUserName: "account-b",
+      },
+    ],
+  }, {
+    futureAccountVOList: [
+      {
+        id: null,
+        futureInvestorId: "api-key-b",
+        futureUserName: "account-b",
+        futureAccountStatus: "NORMAL",
+        realProfit: "20.25",
+      },
+      {
+        id: null,
+        futureUserID: "api-key-a",
+        futureUserName: "account-a",
+        qryCommission: "0.001",
+        realProfit: "10.5",
+      },
+    ],
+  });
+
+  assert.equal(merged.futureAccountVOList[0].id, 233);
+  assert.equal(merged.futureAccountVOList[0].futureUserName, "account-a");
+  assert.equal(merged.futureAccountVOList[0].qryCommission, "0.001");
+  assert.equal(merged.futureAccountVOList[0].brokerId, "0000");
+  assert.equal(merged.futureAccountVOList[1].id, 234);
+  assert.equal(merged.futureAccountVOList[1].futureUserName, "account-b");
+  assert.equal(merged.futureAccountVOList[1].realProfit, "20.25");
+  assert.deepEqual(getAccountChoices(merged), [
+    { accountKey: "233", futureUserName: "account-a" },
+    { accountKey: "234", futureUserName: "account-b" },
+  ]);
+});
+
+test("用户详情缺少匹配账号时仍保留两侧独有账号", () => {
+  const merged = mergeManagerAccountInfo({
+    futureAccountVOList: [
+      { id: 1, futureInvestorId: "login-only", futureUserName: "login" },
+    ],
+  }, {
+    futureAccountVOList: [
+      { id: null, futureUserID: "detail-only", futureUserName: "detail" },
+    ],
+  });
+  assert.equal(merged.futureAccountVOList.length, 2);
+  assert.equal(merged.futureAccountVOList[0].id, 1);
+  assert.equal(merged.futureAccountVOList[1].futureUserName, "detail");
 });
 
 test("账号选择列表不向页面暴露 API Key 和 Secret", () => {
@@ -109,7 +183,7 @@ test("账号选择列表不向页面暴露 API Key 和 Secret", () => {
   assert.equal(resolveSelectedAccount(response, "233").futureUserID, "api-key");
 });
 
-test("用户账户信息会保留交易指标但移除密钥和授权码", () => {
+test("管理端用户账户信息保留身份配置但不采用其资金指标", () => {
   const sanitized = sanitizeManagerUserInfo({
     vtpUserId: 114,
     vtpUserNm: "新期数字资产韩喆",
@@ -127,7 +201,7 @@ test("用户账户信息会保留交易指标但移除密钥和授权码", () =>
   }, "test4bn01");
 
   assert.equal(sanitized.accounts[0].selected, true);
-  assert.equal(sanitized.accounts[0].balance, 12.5);
+  assert.equal("balance" in sanitized.accounts[0], false);
   assert.equal(sanitized.accounts[0].qryCommission, 0.002);
   assert.equal("futureUserID" in sanitized.accounts[0], false);
   assert.equal("futureUserPwd" in sanitized.accounts[0], false);

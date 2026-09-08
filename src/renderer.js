@@ -1747,7 +1747,8 @@ async function refreshManagerUserInfo({ showResult = true } = {}) {
     }
     renderManagerUserInfo(result.data);
     elements.managerUserInfoStatus.textContent =
-      `已加载 ${result.data.accounts?.length || 0} 个账号 / ` +
+      `管理端身份 + Binance 资金已更新；` +
+      `${result.data.accounts?.length || 0} 个账号 / ` +
       new Date().toLocaleString();
   } catch (error) {
     elements.managerUserInfoStatus.textContent = error?.message || "刷新失败";
@@ -3311,6 +3312,27 @@ window.binance.onLatencyUpdate((latency) => {
 
 window.binance.onAccountOverviewUpdate((overview) => {
   renderAccountOverview(overview);
+});
+
+window.binance.onManagerUserInfoUpdate((userInfo) => {
+  renderManagerUserInfo(userInfo || {});
+});
+
+window.binance.onAccountMetricsStatus((status = {}) => {
+  if (status.status === "updated") {
+    const warningCount = Array.isArray(status.warnings)
+      ? status.warnings.length
+      : 0;
+    elements.managerUserInfoStatus.textContent =
+      `管理端身份 + Binance 资金已更新 / ` +
+      `${new Date(status.updatedAt || Date.now()).toLocaleString()}` +
+      (warningCount ? ` / ${warningCount} 项数据警告` : "");
+    return;
+  }
+  if (status.status === "error") {
+    elements.managerUserInfoStatus.textContent =
+      `Binance 资金刷新失败：${status.error?.message || "未知错误"}`;
+  }
 });
 
 window.binance.onRateLimitUpdate((snapshot) => {

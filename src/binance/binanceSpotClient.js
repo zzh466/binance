@@ -633,6 +633,10 @@ class BinanceSpotClient extends EventEmitter {
     };
   }
 
+  async tickerPrices() {
+    return this.request("GET", "/v3/ticker/price");
+  }
+
   decimalPlaces(value) {
     const text = String(value ?? "").toLowerCase();
     if (text.includes("e-")) {

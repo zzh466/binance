@@ -33,10 +33,15 @@ const {
   ManagerClientService,
   getAccountChoices,
   getAccountApiKey,
+  mergeManagerAccountInfo,
   resolveSelectedAccount,
   sanitizeManagerUserInfo,
 } = require("./managerClientService");
 const { buildAccountOverview } = require("./accountOverview");
+const {
+  BinanceAccountMetricsService,
+} = require("./binanceAccountMetricsService");
+const { addDecimal } = require("./binance/decimalMath");
 
 function loadEnvironmentFile() {
   const packagedEnvironmentPath = getPackagedEnvironmentPath({
@@ -74,7 +79,13 @@ let runtimeAccountCredentials = null;
 let runtimeBrokerLinkIds = null;
 let authenticatedManagerSession = null;
 let authenticatedManagerUserInfo = null;
+let authenticatedManagerLoginResponse = null;
 let pendingManagerLogin = null;
+let latestBinanceAccountMetrics = null;
+let accountMetricsRefreshPromise = null;
+let accountMetricsRefreshClient = null;
+let accountMetricsRefreshTimer = null;
+let accountMetricsInterval = null;
 const defaultTestnet = process.env.BINANCE_TESTNET !== "false";
 const shortcutConfigPath = path.join(
   app.getPath("appData"),
@@ -89,11 +100,15 @@ const recentOrderStore = new RecentOrderStore(recentOrderStorePath);
 const tradingRoundStore = new TradingRoundStore(
   path.join(app.getPath("userData"), "trading-rounds.json")
 );
+const accountMetricsService = new BinanceAccountMetricsService({
+  storePath: path.join(app.getPath("userData"), "spot-pnl-ledger.json"),
+});
 const rateLimitCoordinator = new SharedRateLimitCoordinator(
   path.join(app.getPath("appData"), "Binance统一交易台", "rate-limits"),
   { instanceId: instanceId || `pid-${process.pid}` }
 );
 const unknownOrderReconciliationTimers = new Set();
+const ACCOUNT_METRICS_REFRESH_MS = 30_000;
 let futuresDeadManState = null;
 const managerClientService = new ManagerClientService({
   fetchImpl: (url, options) => net.fetch(url, options),
@@ -682,8 +697,10 @@ async function enterTradingConsole(loginResponse, userInfo, account, device) {
     userInfo,
     String(account.futureUserName || "")
   );
+  authenticatedManagerLoginResponse = loginResponse;
   pendingManagerLogin = null;
   createWindow();
+  startAccountMetricsRefresh();
   setImmediate(() => {
     if (loginWindow && !loginWindow.isDestroyed()) loginWindow.close();
   });
@@ -763,16 +780,158 @@ function sendToRenderer(channel, payload) {
   }
 }
 
+function getAccountMetricsContext(targetClient = client) {
+  const spotApiKey = targetClient?.spot?.apiKey;
+  const futuresApiKey = targetClient?.futures?.apiKey;
+  return {
+    environment: targetClient?.testnet ? "testnet" : "production",
+    accountFingerprint: fingerprintApiKey(spotApiKey || futuresApiKey),
+  };
+}
+
+function getDisplayedManagerUserInfo() {
+  if (!authenticatedManagerUserInfo) return null;
+  const metrics = latestBinanceAccountMetrics;
+  return {
+    ...authenticatedManagerUserInfo,
+    accounts: (authenticatedManagerUserInfo.accounts || []).map((account) => {
+      if (!account.selected || !metrics) return { ...account };
+      return {
+        ...account,
+        staticBalance: metrics.staticBalance,
+        balance: metrics.balance,
+        available: metrics.available,
+        positionProfit: metrics.positionProfit,
+        realProfit: metrics.realProfit,
+        metricsCurrency: metrics.currency,
+        metricsUpdatedAt: metrics.updatedAt,
+      };
+    }),
+  };
+}
+
 function getAccountOverview() {
   return buildAccountOverview({
     session: authenticatedManagerSession,
-    userInfo: authenticatedManagerUserInfo,
+    userInfo: getDisplayedManagerUserInfo(),
     latency: latestBinanceLatency,
+    accountMetrics: latestBinanceAccountMetrics,
   });
 }
 
-function sendAccountOverviewToRenderer() {
+function sendAccountDataToRenderer() {
+  sendToRenderer("manager:user-info-update", getDisplayedManagerUserInfo());
   sendToRenderer("manager:account-overview-update", getAccountOverview());
+}
+
+function sendAccountOverviewToRenderer() {
+  sendAccountDataToRenderer();
+}
+
+async function refreshBinanceAccountMetrics(targetClient = client) {
+  if (!targetClient || !authenticatedManagerSession) return null;
+  if (accountMetricsRefreshPromise) {
+    if (accountMetricsRefreshClient === targetClient) {
+      return accountMetricsRefreshPromise;
+    }
+    try {
+      await accountMetricsRefreshPromise;
+    } catch {
+      // 环境切换时旧客户端的刷新结果不应阻止新客户端立即刷新。
+    }
+    return refreshBinanceAccountMetrics(targetClient);
+  }
+
+  const context = getAccountMetricsContext(targetClient);
+  if (!context.accountFingerprint) return null;
+  const knownSpotSymbols = listKnownOrderSymbols("spot", targetClient);
+  if (
+    targetClient.activeMarketType === "spot" &&
+    targetClient.activeSymbol
+  ) {
+    knownSpotSymbols.push(targetClient.activeSymbol);
+  }
+
+  const refreshPromise = accountMetricsService.refresh({
+    client: targetClient,
+    ...context,
+    knownSpotSymbols: [...new Set(knownSpotSymbols)],
+  }).then((metrics) => {
+    if (targetClient !== client) return metrics;
+    latestBinanceAccountMetrics = metrics;
+    sendAccountDataToRenderer();
+    sendToRenderer("manager:account-metrics-status", {
+      status: "updated",
+      updatedAt: metrics.updatedAt,
+      currency: metrics.currency,
+      warnings: metrics.warnings,
+    });
+    return metrics;
+  }).finally(() => {
+    if (accountMetricsRefreshPromise === refreshPromise) {
+      accountMetricsRefreshPromise = null;
+      accountMetricsRefreshClient = null;
+    }
+  });
+  accountMetricsRefreshPromise = refreshPromise;
+  accountMetricsRefreshClient = targetClient;
+  return refreshPromise;
+}
+
+function scheduleAccountMetricsRefresh(delayMs = 750) {
+  clearTimeout(accountMetricsRefreshTimer);
+  accountMetricsRefreshTimer = setTimeout(() => {
+    accountMetricsRefreshTimer = null;
+    refreshBinanceAccountMetrics(client).catch((error) => {
+      sendToRenderer("manager:account-metrics-status", {
+        status: "error",
+        error: serializeError(error),
+        time: Date.now(),
+      });
+    });
+  }, delayMs);
+  accountMetricsRefreshTimer.unref?.();
+}
+
+function stopAccountMetricsRefresh() {
+  clearTimeout(accountMetricsRefreshTimer);
+  accountMetricsRefreshTimer = null;
+  clearInterval(accountMetricsInterval);
+  accountMetricsInterval = null;
+}
+
+function startAccountMetricsRefresh() {
+  stopAccountMetricsRefresh();
+  scheduleAccountMetricsRefresh(0);
+  accountMetricsInterval = setInterval(() => {
+    scheduleAccountMetricsRefresh(0);
+  }, ACCOUNT_METRICS_REFRESH_MS);
+  accountMetricsInterval.unref?.();
+}
+
+function ingestSpotExecutionMetrics(targetClient, event) {
+  const context = getAccountMetricsContext(targetClient);
+  const snapshot = accountMetricsService.ingestSpotExecution({
+    ...context,
+    event,
+  });
+  if (!snapshot || !latestBinanceAccountMetrics || targetClient !== client) {
+    return;
+  }
+  latestBinanceAccountMetrics = {
+    ...latestBinanceAccountMetrics,
+    realProfit: addDecimal(
+      snapshot.realizedPnl24h,
+      latestBinanceAccountMetrics.futures?.realizedPnl24h || "0"
+    ),
+    spot: {
+      ...latestBinanceAccountMetrics.spot,
+      realizedPnl24h: snapshot.realizedPnl24h,
+      ledger: snapshot.ledger,
+    },
+    updatedAt: Date.now(),
+  };
+  sendAccountDataToRenderer();
 }
 
 function serializeError(error) {
@@ -809,7 +968,8 @@ function getClientStatus() {
   return {
     clientVersion: CLIENT_VERSION,
     managerAccount: authenticatedManagerSession,
-    managerUserInfo: authenticatedManagerUserInfo,
+    managerUserInfo: getDisplayedManagerUserInfo(),
+    accountMetrics: latestBinanceAccountMetrics,
     accountOverview: getAccountOverview(),
     testnet: client.testnet,
     restBase: client.restBase,
@@ -870,11 +1030,13 @@ async function switchClientEnvironment(testnet) {
   }
 
   const previousClient = client;
+  stopAccountMetricsRefresh();
   clearFuturesDeadManTimer();
   const nextClient = createBinanceClient(testnet);
   bindClientEvents(nextClient);
   client = nextClient;
   latestBinanceLatency = null;
+  latestBinanceAccountMetrics = null;
   sendToRenderer("binance:latency-update", null);
   sendAccountOverviewToRenderer();
   previousClient.close();
@@ -888,6 +1050,7 @@ async function switchClientEnvironment(testnet) {
   if (hasAnyTradingCredentials(nextClient)) {
     connectUserDataInBackground(nextClient);
   }
+  startAccountMetricsRefresh();
 
   return {
     ...getClientStatus(),
@@ -957,13 +1120,18 @@ function registerIpcHandlers() {
       if (!authenticatedManagerSession || !client) {
         throw new TypeError("当前客户端尚未登录管理端。");
       }
-      const userInfo = await managerClientService.getUserInfo();
+      const rawUserInfo = await managerClientService.getUserInfo();
+      const userInfo = mergeManagerAccountInfo(
+        authenticatedManagerLoginResponse || {},
+        rawUserInfo
+      );
       authenticatedManagerUserInfo = sanitizeManagerUserInfo(
         userInfo,
         authenticatedManagerSession.futureUserName
       );
-      sendAccountOverviewToRenderer();
-      return authenticatedManagerUserInfo;
+      await refreshBinanceAccountMetrics(client);
+      sendAccountDataToRenderer();
+      return getDisplayedManagerUserInfo();
     });
   });
 
@@ -1243,6 +1411,20 @@ function bindClientEvents(targetClient) {
         marketType: data.marketType,
         source: "user-data-stream",
       });
+      ingestSpotExecutionMetrics(targetClient, data.event);
+      if (data.event.x === "TRADE") scheduleAccountMetricsRefresh(500);
+    }
+    if (
+      [
+        "outboundAccountPosition",
+        "balanceUpdate",
+        "ACCOUNT_UPDATE",
+        "ORDER_TRADE_UPDATE",
+      ].includes(
+        data.event?.e
+      )
+    ) {
+      scheduleAccountMetricsRefresh(500);
     }
     sendToRenderer("binance:user-data-event", data);
     showUserDataNotification(data);
@@ -1298,11 +1480,13 @@ app.whenReady().then(() => {
 });
 
 app.on("before-quit", () => {
+  stopAccountMetricsRefresh();
   clearFuturesDeadManTimer();
   for (const timer of unknownOrderReconciliationTimers) clearTimeout(timer);
   unknownOrderReconciliationTimers.clear();
   recentOrderStore.close();
   tradingRoundStore.close();
+  accountMetricsService.close();
   rateLimitCoordinator.close();
   client?.close();
 });
