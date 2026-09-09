@@ -94,6 +94,162 @@ test("已有 5 手多向时开空 10 手，结束旧回合并把剩余 5 手放�
   assert.equal(open.remainingQty, "5");
 });
 
+test("多空方向按累计成交总价动态计算加权平均成交价", (t) => {
+  const { store } = createStore(t);
+  store.recordOrderExecution(
+    execution(1, "BUY", "2", { Z: "20" }),
+    context
+  );
+  store.recordOrderExecution(
+    execution(1, "BUY", "5", { Z: "65" }),
+    context
+  );
+  store.recordOrderExecution(
+    execution(2, "SELL", "2", { Z: "40" }),
+    context
+  );
+  store.recordOrderExecution(
+    execution(2, "SELL", "5", { Z: "115" }),
+    context
+  );
+
+  const [round] = store.list();
+  assert.equal(round.status, "COMPLETED");
+  assert.equal(round.longQty, "5");
+  assert.equal(round.longQuoteAmount, "65");
+  assert.equal(round.longAveragePrice, "13");
+  assert.equal(round.shortQty, "5");
+  assert.equal(round.shortQuoteAmount, "115");
+  assert.equal(round.shortAveragePrice, "23");
+});
+
+test("单次成交跨回合拆分时同步拆分成交总价并保持均价", (t) => {
+  const { store } = createStore(t);
+  store.recordOrderExecution(
+    execution(1, "BUY", "5", { Z: "50" }),
+    context
+  );
+  store.recordOrderExecution(
+    execution(2, "SELL", "10", { Z: "120" }),
+    context
+  );
+
+  const rounds = store.list();
+  const completed = rounds.find((round) => round.status === "COMPLETED");
+  const open = rounds.find((round) => round.status === "OPEN");
+  assert.equal(completed.shortQuoteAmount, "60");
+  assert.equal(completed.shortAveragePrice, "12");
+  assert.equal(open.shortQuoteAmount, "60");
+  assert.equal(open.shortAveragePrice, "12");
+});
+
+test("账户事件没有累计成交额时使用本次成交价计算增量均价", (t) => {
+  const { store } = createStore(t);
+  store.recordOrderExecution(
+    execution(1, "BUY", "1", { l: "1", L: "10" }),
+    context
+  );
+  store.recordOrderExecution(
+    execution(1, "BUY", "3", { l: "2", L: "20" }),
+    context
+  );
+
+  const [round] = store.list();
+  assert.equal(round.longQuoteAmount, "50");
+  assert.equal(round.longAveragePrice, "16.666666666666666666");
+});
+
+test("成交总价和平均价随回合写入本地 JSON 并可恢复", (t) => {
+  const { store, filePath } = createStore(t);
+  store.recordOrderExecution(
+    execution(1, "BUY", "4", { avgPrice: "12.5" }),
+    context
+  );
+  store.flush();
+
+  const reloaded = new TradingRoundStore(filePath, {
+    now: () => 2_000,
+    saveDelayMs: 60_000,
+  });
+  const [round] = reloaded.list();
+  assert.equal(round.longQty, "4");
+  assert.equal(round.longQuoteAmount, "50");
+  assert.equal(round.longAveragePrice, "12.5");
+  reloaded.close();
+});
+
+test("旧版回合可用订单累计成交额回填多空均价", (t) => {
+  const { store } = createStore(t);
+  store.recordOrderExecution(execution(1, "BUY", "5"), context);
+  store.recordOrderExecution(execution(2, "SELL", "10"), context);
+
+  const references = store.listMissingPricingOrderReferences({
+    environment: context.environment,
+    accountFingerprints: [context.accountFingerprint],
+    marketType: context.marketType,
+  });
+  assert.deepEqual(
+    references.map((reference) => reference.orderIdentity).sort(),
+    ["order:1", "order:2"]
+  );
+
+  const result = store.backfillExecutionPricing([
+    execution(1, "BUY", "5", { Z: "50" }),
+    execution(2, "SELL", "10", { Z: "120" }),
+  ], context);
+  assert.equal(result.affectedRoundIds.length, 2);
+
+  const rounds = store.list();
+  const completed = rounds.find((round) => round.status === "COMPLETED");
+  const open = rounds.find((round) => round.status === "OPEN");
+  assert.equal(completed.longQuoteAmount, "50");
+  assert.equal(completed.longAveragePrice, "10");
+  assert.equal(completed.shortQuoteAmount, "60");
+  assert.equal(completed.shortAveragePrice, "12");
+  assert.equal(open.shortQuoteAmount, "60");
+  assert.equal(open.shortAveragePrice, "12");
+  assert.deepEqual(store.listMissingPricingOrderReferences({
+    environment: context.environment,
+    accountFingerprints: [context.accountFingerprint],
+    marketType: context.marketType,
+  }), []);
+});
+
+test("历史订单不完整时不生成误导性的部分平均价", (t) => {
+  const { store } = createStore(t);
+  store.recordOrderExecution(execution(1, "BUY", "2"), context);
+  store.recordOrderExecution(execution(2, "BUY", "3"), context);
+
+  const result = store.backfillExecutionPricing([
+    execution(1, "BUY", "2", { avgPrice: "10" }),
+  ], context);
+  assert.deepEqual(result.affectedRoundIds, []);
+  const [round] = store.list();
+  assert.equal(round.longQuoteAmount, null);
+  assert.equal(round.longAveragePrice, null);
+});
+
+test("跨回合订单使用逐笔成交价格恢复每个回合各自的均价", (t) => {
+  const { store } = createStore(t);
+  store.recordOrderExecution(execution(1, "BUY", "5"), context);
+  store.recordOrderExecution(execution(2, "SELL", "10"), context);
+
+  const result = store.backfillExecutionPricing([
+    execution(1, "BUY", "5", { Z: "50", updateTime: 1_500 }),
+    execution(2, "SELL", "5", { Z: "55", updateTime: 2_000 }),
+    execution(2, "SELL", "5", { Z: "65", updateTime: 3_000 }),
+  ], context);
+  assert.equal(result.affectedRoundIds.length, 2);
+
+  const rounds = store.list();
+  const completed = rounds.find((round) => round.status === "COMPLETED");
+  const open = rounds.find((round) => round.status === "OPEN");
+  assert.equal(completed.shortQuoteAmount, "55");
+  assert.equal(completed.shortAveragePrice, "11");
+  assert.equal(open.shortQuoteAmount, "65");
+  assert.equal(open.shortAveragePrice, "13");
+});
+
 test("回合按开始时间降序，同一毫秒创建的新回合也排在最上面", (t) => {
   const { store } = createStore(t);
   store.recordOrderExecution(

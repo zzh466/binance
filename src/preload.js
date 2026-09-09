@@ -111,6 +111,8 @@ contextBridge.exposeInMainWorld("binance", {
     subscribe("manager:user-info-update", callback),
   onAccountMetricsStatus: (callback) =>
     subscribe("manager:account-metrics-status", callback),
+  onManagerTradingInfoSyncStatus: (callback) =>
+    subscribe("manager:trading-info-sync-status", callback),
   onRateLimitUpdate: (callback) =>
     subscribe("binance:rate-limit-update", callback),
   onUserDataEvent: (callback) =>

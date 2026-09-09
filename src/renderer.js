@@ -1129,6 +1129,13 @@ function formatRoundRemainder(round) {
   return "-";
 }
 
+function formatRoundAveragePrice(value) {
+  const averagePrice = String(value ?? "").trim();
+  return averagePrice && !/^0(?:\.0+)?$/.test(averagePrice)
+    ? averagePrice
+    : "-";
+}
+
 function renderTradingRounds(rounds, { merge = false } = {}) {
   if (!merge) tradingRoundsById.clear();
   for (const round of rounds) {
@@ -1150,7 +1157,7 @@ function renderTradingRounds(rounds, { merge = false } = {}) {
   if (!visibleRounds.length) {
     const row = document.createElement("tr");
     const cell = document.createElement("td");
-    cell.colSpan = 13;
+    cell.colSpan = 15;
     cell.textContent = "当前账户还没有记录到实际成交回合";
     row.append(cell);
     elements.tradingRoundsBody.append(row);
@@ -1169,7 +1176,9 @@ function renderTradingRounds(rounds, { merge = false } = {}) {
       round.openShortQty || "0",
       round.closeLongQty || "0",
       round.longQty || "0",
+      formatRoundAveragePrice(round.longAveragePrice),
       round.shortQty || "0",
+      formatRoundAveragePrice(round.shortAveragePrice),
       formatRoundRemainder(round),
       formatOrderTime(round.createdAt),
       round.completedAt ? formatOrderTime(round.completedAt) : "-",
@@ -1746,10 +1755,30 @@ async function refreshManagerUserInfo({ showResult = true } = {}) {
       return;
     }
     renderManagerUserInfo(result.data);
-    elements.managerUserInfoStatus.textContent =
-      `管理端身份 + Binance 资金已更新；` +
-      `${result.data.accounts?.length || 0} 个账号 / ` +
-      new Date().toLocaleString();
+    const metricsStatus = result.data.binanceMetricsStatus;
+    const warnings = Array.isArray(metricsStatus?.warnings)
+      ? metricsStatus.warnings
+      : [];
+    const notes = [];
+    if (
+      metricsStatus?.environment === "testnet" &&
+      Number(metricsStatus.spotTradeCount) > 0 &&
+      Number(metricsStatus.spotCommission) === 0
+    ) {
+      notes.push("Testnet 现货成交由 Binance 返回零手续费");
+    }
+    if (metricsStatus?.complete === false) {
+      elements.managerUserInfoStatus.textContent =
+        `管理端身份已更新，但 Binance 指标不完整：` +
+        `${warnings.map((warning) => warning.message).join("；") || "部分接口不可用"}` +
+        `${notes.length ? `；${notes.join("；")}` : ""}`;
+    } else {
+      elements.managerUserInfoStatus.textContent =
+        `管理端身份 + Binance 资金已更新；` +
+        `${result.data.accounts?.length || 0} 个账号 / ` +
+        new Date().toLocaleString() +
+        `${notes.length ? `；${notes.join("；")}` : ""}`;
+    }
   } catch (error) {
     elements.managerUserInfoStatus.textContent = error?.message || "刷新失败";
   } finally {
@@ -2828,6 +2857,12 @@ let chartSymbol = null;
 let chartMarketType = null;
 const latestTradePrices = new Map();
 const openOrdersByKey = new Map();
+const {
+  isOpenOrder,
+  normalizeOpenOrder,
+  openOrderKey,
+  updateOpenOrderMap,
+} = window.OpenOrderState;
 const executionReportStatusByClientId = new Map();
 let numpadOrderBusy = false;
 let executionReportRefreshTimer = null;
@@ -3018,39 +3053,6 @@ function scheduleExecutionReportRefresh() {
   }, 250);
 }
 
-function openOrderKey(order) {
-  return `${order.marketType || "auto"}:${order.symbol}:` +
-    `${order.algoOrder ? "algo" : "order"}:${order.orderId}`;
-}
-
-function normalizeOpenOrder(order, receivedAt = Date.now()) {
-  const normalized = {
-    marketType: order.marketType || null,
-    symbol: String(order.symbol ?? order.s ?? "").toUpperCase(),
-    orderId: order.orderId ?? order.i,
-    clientOrderId: order.clientOrderId ?? order.c ?? order.newClientOrderId ?? "",
-    side: String(order.side ?? order.S ?? "").toUpperCase(),
-    type: String(order.type ?? order.o ?? "").toUpperCase(),
-    status: String(order.status ?? order.X ?? "").toUpperCase(),
-    price: String(order.price ?? order.p ?? "0"),
-    stopPrice: String(order.stopPrice ?? order.P ?? "0"),
-    origQty: String(order.origQty ?? order.q ?? "0"),
-    executedQty: String(order.executedQty ?? order.z ?? "0"),
-    updateTime: Number(order.updateTime ?? order.T ?? order.E ?? Date.now()),
-    receivedAt,
-    algoOrder: order.algoOrder === true,
-  };
-
-  return normalized.symbol && normalized.orderId !== undefined
-    ? normalized
-    : null;
-}
-
-function isOpenOrder(order) {
-  return ["NEW", "PARTIALLY_FILLED"].includes(order.status) &&
-    Number(order.origQty) - Number(order.executedQty) > 0;
-}
-
 function updateChartOrderStatus() {
   const total = chart.totalPlaceOrderCount ?? chart.placeOrder.length;
   const visible = chart.visiblePlaceOrderCount ?? 0;
@@ -3095,15 +3097,8 @@ function syncTrackedOpenOrders() {
 }
 
 function applyOpenOrderUpdate(order, receivedAt = Date.now()) {
-  const normalized = normalizeOpenOrder(order, receivedAt);
-  if (!normalized) return;
-
-
-    const existing = openOrdersByKey.get(key);
-  if (existing && existing.receivedAt > normalized.receivedAt) return;
-
-  if (isOpenOrder(normalized)) openOrdersByKey.set(key, normalized);
-  else openOrdersByKey.delete(key);
+  const result = updateOpenOrderMap(openOrdersByKey, order, receivedAt);
+  if (!result.updated) return;
   syncTrackedOpenOrders();
 }
 
@@ -3332,6 +3327,19 @@ window.binance.onAccountMetricsStatus((status = {}) => {
   if (status.status === "error") {
     elements.managerUserInfoStatus.textContent =
       `Binance 资金刷新失败：${status.error?.message || "未知错误"}`;
+  }
+});
+
+window.binance.onManagerTradingInfoSyncStatus((status = {}) => {
+  if (status.status === "synced") {
+    elements.managerUserInfoStatus.textContent =
+      `Binance 资金已同步新期管理端 / ` +
+      `${new Date(status.syncedAt || Date.now()).toLocaleString()}`;
+    return;
+  }
+  if (status.status === "error") {
+    elements.managerUserInfoStatus.textContent =
+      `资金同步管理端失败：${status.error?.message || "未知错误"}`;
   }
 });
 

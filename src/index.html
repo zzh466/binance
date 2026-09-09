@@ -794,7 +794,7 @@
           <h2>交易回合</h2>
           <p class="muted">
             只按 Binance 已确认的实际成交增量计算。多向成交 = 开多 + 平空，空向成交 = 开空 + 平多；
-            两边手数相等时回合完成，超出的成交量自动进入该合约的下一个回合。
+            两边手数相等时回合完成，超出的成交量自动进入该合约的下一个回合。多、空均价分别按对应方向的成交总价除以成交总手数动态计算。
           </p>
           <div class="order-history-toolbar">
             <button id="refreshTradingRoundsButton">刷新回合列表</button>
@@ -813,14 +813,16 @@
                   <th>开空</th>
                   <th>平多</th>
                   <th>多向合计</th>
+                  <th>多向均价</th>
                   <th>空向合计</th>
+                  <th>空向均价</th>
                   <th>待匹配</th>
                   <th>开始时间</th>
                   <th>结束时间</th>
                 </tr>
               </thead>
               <tbody id="tradingRoundsBody">
-                <tr><td colspan="13">等待实际成交数据</td></tr>
+                <tr><td colspan="15">等待实际成交数据</td></tr>
               </tbody>
             </table>
           </div>
@@ -956,7 +958,7 @@
           <h2>管理端用户与账户信息</h2>
           <p class="muted">
             账号身份从新期管理端读取；当前账号的权益、可用资金和盈亏从 Binance
-            自动刷新。交易密钥和授权码不会显示在页面中。
+            自动刷新，并每 2 秒同步回新期管理端。交易密钥和授权码不会显示在页面中。
           </p>
           <div class="toolbar">
             <button id="refreshManagerUserInfoButton">刷新管理端账户信息</button>
@@ -1307,6 +1309,7 @@
     </dialog>
 
     <script src="./shortcutSettings.js"></script>
+    <script src="./openOrderState.js"></script>
     <script src="./renderer.js"></script>
   </body>
 </html>

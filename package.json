@@ -6,7 +6,8 @@
   "description": "Electron Binance Spot and USD-M Futures unified trading console",
   "main": "src/main.js",
   "scripts": {
-    "start": "electron .",
+    "start": "node scripts/dev.js",
+    "start:once": "electron .",
     "build:mac": "zsh scripts/build-mac-app.sh",
     "build:win": "electron-builder --win --x64",
     "build:win:arm64": "electron-builder --win --arm64",

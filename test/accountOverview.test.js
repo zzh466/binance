@@ -52,6 +52,7 @@ test("账号信息行采用管理端身份和 Binance 实时账户指标", () =>
     latency: { success: true, elapsedMs: 83.5 },
     accountMetrics: {
       realProfit: "7.25",
+      commission: "0.75",
       available: "88.5",
       currency: "USDT",
       updatedAt: 123456,
@@ -62,11 +63,11 @@ test("账号信息行采用管理端身份和 Binance 实时账户指标", () =>
   assert.equal(overview.managementStatus, "正常");
   assert.equal(overview.currentAccount, "account-b");
   assert.equal(overview.connectionTone, "medium");
-  assert.equal(overview.commission, "0.002");
+  assert.equal(overview.commission, "0.75");
   assert.equal(overview.currentAccountProfit, "7.25");
   assert.equal(overview.actualProfit, "7.25");
   assert.equal(overview.availableFunds, "88.5");
   assert.equal(overview.liquidationLine, "100000");
-  assert.equal(overview.totalActualProfit, "31.25");
+  assert.equal(overview.totalActualProfit, "7.25");
   assert.equal(overview.metricsUpdatedAt, 123456);
 });

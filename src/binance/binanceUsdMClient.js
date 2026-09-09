@@ -1157,6 +1157,10 @@ class BinanceUsdMClient extends BinanceSpotClient {
       origQty: order.quantity ?? order.origQty ?? order.q ?? "0",
       executedQty:
         order.executedQty ?? order.actualExecutedQty ?? order.z ?? "0",
+      averagePrice:
+        order.avgPrice ?? order.averagePrice ?? order.ap ?? "0",
+      cumulativeQuoteQty:
+        order.cumQuote ?? order.cumulativeQuoteQty ?? order.Z ?? "0",
       reduceOnly: order.reduceOnly ?? order.R,
       closePosition: order.closePosition ?? order.cp,
       updateTime:
@@ -1656,6 +1660,8 @@ class BinanceUsdMClient extends BinanceSpotClient {
         l: order.lastExecutedQty ?? order.l ?? "0",
         z: normalized.executedQty,
         L: order.lastExecutedPrice ?? order.L ?? "0",
+        ap: normalized.averagePrice,
+        cumQuote: normalized.cumulativeQuoteQty,
         ps: order.positionSide ?? order.ps,
         positionSide: order.positionSide ?? order.ps,
         R: order.reduceOnly ?? order.R,
@@ -1716,6 +1722,8 @@ class BinanceUsdMClient extends BinanceSpotClient {
       l: order.l,
       z: order.z,
       L: order.L,
+      ap: order.ap,
+      cumQuote: order.cumQuote,
       n: order.n,
       N: order.N,
       t: order.t,

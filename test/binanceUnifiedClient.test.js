@@ -942,6 +942,7 @@ test("永续 ORDER_TRADE_UPDATE 被转换为现有界面可消费的 executionRe
       i: 9,
       l: "0",
       z: "0",
+      ap: "199.5",
     },
   });
 
@@ -949,6 +950,7 @@ test("永续 ORDER_TRADE_UPDATE 被转换为现有界面可消费的 executionRe
   assert.equal(result.s, "SKHYUSDT");
   assert.equal(result.i, 9);
   assert.equal(result.X, "NEW");
+  assert.equal(result.ap, "199.5");
   client.close();
 });
 

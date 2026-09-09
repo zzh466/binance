@@ -5,6 +5,8 @@ const MANAGER_API_BASE_URL = "http://139.196.41.155:8082/vtpmanagerapi";
 const LOGIN_PATH = "/access/loginClientDAT";
 const USER_INFO_PATH = "/user/info";
 const PROPERTY_PATH = "/property/info";
+const FUTURE_ACCOUNT_TRADING_INFO_PATH =
+  "/future/futureAccountTradingInfo";
 const REQUIRED_PROPERTY_KEYS = [
   "BINANCE_SPOT_LINK_ID",
   "BINANCE_FUTURES_LINK_ID",
@@ -90,6 +92,46 @@ function normalizePropertyValue(value) {
     }
   }
   return trimmed;
+}
+
+function normalizeFutureAccountTradingInfo(payload = {}) {
+  const id = Number(payload.id);
+  if (!Number.isSafeInteger(id) || id <= 0) {
+    throw new TypeError("同步账号资金时必须提供有效的账号 id。");
+  }
+  const result = { id };
+  for (const field of [
+    "staticBalance",
+    "balance",
+    "available",
+    "closeProfit",
+    "commission",
+    "deviation",
+    "margin",
+    "positionProfit",
+    "realProfit",
+  ]) {
+    if (
+      payload[field] === undefined ||
+      payload[field] === null ||
+      String(payload[field]).trim() === ""
+    ) {
+      throw new TypeError(`同步账号资金时 ${field} 不能为空。`);
+    }
+    const value = Number(payload[field]);
+    if (!Number.isFinite(value)) {
+      throw new TypeError(`同步账号资金时 ${field} 必须是有效数字。`);
+    }
+    result[field] = value;
+  }
+  for (const field of ["openVolume", "orderVolume"]) {
+    const value = Number(payload[field]);
+    if (!Number.isSafeInteger(value) || value < 0) {
+      throw new TypeError(`同步账号资金时 ${field} 必须是非负整数。`);
+    }
+    result[field] = value;
+  }
+  return result;
 }
 
 function validateSuccessfulResponse(payload, response, operation) {
@@ -343,6 +385,14 @@ class ManagerClientService {
     });
   }
 
+  async updateFutureAccountTradingInfo(payload) {
+    return this.requestJson(FUTURE_ACCOUNT_TRADING_INFO_PATH, {
+      method: "PATCH",
+      operation: "同步 Binance 账号交易指标",
+      body: normalizeFutureAccountTradingInfo(payload),
+    });
+  }
+
   async getProperty(key) {
     const normalizedKey = String(key || "").trim();
     if (!normalizedKey) throw new TypeError("系统配置 key 不能为空。");
@@ -371,6 +421,7 @@ class ManagerClientService {
 
 module.exports = {
   CLIENT_VERSION,
+  FUTURE_ACCOUNT_TRADING_INFO_PATH,
   LOGIN_PATH,
   MANAGER_API_BASE_URL,
   USER_INFO_PATH,
@@ -380,6 +431,7 @@ module.exports = {
   getAccountApiKey,
   interfaceNamePriority,
   normalizeMacAddress,
+  normalizeFutureAccountTradingInfo,
   normalizePropertyValue,
   mergeManagerAccountInfo,
   resolveSelectedAccount,

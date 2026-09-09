@@ -2,9 +2,11 @@ const assert = require("node:assert/strict");
 const test = require("node:test");
 const {
   CLIENT_VERSION,
+  FUTURE_ACCOUNT_TRADING_INFO_PATH,
   ManagerClientService,
   getAccountChoices,
   mergeManagerAccountInfo,
+  normalizeFutureAccountTradingInfo,
   resolveSelectedAccount,
   sanitizeManagerUserInfo,
   selectPreferredMac,
@@ -229,4 +231,123 @@ test("系统配置接口读取两个 LinkID", async () => {
     BINANCE_FUTURES_LINK_ID: "futures-code",
   });
   assert.equal(requestedUrls.length, 2);
+});
+
+test("账号交易指标使用 PATCH 且不会携带密钥", async () => {
+  const requests = [];
+  const service = new ManagerClientService({
+    fetchImpl: async (url, options) => {
+      requests.push({ url, options });
+      return jsonResponse({ code: "REQ_SUCCESS", msg: "响应成功" });
+    },
+  });
+
+  await service.updateFutureAccountTradingInfo({
+    id: "233",
+    staticBalance: "100.25",
+    balance: "101.5",
+    available: "88.75",
+    closeProfit: "2.5",
+    commission: "0.25",
+    deviation: "0",
+    margin: "12.75",
+    openVolume: 2,
+    orderVolume: 3,
+    positionProfit: "-1",
+    realProfit: "1.25",
+    futureUserPwd: "不得发送",
+  });
+
+  assert.equal(requests.length, 1);
+  assert.equal(
+    requests[0].url,
+    `http://139.196.41.155:8082/vtpmanagerapi${FUTURE_ACCOUNT_TRADING_INFO_PATH}`
+  );
+  assert.equal(requests[0].options.method, "PATCH");
+  assert.equal(requests[0].options.useSessionCookies, true);
+  assert.deepEqual(JSON.parse(requests[0].options.body), {
+    id: 233,
+    staticBalance: 100.25,
+    balance: 101.5,
+    available: 88.75,
+    closeProfit: 2.5,
+    commission: 0.25,
+    deviation: 0,
+    margin: 12.75,
+    positionProfit: -1,
+    realProfit: 1.25,
+    openVolume: 2,
+    orderVolume: 3,
+  });
+});
+
+test("账号资金同步拒绝无效 id 和非数字资金字段", () => {
+  assert.throws(
+    () => normalizeFutureAccountTradingInfo({
+      id: null,
+      staticBalance: 1,
+      balance: 1,
+      available: 1,
+      closeProfit: 1,
+      commission: 1,
+      deviation: 0,
+      margin: 1,
+      openVolume: 1,
+      orderVolume: 1,
+      positionProfit: 1,
+      realProfit: 1,
+    }),
+    /账号 id/
+  );
+  assert.throws(
+    () => normalizeFutureAccountTradingInfo({
+      id: 233,
+      staticBalance: 1,
+      balance: "not-a-number",
+      available: 1,
+      closeProfit: 1,
+      commission: 1,
+      deviation: 0,
+      margin: 1,
+      openVolume: 1,
+      orderVolume: 1,
+      positionProfit: 1,
+      realProfit: 1,
+    }),
+    /balance/
+  );
+  assert.throws(
+    () => normalizeFutureAccountTradingInfo({
+      id: 233,
+      staticBalance: 1,
+      balance: 1,
+      available: null,
+      closeProfit: 1,
+      commission: 1,
+      deviation: 0,
+      margin: 1,
+      openVolume: 1,
+      orderVolume: 1,
+      positionProfit: 1,
+      realProfit: 1,
+    }),
+    /available/
+  );
+  assert.throws(
+    () => normalizeFutureAccountTradingInfo({
+      id: 233,
+      staticBalance: 1,
+      balance: 1,
+      available: 1,
+      closeProfit: 1,
+      commission: 1,
+      deviation: 0,
+      margin: 1,
+      openVolume: 0.001,
+      orderVolume: 1,
+      positionProfit: 1,
+      realProfit: 1,
+    }),
+    /openVolume/
+  );
 });
