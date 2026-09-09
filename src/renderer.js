@@ -590,14 +590,15 @@ class Chart {
     renderTradeOrder(){
         const _x = X + 50;
         const _y = Y + 17;
-        const {price, direction} = this.traded;
+        const {price, direction, amount} = this.traded;
         const {ctx , width, start, barWidth} = this;
+        
         if(!this.data.length)return;
         ctx.clearRect(0, _y - 1 , width, 10)
-        if(direction && price.length){
+        if(direction && amount){
             ctx.save();
-            const average = price.reduce((a,b)=> a + parseFloat(b), 0) / price.length;
-            const index = this.getindex(average, true)- start;
+           
+            const index = this.getindex(price, true)- start;
             let cindex;
             if(direction === '0'){
                 cindex = this.buyIndex;
@@ -629,7 +630,7 @@ class Chart {
             ctx.fillStyle = color;
             ctx.fillRect(_x + begin * barWidth, _y , (end - begin + 1) * barWidth, 7);
             ctx.fillStyle = '#fff';
-            ctx.fillText(price.length, _x+cindex * barWidth + 5, _y + 8)
+            ctx.fillText(amount, _x+cindex * barWidth + 5, _y + 8)
             ctx.restore()
         }
     }
@@ -1261,12 +1262,17 @@ function renderTradingRounds(rounds, { merge = false } = {}) {
   for (const round of visibleRounds) {
     const row = document.createElement("tr");
     if(round.status !== 'COMPLETED' && round.symbol === chartSymbol){
-      const direction = round.remainingDirection === 'LONG'? '1' : '0';
-      const price = 0;
-      if(chart.traded.price !== price && chart.traded.direction !== direction){
+      
+      const _long = round.remainingDirection === 'LONG';
+      const direction = _long? '0' : '1';
+      let price = _long?round.longAveragePrice: round.shortAveragePrice;
+      const amount = _long? (+round.openShortQty|| +round.closeShortQty): (+round.openLongQty || +round.closeLongQty)
+      price = parseFloat(price).toFixed(2)
+      if(chart.traded.price !== price && chart.traded.direction !== direction && chart.traded.amount !== amount){
         chart.traded = {
           direction,
-          price
+          price,
+          amount
         };
         chart.renderTradeOrder();
       }
@@ -2533,6 +2539,7 @@ chartDom.addEventListener('mousemove', function(event){
     mousebar.style.display = 'none';
     return;
   }
+  
   mousebar.style.display = 'block';
   mousebar.style.left = `${selection.cssLeft}px`;
   mousebar.style.width = `${Math.max(1, selection.cssBarWidth)}px`;
