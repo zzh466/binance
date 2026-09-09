@@ -5,6 +5,7 @@ const {
   getAdditionalInstanceLaunch,
   getPackagedEnvironmentPath,
   resolveCurlExecutable,
+  shouldShowWindowImmediately,
 } = require("../src/platformSupport");
 const { BinanceUsdMClient } = require("../src/binance/binanceUsdMClient");
 
@@ -19,6 +20,12 @@ test("curl 可执行文件同时支持 macOS 和 Windows", () => {
     }),
     "D:\\Tools\\curl.exe"
   );
+});
+
+test("Windows 窗口立即显示，macOS 等待页面准备完成", () => {
+  assert.equal(shouldShowWindowImmediately("win32"), true);
+  assert.equal(shouldShowWindowImmediately("darwin"), false);
+  assert.equal(shouldShowWindowImmediately("linux"), false);
 });
 
 test("打包应用从各自平台的可执行文件旁读取 .env", () => {

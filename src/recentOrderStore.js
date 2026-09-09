@@ -130,6 +130,11 @@ function normalizeRecentOrder(order, context = {}, now = Date.now()) {
     updatedAt,
     observedAt: now,
     terminal: TERMINAL_ORDER_STATUSES.has(status),
+    submissionSource: String(firstPresent(
+      order.submissionSource,
+      context.submissionSource,
+      ""
+    ) || ""),
     source: String(context.source || "unknown"),
     statusHistory: [{ status, updatedAt, observedAt: now }],
   };

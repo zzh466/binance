@@ -13,9 +13,59 @@ function createClient(testnet = true) {
 test("交易地址随环境切换", () => {
   const testnet = createClient(true);
   assert.match(testnet.tradingRestBase, /testnet/);
+  assert.equal(
+    testnet.tradingWsApiBase,
+    "wss://ws-api.testnet.binance.vision/ws-api/v3"
+  );
 
   const production = createClient(false);
   assert.doesNotMatch(production.tradingRestBase, /testnet/);
+});
+
+test("现货 Testnet REST 返回 502 时公共查询自动改走 WebSocket API", async () => {
+  const client = createClient(true);
+  const wsCalls = [];
+  client.request = async () => {
+    throw new BinanceApiError("Binance HTTP 502", { status: 502 });
+  };
+  client.requestPublicWsApi = async (path, params) => {
+    wsCalls.push({ path, params });
+    return {
+      symbols: [{ symbol: params.symbol, status: "TRADING", filters: [] }],
+    };
+  };
+
+  const result = await client.exchangeInfo("BTCUSDT");
+
+  assert.equal(result.symbol.symbol, "BTCUSDT");
+  assert.deepEqual(wsCalls, [{
+    path: "/v3/exchangeInfo",
+    params: { symbol: "BTCUSDT" },
+  }]);
+  client.close();
+});
+
+test("现货 Testnet 的 4xx 业务错误不会被当作网络故障重试", async () => {
+  const client = createClient(true);
+  let wsCallCount = 0;
+  const originalError = new BinanceApiError("Invalid symbol.", {
+    status: 400,
+    code: -1121,
+  });
+  client.request = async () => {
+    throw originalError;
+  };
+  client.requestPublicWsApi = async () => {
+    wsCallCount += 1;
+    return {};
+  };
+
+  await assert.rejects(
+    client.exchangeInfo("BADUSDT"),
+    (error) => error === originalError
+  );
+  assert.equal(wsCallCount, 0);
+  client.close();
 });
 
 test("正式环境公共行情使用 Binance Vision，交易仍使用正式交易域名", () => {

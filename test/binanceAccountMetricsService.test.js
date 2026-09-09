@@ -4,12 +4,77 @@ const {
   BinanceAccountMetricsService,
   SpotPnlStore,
   buildTickerPriceMap,
+  buildFuturesPositionRows,
+  buildSpotPositionRows,
   convertAssetToUsdt,
   normalizeSpotFill,
   summarizeSpotTradeHistory,
   summarizeFuturesIncome,
   valueSpotBalances,
 } = require("../src/binanceAccountMetricsService");
+
+test("当前持仓快照过滤零余额并统一现货和 U 本位字段", () => {
+  const prices = buildTickerPriceMap([
+    { symbol: "BTCUSDT", price: "50" },
+  ]);
+  const spotRows = buildSpotPositionRows([
+    { asset: "USDT", free: "100", locked: "0" },
+    { asset: "BTC", free: "1", locked: "0.5" },
+    { asset: "ETH", free: "0", locked: "0" },
+  ], prices, {
+    BTC: { quantity: "1.5", costUsdt: "60" },
+  }, 1234);
+  assert.deepEqual(spotRows, [{
+    marketType: "spot",
+    symbol: "BTCUSDT",
+    asset: "BTC",
+    side: "LONG",
+    positionAmount: "1.5",
+    availableAmount: "1",
+    lockedAmount: "0.5",
+    entryPrice: "40",
+    markPrice: "50",
+    notionalUsdt: "75",
+    unrealizedPnl: "15",
+    leverage: "1",
+    marginMode: "现货",
+    updateTime: 1234,
+  }]);
+
+  const futuresRows = buildFuturesPositionRows({
+    positions: [
+      {
+        symbol: "BTCUSDT",
+        positionAmt: "-0.02",
+        entryPrice: "60000",
+        notional: "-1220",
+        unrealizedProfit: "-20",
+        positionInitialMargin: "122",
+        leverage: "10",
+        isolated: false,
+        updateTime: 1200,
+      },
+      { symbol: "ETHUSDT", positionAmt: "0" },
+    ],
+  }, 1234);
+  assert.equal(futuresRows.length, 1);
+  assert.deepEqual(futuresRows[0], {
+    marketType: "futures",
+    symbol: "BTCUSDT",
+    asset: "BTCUSDT",
+    side: "SHORT",
+    positionAmount: "0.02",
+    availableAmount: null,
+    lockedAmount: "122",
+    entryPrice: "60000",
+    markPrice: "61000",
+    notionalUsdt: "1220",
+    unrealizedPnl: "-20",
+    leverage: "10",
+    marginMode: "全仓",
+    updateTime: 1200,
+  });
+});
 
 test("现货资产可按直接、反向和 BTC 中间价折算为 USDT", () => {
   const prices = buildTickerPriceMap([
@@ -181,7 +246,14 @@ test("账户指标合并现货 USDT 估值与 U 本位账户数据", async () =>
         totalUnrealizedProfit: "2",
         totalInitialMargin: "4",
         positions: [
-          { symbol: "BTCUSDT", positionAmt: "0.01" },
+          {
+            symbol: "BTCUSDT",
+            positionAmt: "0.01",
+            entryPrice: "49000",
+            notional: "500",
+            unrealizedProfit: "2",
+            leverage: "20",
+          },
           { symbol: "ETHUSDT", positionAmt: "0" },
         ],
       }),
@@ -211,6 +283,10 @@ test("账户指标合并现货 USDT 估值与 U 本位账户数据", async () =>
   assert.equal(metrics.openVolume, 2);
   assert.equal(metrics.orderVolume, 3);
   assert.equal(metrics.spot.realizedPnl24h, "0");
+  assert.equal(metrics.positions.length, 2);
+  assert.equal(metrics.positions[0].marketType, "futures");
+  assert.equal(metrics.positions[1].symbol, "BTCUSDT");
+  assert.equal(metrics.positionsComplete, true);
   assert.deepEqual(metrics.warnings, []);
   assert.deepEqual(valueSpotBalances([
     { asset: "USDT", free: "1", locked: "2" },
@@ -220,6 +296,38 @@ test("账户指标合并现货 USDT 估值与 U 本位账户数据", async () =>
     lockedUsdt: "2",
     unpricedAssets: [],
   });
+});
+
+test("U 本位账户暂时失败时仍保留已经查到的现货持仓", async () => {
+  const service = new BinanceAccountMetricsService({ now: () => 15_000_000 });
+  const metrics = await service.refresh({
+    client: {
+      spot: {
+        apiKey: "spot-key",
+        apiSecret: "spot-secret",
+        accountStatus: async () => ({
+          balances: [{ asset: "BTC", free: "0.2", locked: "0" }],
+        }),
+        tickerPrices: async () => [{ symbol: "BTCUSDT", price: "50000" }],
+      },
+      futures: {
+        apiKey: "futures-key",
+        apiSecret: "futures-secret",
+        accountStatus: async () => {
+          throw new Error("futures unavailable");
+        },
+        incomeHistory: async () => [],
+      },
+    },
+    environment: "production",
+    accountFingerprint: "account",
+  });
+
+  assert.equal(metrics.positions.length, 1);
+  assert.equal(metrics.positions[0].marketType, "spot");
+  assert.equal(metrics.positions[0].symbol, "BTCUSDT");
+  assert.equal(metrics.positionsComplete, false);
+  assert.equal(metrics.warnings[0].marketType, "futures");
 });
 
 test("现货 executionReport 成交可以即时写入已初始化账本", async () => {

@@ -10,6 +10,10 @@ function resolveCurlExecutable({
   return platform === "darwin" ? "/usr/bin/curl" : "curl";
 }
 
+function shouldShowWindowImmediately(platform = process.platform) {
+  return platform === "win32";
+}
+
 function getPackagedEnvironmentPath({
   isPackaged,
   platform = process.platform,
@@ -58,4 +62,5 @@ module.exports = {
   getAdditionalInstanceLaunch,
   getPackagedEnvironmentPath,
   resolveCurlExecutable,
+  shouldShowWindowImmediately,
 };

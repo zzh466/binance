@@ -68,6 +68,8 @@ contextBridge.exposeInMainWorld("binance", {
     ipcRenderer.invoke("binance:my-trades", options || {}),
   accountStatus: (options) =>
     ipcRenderer.invoke("binance:account-status", options || {}),
+  currentPositions: () =>
+    ipcRenderer.invoke("binance:current-positions"),
   tradingSafetyStatus: () =>
     ipcRenderer.invoke("binance:trading-safety-status"),
   accountRateLimits: (options) =>
@@ -111,6 +113,8 @@ contextBridge.exposeInMainWorld("binance", {
     subscribe("manager:user-info-update", callback),
   onAccountMetricsStatus: (callback) =>
     subscribe("manager:account-metrics-status", callback),
+  onPositionsUpdate: (callback) =>
+    subscribe("binance:positions-update", callback),
   onManagerTradingInfoSyncStatus: (callback) =>
     subscribe("manager:trading-info-sync-status", callback),
   onRateLimitUpdate: (callback) =>

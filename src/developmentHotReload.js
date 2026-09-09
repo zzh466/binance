@@ -3,6 +3,7 @@ const path = require("node:path");
 
 const MAIN_RENDERER_FILES = new Set([
   "chart.js",
+  "chartOrderSelection.js",
   "index.html",
   "openOrderState.js",
   "preload.js",
@@ -33,11 +34,17 @@ function isDevelopmentMode({
   return !isPackaged && environment.BINANCE_DEV_HOT_RELOAD === "true";
 }
 
-function openDevelopmentTools(browserWindow, { enabled } = {}) {
+function openDevelopmentTools(
+  browserWindow,
+  { enabled, platform = process.platform } = {}
+) {
   const webContents = browserWindow?.webContents;
   if (!enabled || !webContents || webContents.isDestroyed?.()) return false;
   if (!webContents.isDevToolsOpened()) {
-    webContents.openDevTools({ mode: "detach", activate: true });
+    webContents.openDevTools({
+      mode: "detach",
+      activate: platform !== "win32",
+    });
   }
   return true;
 }

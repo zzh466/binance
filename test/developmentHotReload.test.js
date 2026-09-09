@@ -160,3 +160,20 @@ test("开发者模式自动打开独立调试控制台，热刷新时不会重�
   );
   assert.equal(openOptions.length, 1);
 });
+
+test("Windows 自动打开调试控制台但不抢走主窗口焦点", () => {
+  const openOptions = [];
+  const browserWindow = {
+    webContents: {
+      isDestroyed: () => false,
+      isDevToolsOpened: () => false,
+      openDevTools: (options) => openOptions.push(options),
+    },
+  };
+
+  assert.equal(openDevelopmentTools(browserWindow, {
+    enabled: true,
+    platform: "win32",
+  }), true);
+  assert.deepEqual(openOptions, [{ mode: "detach", activate: false }]);
+});

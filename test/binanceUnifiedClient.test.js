@@ -3,6 +3,8 @@ const test = require("node:test");
 const { BinanceApiError } = require("../src/binance/binanceSpotClient");
 const {
   BinanceUsdMClient,
+  FUTURES_REST_BASE,
+  FUTURES_WS_BASE,
   FUTURES_WS_API_BASE,
 } = require("../src/binance/binanceUsdMClient");
 const {
@@ -744,6 +746,10 @@ test("USDⓈ-M 正式和测试环境使用各自官方 WebSocket API", () => {
   const testnet = new BinanceUsdMClient({ testnet: true });
   assert.equal(production.tradingWsApiBase, FUTURES_WS_API_BASE.production);
   assert.equal(testnet.tradingWsApiBase, FUTURES_WS_API_BASE.testnet);
+  assert.equal(testnet.restBase, "https://testnet.binancefuture.com");
+  assert.equal(testnet.restBase, FUTURES_REST_BASE.testnet);
+  assert.equal(testnet.wsBase, "wss://stream.binancefuture.com/ws");
+  assert.equal(testnet.wsBase, FUTURES_WS_BASE.testnet);
   production.close();
   testnet.close();
 });

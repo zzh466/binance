@@ -804,6 +804,11 @@ const elements = {
   environmentSwitchStatus: document.querySelector("#environmentSwitchStatus"),
   environmentWarning: document.querySelector("#environmentWarning"),
   accountOverviewBody: document.querySelector("#accountOverviewBody"),
+  refreshCurrentPositionsButton: document.querySelector(
+    "#refreshCurrentPositionsButton"
+  ),
+  currentPositionsStatus: document.querySelector("#currentPositionsStatus"),
+  currentPositionsBody: document.querySelector("#currentPositionsBody"),
   managerAccount: document.querySelector("#managerAccount"),
   refreshManagerUserInfoButton: document.querySelector(
     "#refreshManagerUserInfoButton"
@@ -1061,6 +1066,95 @@ function formatOrderTime(value) {
 
   return new Date(timestamp).toLocaleString();
 }
+
+function formatPositionValue(value) {
+  return value === undefined || value === null || value === "" ? "-" : String(value);
+}
+
+function renderCurrentPositionsSnapshot(snapshot = {}) {
+  const positions = Array.isArray(snapshot.positions) ? snapshot.positions : [];
+  const fragment = document.createDocumentFragment();
+
+  if (!positions.length) {
+    const row = document.createElement("tr");
+    const cell = document.createElement("td");
+    cell.colSpan = 13;
+    cell.textContent = "当前账户在现货和 U 本位永续中没有可展示的持仓";
+    row.append(cell);
+    fragment.append(row);
+  } else {
+    for (const position of positions) {
+      const row = document.createElement("tr");
+      const side = String(position.side || "").toUpperCase();
+      const pnlValue = position.unrealizedPnl;
+      const values = [
+        getMarketLabel(position.marketType),
+        position.symbol || position.asset,
+        side === "SHORT" ? "空" : "多",
+        position.positionAmount,
+        position.availableAmount,
+        position.lockedAmount,
+        position.entryPrice,
+        position.markPrice,
+        position.notionalUsdt,
+        pnlValue,
+        position.leverage,
+        position.marginMode,
+        formatOrderTime(position.updateTime),
+      ];
+      for (const [index, value] of values.entries()) {
+        const cell = document.createElement("td");
+        cell.textContent = formatPositionValue(value);
+        if (index === 2) {
+          cell.className = side === "SHORT"
+            ? "position-side-short"
+            : "position-side-long";
+        } else if (index === 9 && pnlValue !== null && pnlValue !== undefined) {
+          const numericPnl = Number(pnlValue);
+          if (numericPnl > 0) cell.className = "position-pnl-positive";
+          if (numericPnl < 0) cell.className = "position-pnl-negative";
+        }
+        row.append(cell);
+      }
+      fragment.append(row);
+    }
+  }
+
+  elements.currentPositionsBody.replaceChildren(fragment);
+  const spotCount = positions.filter((row) => row.marketType === "spot").length;
+  const futuresCount = positions.filter((row) => row.marketType === "futures").length;
+  const updatedAt = Number(snapshot.updatedAt);
+  const statusParts = [
+    `共 ${positions.length} 项（现货 ${spotCount} / U 本位 ${futuresCount}）`,
+    Number.isFinite(updatedAt) && updatedAt > 0
+      ? new Date(updatedAt).toLocaleString()
+      : "",
+    snapshot.complete === false ? "部分市场查询失败，已保留成功结果" : "",
+  ].filter(Boolean);
+  elements.currentPositionsStatus.textContent = statusParts.join(" / ");
+}
+
+async function refreshCurrentPositions({ showResult = true } = {}) {
+  elements.refreshCurrentPositionsButton.disabled = true;
+  elements.currentPositionsStatus.textContent = "正在刷新现货与 U 本位持仓…";
+  try {
+    const result = await window.binance.currentPositions();
+    if (showResult) printResult("当前持仓", result);
+    if (!result.ok) {
+      elements.currentPositionsStatus.textContent = formatError(result);
+      return;
+    }
+    renderCurrentPositionsSnapshot(result.data || {});
+  } catch (error) {
+    elements.currentPositionsStatus.textContent = error?.message || "刷新失败";
+  } finally {
+    elements.refreshCurrentPositionsButton.disabled = false;
+  }
+}
+
+elements.refreshCurrentPositionsButton.addEventListener("click", () => {
+  refreshCurrentPositions();
+});
 
 function renderOrders(orders, container = elements.orderHistoryBody) {
   container.replaceChildren();
@@ -2012,7 +2106,7 @@ document
 document
   .querySelector("#placeOrderButton")
   .addEventListener("click", async () => {
-    const order = readOrderForm();
+    const order = { ...readOrderForm(), triggerSource: "order-form" };
     const submittedAt = Date.now();
     const result = await submitOrderWithTradFiAgreement(order);
     printResult("下单结果", result);
@@ -2383,7 +2477,6 @@ elements.orderType.addEventListener("change", () => {
 const chartDom = document.querySelector('#can');
 const mousebar= document.querySelector("#mousebar")
 mousebar.style.width = '13px'
-let left = 0;
 const chart = new Chart(chartDom,980, 300, 0.01,{
     volumeScaleCount: 3,
     volumeScaleHeight: 25,
@@ -2398,55 +2491,92 @@ const chart = new Chart(chartDom,980, 300, 0.01,{
     calcBarType: 2
 
 });
-chartDom.addEventListener('mousemove', function(e){
-   const {x ,y} = e;
-      
-    if(x > 122  && x < 13 * chart.count + 124   && y > 370 && y < 590){
-      left = x - (x-123)%13 - 24;
-      
-      mousebar.style.display = 'block';
-      mousebar.style.left = left+'px'
-    }else {
-      mousebar.style.display = 'none';
-      left = 0
-    }
-})
-document.addEventListener('dblclick', async function(){
-  
-  if(left){
-     const index = (left - 123 + 24) / 13
-     let side 
-     let {buyIndex, askIndex, start} = chart;
-     if(index <= buyIndex){
-      side = 'BUY';
-     }else if(index >= askIndex){
-      side = 'SELL';
-     }else{
-      return
-     }
-     const price = chart.data[index- start].price;
-      const order = {
-        symbol: getSelectedSymbol(),
-        side,
-        type: 'LIMIT',
-        price,
-        stopPrice: '',
-        trailingDelta: '',
-        icebergQty: '',
-        timeInForce: "GTC" ,
-        quantity: '0.1'
-      };
-       const submittedAt = Date.now();
-      const result = await submitOrderWithTradFiAgreement(order);
-      printResult("下单结果", result);
+const chartOrderApi = window.ChartOrderSelection;
+const CHART_ORDER_COOLDOWN_MS = 800;
+let chartOrderBusy = false;
+let lastChartOrderAt = 0;
 
-      if (result.ok && result.data.orderId !== undefined) {
-        elements.orderId.value = String(result.data.orderId);
-        elements.queryOrderId.value = String(result.data.orderId);
-        applyConfirmedOrderResponse(result.data, submittedAt);
-      }
+function resolveChartPointer(event) {
+  return chartOrderApi.resolveChartOrderSelection({
+    clientX: event.clientX,
+    clientY: event.clientY,
+    bounds: chartDom.getBoundingClientRect(),
+    canvasWidth: chartDom.width,
+    canvasHeight: chartDom.height,
+    plotLeft: X + 50,
+    plotTop: Y + 30,
+    plotBottom: chart.height - 10,
+    barWidth: chart.barWidth,
+    count: chart.count,
+    start: chart.start,
+    buyIndex: chart.buyIndex,
+    askIndex: chart.askIndex,
+    data: chart.data,
+  });
+}
+
+chartDom.addEventListener('mousemove', function(event){
+  const selection = resolveChartPointer(event);
+  if (!selection) {
+    mousebar.style.display = 'none';
+    return;
   }
-})
+  mousebar.style.display = 'block';
+  mousebar.style.left = `${selection.cssLeft}px`;
+  mousebar.style.width = `${Math.max(1, selection.cssBarWidth)}px`;
+});
+
+chartDom.addEventListener('mouseleave', () => {
+  mousebar.style.display = 'none';
+});
+
+chartDom.addEventListener('dblclick', async function(event){
+  event.preventDefault();
+  const selection = resolveChartPointer(event);
+  if (!selection) return;
+
+  const now = Date.now();
+  if (chartOrderBusy || now - lastChartOrderAt < CHART_ORDER_COOLDOWN_MS) {
+    printResult("行情双击下单已忽略", {
+      ok: false,
+      error: { message: "上一笔行情双击订单仍在提交，或双击间隔过短。" },
+    });
+    return;
+  }
+
+  chartOrderBusy = true;
+  lastChartOrderAt = now;
+  const order = {
+    ...readOrderForm(),
+    symbol: getSelectedSymbol(),
+    side: selection.side,
+    type: 'LIMIT',
+    price: selection.price,
+    stopPrice: '',
+    trailingDelta: '',
+    icebergQty: '',
+    timeInForce: "GTC",
+    triggerSource: "chart-double-click",
+  };
+  const submittedAt = Date.now();
+
+  try {
+    const result = await submitOrderWithTradFiAgreement(order);
+    printResult("行情双击下单结果", result);
+    if (result.ok && result.data.orderId !== undefined) {
+      elements.orderId.value = String(result.data.orderId);
+      elements.queryOrderId.value = String(result.data.orderId);
+      applyConfirmedOrderResponse(result.data, submittedAt);
+    }
+  } catch (error) {
+    printResult("行情双击下单异常", {
+      ok: false,
+      error: { name: error.name, message: error.message },
+    });
+  } finally {
+    chartOrderBusy = false;
+  }
+});
 const SHORTCUT_STORAGE_KEY = "binanceShortcutSettingsV2";
 const LEGACY_SHORTCUT_STORAGE_KEY = "binanceShortcutSettingsV1";
 const COLORBLIND_STORAGE_KEY = "binanceColorblindModeV1";
@@ -2930,6 +3060,7 @@ async function placeOrderFromNumpad(shortcut) {
     ...(quoteTotalMode
       ? { quoteOrderQty: shortcut.quoteOrderQty }
       : { quantity: shortcut.quantity }),
+    triggerSource: `shortcut:${shortcut.key}`,
   };
   const submittedAt = Date.now();
   const result = await submitOrderWithTradFiAgreement(order);
@@ -3330,6 +3461,10 @@ window.binance.onAccountMetricsStatus((status = {}) => {
   }
 });
 
+window.binance.onPositionsUpdate((snapshot = {}) => {
+  renderCurrentPositionsSnapshot(snapshot);
+});
+
 window.binance.onManagerTradingInfoSyncStatus((status = {}) => {
   if (status.status === "synced") {
     elements.managerUserInfoStatus.textContent =
@@ -3445,6 +3580,7 @@ window.binance.onUserDataError((error) => {
 async function initializeApp() {
   await initializeShortcutSettings();
   await loadStatus();
+  await refreshCurrentPositions({ showResult: false });
   await refreshTradingRounds();
 
   const switchResultText = sessionStorage.getItem(

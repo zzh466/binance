@@ -86,6 +86,42 @@ test("订单状态按时间合并且 ACK 不会覆盖已经收到的最终状态
   assert.deepEqual(order.statusHistory.map(({ status }) => status), ["FILLED"]);
 });
 
+test("订单后续状态刷新不会丢失最初的下单触发来源", (t) => {
+  const now = new Date(2026, 8, 2, 12, 0, 0).getTime();
+  const { store } = createTemporaryStore(t, now);
+  const context = {
+    environment: "testnet",
+    accountFingerprint: "account-4",
+    marketType: "spot",
+  };
+
+  store.upsert({
+    symbol: "BTCUSDT",
+    orderId: 123,
+    clientOrderId: "chart-order",
+    status: "ACKNOWLEDGED",
+    transactTime: now - 1_000,
+  }, {
+    ...context,
+    submissionSource: "chart-double-click",
+    source: "place-order",
+  });
+  store.upsert({
+    symbol: "BTCUSDT",
+    orderId: 123,
+    clientOrderId: "chart-order",
+    status: "FILLED",
+    updateTime: now,
+  }, {
+    ...context,
+    source: "recent-account-orders",
+  });
+
+  const [order] = store.list();
+  assert.equal(order.status, "FILLED");
+  assert.equal(order.submissionSource, "chart-double-click");
+});
+
 test("状态库只保留滚动的最近 24 小时并可以重新加载", (t) => {
   const now = new Date(2026, 8, 2, 12, 0, 0).getTime();
   const cutoff = recent24HourCutoff(now);

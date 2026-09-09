@@ -20,6 +20,7 @@ const {
 const {
   getAdditionalInstanceLaunch,
   getPackagedEnvironmentPath,
+  shouldShowWindowImmediately,
 } = require("./platformSupport");
 const {
   SharedRateLimitCoordinator,
@@ -142,7 +143,7 @@ function fingerprintApiKey(apiKey) {
 function getOrderStoreContext(
   targetClient,
   marketType,
-  { defaultStatus, source } = {}
+  { defaultStatus, submissionSource, source } = {}
 ) {
   const marketClient = targetClient.getClient(marketType);
   return {
@@ -150,6 +151,7 @@ function getOrderStoreContext(
     accountFingerprint: fingerprintApiKey(marketClient.apiKey),
     marketType,
     defaultStatus,
+    submissionSource,
     source,
   };
 }
@@ -180,7 +182,13 @@ function collectOrderCandidates(payload, target = []) {
 
 function trackOrderPayload(
   payload,
-  { targetClient = client, marketType, defaultStatus, source } = {}
+  {
+    targetClient = client,
+    marketType,
+    defaultStatus,
+    submissionSource,
+    source,
+  } = {}
 ) {
   const saved = [];
   const affectedRoundIds = new Set();
@@ -191,7 +199,7 @@ function trackOrderPayload(
     const storeContext = getOrderStoreContext(
       targetClient,
       resolvedMarketType,
-      { defaultStatus, source }
+      { defaultStatus, submissionSource, source }
     );
     const result = recentOrderStore.upsert(
       order,
@@ -749,6 +757,32 @@ function openAdditionalInstances(count = 2) {
   return { launchedCount: launched.length, instances: launched };
 }
 
+function revealBrowserWindow(targetWindow) {
+  if (!targetWindow || targetWindow.isDestroyed()) return false;
+  if (targetWindow.isMinimized()) targetWindow.restore();
+  targetWindow.show();
+  targetWindow.focus();
+  return true;
+}
+
+function registerWindowLoadFallbacks(targetWindow, label) {
+  targetWindow.once("ready-to-show", () => revealBrowserWindow(targetWindow));
+  targetWindow.webContents.once("did-finish-load", () => {
+    revealBrowserWindow(targetWindow);
+  });
+  targetWindow.webContents.on(
+    "did-fail-load",
+    (_event, errorCode, errorDescription, validatedURL, isMainFrame) => {
+      if (isMainFrame === false) return;
+      process.stderr.write(
+        `[窗口加载失败] ${label}：${errorDescription || "未知错误"}` +
+        `（${errorCode || "无错误码"}）${validatedURL ? ` ${validatedURL}` : ""}\n`
+      );
+      revealBrowserWindow(targetWindow);
+    }
+  );
+}
+
 function createWindow() {
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.show();
@@ -759,7 +793,8 @@ function createWindow() {
     width: 1080,
     height: 820,
     resizable: true,
-    show: false,
+    show: shouldShowWindowImmediately(),
+    backgroundColor: "#111111",
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),
       contextIsolation: true,
@@ -768,8 +803,8 @@ function createWindow() {
     },
   });
 
-  mainWindow.loadFile(path.join(__dirname, "index.html"));
-  mainWindow.once("ready-to-show", () => mainWindow.show());
+  const targetWindow = mainWindow;
+  registerWindowLoadFallbacks(targetWindow, "主窗口");
   mainWindow.webContents.on("did-finish-load", () => {
     openDevelopmentTools(mainWindow, {
       enabled: isDevelopmentMode({
@@ -784,6 +819,10 @@ function createWindow() {
     if (hasAnyTradingCredentials(activeClient)) {
       connectUserDataInBackground(activeClient);
     }
+  });
+  void targetWindow.loadFile(path.join(__dirname, "index.html")).catch((error) => {
+    process.stderr.write(`[窗口加载失败] 主窗口：${error.message}\n`);
+    revealBrowserWindow(targetWindow);
   });
 
   mainWindow.on("closed", () => {
@@ -804,7 +843,8 @@ function createLoginWindow() {
     minWidth: 440,
     minHeight: 460,
     resizable: true,
-    show: false,
+    show: shouldShowWindowImmediately(),
+    backgroundColor: "#111111",
     webPreferences: {
       preload: path.join(__dirname, "loginPreload.js"),
       contextIsolation: true,
@@ -812,14 +852,18 @@ function createLoginWindow() {
       sandbox: true,
     },
   });
-  loginWindow.loadFile(path.join(__dirname, "login.html"));
-  loginWindow.once("ready-to-show", () => loginWindow.show());
+  const targetWindow = loginWindow;
+  registerWindowLoadFallbacks(targetWindow, "登录窗口");
   loginWindow.webContents.on("did-finish-load", () => {
     openDevelopmentTools(loginWindow, {
       enabled: isDevelopmentMode({
         isPackaged: app.isPackaged,
       }),
     });
+  });
+  void targetWindow.loadFile(path.join(__dirname, "login.html")).catch((error) => {
+    process.stderr.write(`[窗口加载失败] 登录窗口：${error.message}\n`);
+    revealBrowserWindow(targetWindow);
   });
   loginWindow.on("closed", () => {
     loginWindow = null;
@@ -1023,6 +1067,16 @@ function sendAccountOverviewToRenderer() {
   sendAccountDataToRenderer();
 }
 
+function buildCurrentPositionsPayload(metrics = latestBinanceAccountMetrics) {
+  return {
+    positions: Array.isArray(metrics?.positions) ? metrics.positions : [],
+    environment: metrics?.environment || (client.testnet ? "testnet" : "production"),
+    updatedAt: metrics?.updatedAt || null,
+    complete: metrics?.positionsComplete !== false,
+    warnings: Array.isArray(metrics?.warnings) ? metrics.warnings : [],
+  };
+}
+
 async function refreshBinanceAccountMetrics(
   targetClient = client,
   { reconcileHistory = true } = {}
@@ -1063,6 +1117,7 @@ async function refreshBinanceAccountMetrics(
     if (targetClient !== client) return metrics;
     latestBinanceAccountMetrics = metrics;
     sendAccountDataToRenderer();
+    sendToRenderer("binance:positions-update", buildCurrentPositionsPayload(metrics));
     sendToRenderer("manager:account-metrics-status", {
       status: "updated",
       updatedAt: metrics.updatedAt,
@@ -1505,9 +1560,17 @@ function registerIpcHandlers() {
   });
 
   ipcMain.handle("binance:place-order", async (_event, payload) => {
+    const { triggerSource, ...order } = payload || {};
+    const submissionSource = String(triggerSource || "unknown")
+      .replace(/[^A-Za-z0-9:_-]/g, "")
+      .slice(0, 64) || "unknown";
     return safeCall(() => trackOrderCall(
-      () => client.placeOrder(payload || {}),
-      { defaultStatus: "ACKNOWLEDGED", source: "place-order" }
+      () => client.placeOrder(order),
+      {
+        defaultStatus: "ACKNOWLEDGED",
+        submissionSource,
+        source: "place-order",
+      }
     ));
   });
 
@@ -1589,6 +1652,15 @@ function registerIpcHandlers() {
 
   ipcMain.handle("binance:account-status", async (_event, payload) => {
     return safeCall(() => client.accountStatus(payload || {}));
+  });
+
+  ipcMain.handle("binance:current-positions", async () => {
+    return safeCall(async () => {
+      const metrics = await refreshBinanceAccountMetrics(client, {
+        reconcileHistory: false,
+      });
+      return buildCurrentPositionsPayload(metrics);
+    });
   });
 
   ipcMain.handle("binance:trading-safety-status", async () => {

@@ -42,6 +42,13 @@ function negateDecimal(value) {
   return subtractDecimal("0", safeDecimal(value));
 }
 
+function absoluteDecimal(value) {
+  const normalized = safeDecimal(value);
+  return compareDecimal(normalized, "0") < 0
+    ? subtractDecimal("0", normalized)
+    : normalized;
+}
+
 function buildTickerPriceMap(tickers = []) {
   const prices = new Map();
   for (const ticker of Array.isArray(tickers) ? tickers : []) {
@@ -420,6 +427,20 @@ class SpotPnlStore {
     ).length;
   }
 
+  getPositionSnapshot(scopeKey) {
+    const state = this.getScope(scopeKey, { create: false });
+    if (!state) return {};
+    return Object.fromEntries(
+      Object.entries(state.positions || {}).map(([asset, position]) => [
+        asset,
+        {
+          quantity: safeDecimal(position?.quantity),
+          costUsdt: safeDecimal(position?.costUsdt),
+        },
+      ])
+    );
+  }
+
   getStatus(scopeKey) {
     const state = this.getScope(scopeKey, { create: false });
     if (!state) return null;
@@ -497,6 +518,101 @@ function valueSpotBalances(balances, prices) {
     if (lockedValue !== null) lockedUsdt = addDecimal(lockedUsdt, lockedValue);
   }
   return { totalBalanceUsdt, availableUsdt, lockedUsdt, unpricedAssets };
+}
+
+function buildSpotPositionRows(
+  balances,
+  prices,
+  ledgerPositions = {},
+  updatedAt = Date.now()
+) {
+  const rows = [];
+  for (const balance of Array.isArray(balances) ? balances : []) {
+    const asset = String(balance?.asset || "").toUpperCase();
+    if (!asset || asset === "USDT") continue;
+    const availableAmount = safeDecimal(balance?.free);
+    const lockedAmount = safeDecimal(balance?.locked);
+    const positionAmount = addDecimal(availableAmount, lockedAmount);
+    if (!isPositiveDecimal(positionAmount)) continue;
+
+    const ledgerPosition = ledgerPositions[asset];
+    const costUsdt = ledgerPosition && isPositiveDecimal(ledgerPosition.quantity)
+      ? safeDecimal(ledgerPosition.costUsdt)
+      : null;
+    const entryPrice = costUsdt !== null
+      ? divideDecimal(costUsdt, positionAmount)
+      : null;
+    const markPrice = convertAssetToUsdt(asset, "1", prices);
+    const notionalUsdt = convertAssetToUsdt(asset, positionAmount, prices);
+    const unrealizedPnl = notionalUsdt !== null && costUsdt !== null
+      ? subtractDecimal(notionalUsdt, costUsdt)
+      : null;
+
+    rows.push({
+      marketType: "spot",
+      symbol: prices.has(`${asset}USDT`) ? `${asset}USDT` : asset,
+      asset,
+      side: "LONG",
+      positionAmount,
+      availableAmount,
+      lockedAmount,
+      entryPrice,
+      markPrice,
+      notionalUsdt,
+      unrealizedPnl,
+      leverage: "1",
+      marginMode: "现货",
+      updateTime: updatedAt,
+    });
+  }
+  return rows;
+}
+
+function buildFuturesPositionRows(account = {}, updatedAt = Date.now()) {
+  const rows = [];
+  for (const position of Array.isArray(account?.positions) ? account.positions : []) {
+    const signedAmount = safeDecimal(position?.positionAmt);
+    if (compareDecimal(signedAmount, "0") === 0) continue;
+    const positionAmount = absoluteDecimal(signedAmount);
+    const notionalUsdt = absoluteDecimal(position?.notional);
+    const derivedMarkPrice = isPositiveDecimal(notionalUsdt)
+      ? divideDecimal(notionalUsdt, positionAmount)
+      : null;
+    const positionUpdateTime = Number(position?.updateTime);
+
+    rows.push({
+      marketType: "futures",
+      symbol: String(position?.symbol || "").toUpperCase(),
+      asset: String(position?.symbol || "").toUpperCase(),
+      side: compareDecimal(signedAmount, "0") > 0 ? "LONG" : "SHORT",
+      positionAmount,
+      availableAmount: null,
+      lockedAmount: safeDecimal(firstPresent(
+        position?.positionInitialMargin,
+        position?.initialMargin
+      )),
+      entryPrice: safeDecimal(position?.entryPrice, "") || null,
+      markPrice: safeDecimal(position?.markPrice, "") || derivedMarkPrice,
+      notionalUsdt,
+      unrealizedPnl: safeDecimal(position?.unrealizedProfit),
+      leverage: safeDecimal(position?.leverage, "") || null,
+      marginMode: position?.isolated === true || position?.isolated === "true"
+        ? "逐仓"
+        : "全仓",
+      updateTime: Number.isFinite(positionUpdateTime) && positionUpdateTime > 0
+        ? positionUpdateTime
+        : updatedAt,
+    });
+  }
+  return rows;
+}
+
+function comparePositionRows(left, right) {
+  const marketOrder = { futures: 0, spot: 1 };
+  const marketDifference = (marketOrder[left?.marketType] ?? 9) -
+    (marketOrder[right?.marketType] ?? 9);
+  if (marketDifference) return marketDifference;
+  return String(left?.symbol || "").localeCompare(String(right?.symbol || ""));
 }
 
 function summarizeFuturesIncome(entries, prices) {
@@ -710,6 +826,7 @@ class BinanceAccountMetricsService {
       unrealizedProfit: "0",
       openPositionCount: 0,
       unpricedAssets: [],
+      positions: [],
       ledger: null,
     };
 
@@ -780,6 +897,12 @@ class BinanceAccountMetricsService {
           this.spotPnlStore.getRollingCommission(scopeKey),
         unrealizedProfit: this.spotPnlStore.getUnrealizedPnl(scopeKey, prices),
         openPositionCount: this.spotPnlStore.getOpenPositionCount(scopeKey),
+        positions: buildSpotPositionRows(
+          balances,
+          prices,
+          this.spotPnlStore.getPositionSnapshot(scopeKey),
+          now
+        ),
         tradeHistory: tradeHistory ? {
           tradeCount: tradeHistory.tradeCount,
           incompleteSellCount: tradeHistory.incompleteSellCount,
@@ -854,7 +977,13 @@ class BinanceAccountMetricsService {
       ).length,
       realizedIncomeCount: futuresIncome.count,
       realizedIncomeUpdatedAt: futuresIncome.updatedAt,
+      positions: buildFuturesPositionRows(futuresAccount, now),
     };
+
+    const positions = [
+      ...futuresMetrics.positions,
+      ...spotMetrics.positions,
+    ].sort(comparePositionRows);
 
     return {
       environment,
@@ -906,6 +1035,12 @@ class BinanceAccountMetricsService {
         (!hasFutures || incomeResult.status === "fulfilled" || hadCachedFuturesIncome)
       ),
       historyReconciled: shouldReconcileHistory,
+      positions,
+      positionsComplete: (
+        (!hasSpot || spotResult.status === "fulfilled") &&
+        (!hasSpot || tickerResult.status === "fulfilled") &&
+        (!hasFutures || futuresResult.status === "fulfilled")
+      ),
       spot: spotMetrics,
       futures: futuresMetrics,
       warnings,
@@ -921,7 +1056,11 @@ module.exports = {
   BinanceAccountMetricsService,
   ROLLING_WINDOW_MS,
   SpotPnlStore,
+  absoluteDecimal,
+  buildFuturesPositionRows,
+  buildSpotPositionRows,
   buildTickerPriceMap,
+  comparePositionRows,
   convertAssetToUsdt,
   inferSymbolAssets,
   normalizeSpotFill,

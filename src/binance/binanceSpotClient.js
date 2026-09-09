@@ -30,6 +30,20 @@ const WS_API_BASE = {
   production: "wss://ws-api.binance.com:443/ws-api/v3",
 };
 
+const TESTNET_PUBLIC_WS_METHODS = new Map([
+  ["/v3/ping", "ping"],
+  ["/v3/time", "time"],
+  ["/v3/exchangeInfo", "exchangeInfo"],
+  ["/v3/ticker/price", "ticker.price"],
+  ["/v3/ticker/bookTicker", "ticker.book"],
+  ["/v3/avgPrice", "avgPrice"],
+  ["/v3/ticker/24hr", "ticker.24hr"],
+  ["/v3/trades", "trades.recent"],
+  ["/v3/historicalTrades", "trades.historical"],
+  ["/v3/aggTrades", "trades.aggregate"],
+  ["/v3/klines", "klines"],
+]);
+
 const DEPTH_SPEEDS = new Set(["100ms", "1000ms"]);
 const PARTIAL_DEPTH_LEVELS = 10;
 const SERVER_TIME_CACHE_TTL_MS = 120_000;
@@ -296,7 +310,7 @@ class BinanceSpotClient extends EventEmitter {
 
     const syncPromise = (async () => {
       const before = Date.now();
-      const result = await this.request("GET", this.timePath, {}, false, baseUrl);
+      const result = await this.requestPublicGet(this.timePath, {}, baseUrl);
       const after = Date.now();
 
       const localMidpoint = Math.floor((before + after) / 2);
@@ -503,6 +517,45 @@ class BinanceSpotClient extends EventEmitter {
     return data;
   }
 
+  shouldFallbackTestnetPublicRequest(error, path, baseUrl) {
+    if (
+      !this.testnet ||
+      baseUrl !== this.restBase ||
+      !TESTNET_PUBLIC_WS_METHODS.has(path)
+    ) {
+      return false;
+    }
+    const status = Number(error?.status);
+    return !Number.isFinite(status) || status >= 500;
+  }
+
+  async requestPublicWsApi(path, params = {}) {
+    const wsMethod = TESTNET_PUBLIC_WS_METHODS.get(path);
+    if (!wsMethod) {
+      throw new BinanceApiError(`现货 WebSocket API 不支持公共接口 ${path}。`);
+    }
+    const socket = await this.ensureTradingWebSocketReady();
+    const normalizedParams = Object.fromEntries(
+      Object.entries(params || {}).filter(([, value]) =>
+        value !== undefined && value !== null && value !== ""
+      )
+    );
+    return this.requestWsApiOnSocket(socket, wsMethod, normalizedParams, {
+      url: this.tradingWsApiBase,
+    });
+  }
+
+  async requestPublicGet(path, params = {}, baseUrl = this.restBase) {
+    try {
+      return await this.request("GET", path, params, false, baseUrl);
+    } catch (error) {
+      if (!this.shouldFallbackTestnetPublicRequest(error, path, baseUrl)) {
+        throw error;
+      }
+      return this.requestPublicWsApi(path, params);
+    }
+  }
+
   validateSymbol(symbol) {
     const normalized = String(symbol || "").trim().toUpperCase();
 
@@ -514,7 +567,7 @@ class BinanceSpotClient extends EventEmitter {
   }
 
   async ping() {
-    await this.request("GET", this.pingPath);
+    await this.requestPublicGet(this.pingPath);
     return {
       connected: true,
       environment: this.testnet ? "testnet" : "production",
@@ -558,7 +611,7 @@ class BinanceSpotClient extends EventEmitter {
 
     this.exchangeInfoRefreshAttemptAt.set(symbol, Date.now());
     const promise = (async () => {
-      const result = await this.request("GET", "/v3/exchangeInfo", { symbol });
+      const result = await this.requestPublicGet("/v3/exchangeInfo", { symbol });
       const data = {
         ...result,
         symbol: result.symbols?.[0] || null,
@@ -580,13 +633,13 @@ class BinanceSpotClient extends EventEmitter {
     const normalizedLimit = Math.min(1000, Math.max(1, Number(limit) || 50));
     const [price, bookTicker, averagePrice, ticker24hr, recentTrades, aggregateTrades, klines] =
       await Promise.all([
-        this.request("GET", "/v3/ticker/price", { symbol: normalizedSymbol }),
-        this.request("GET", "/v3/ticker/bookTicker", { symbol: normalizedSymbol }),
-        this.request("GET", "/v3/avgPrice", { symbol: normalizedSymbol }),
-        this.request("GET", "/v3/ticker/24hr", { symbol: normalizedSymbol }),
-        this.request("GET", "/v3/trades", { symbol: normalizedSymbol, limit: normalizedLimit }),
-        this.request("GET", "/v3/aggTrades", { symbol: normalizedSymbol, limit: normalizedLimit }),
-        this.request("GET", "/v3/klines", {
+        this.requestPublicGet("/v3/ticker/price", { symbol: normalizedSymbol }),
+        this.requestPublicGet("/v3/ticker/bookTicker", { symbol: normalizedSymbol }),
+        this.requestPublicGet("/v3/avgPrice", { symbol: normalizedSymbol }),
+        this.requestPublicGet("/v3/ticker/24hr", { symbol: normalizedSymbol }),
+        this.requestPublicGet("/v3/trades", { symbol: normalizedSymbol, limit: normalizedLimit }),
+        this.requestPublicGet("/v3/aggTrades", { symbol: normalizedSymbol, limit: normalizedLimit }),
+        this.requestPublicGet("/v3/klines", {
           symbol: normalizedSymbol,
           interval,
           limit: normalizedLimit,
@@ -596,7 +649,7 @@ class BinanceSpotClient extends EventEmitter {
     let historicalTrades = [];
     let historicalTradesError = null;
     try {
-      historicalTrades = await this.request("GET", "/v3/historicalTrades", {
+      historicalTrades = await this.requestPublicGet("/v3/historicalTrades", {
         symbol: normalizedSymbol,
         limit: normalizedLimit,
       });
@@ -634,7 +687,7 @@ class BinanceSpotClient extends EventEmitter {
   }
 
   async tickerPrices() {
-    return this.request("GET", "/v3/ticker/price");
+    return this.requestPublicGet("/v3/ticker/price");
   }
 
   decimalPlaces(value) {
@@ -979,7 +1032,7 @@ class BinanceSpotClient extends EventEmitter {
     if (!required) {
       let referencePrice = Number(params.price || params.stopPrice || 0);
       if (!referencePrice) {
-        const ticker = await this.request("GET", "/v3/ticker/price", {
+        const ticker = await this.requestPublicGet("/v3/ticker/price", {
           symbol: params.symbol,
         });
         referencePrice = Number(ticker.price);

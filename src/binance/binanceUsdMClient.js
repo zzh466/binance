@@ -17,12 +17,12 @@ const {
 } = require("./decimalMath");
 
 const FUTURES_REST_BASE = {
-  testnet: "https://demo-fapi.binance.com",
+  testnet: "https://testnet.binancefuture.com",
   production: "https://fapi.binance.com",
 };
 
 const FUTURES_WS_BASE = {
-  testnet: "wss://demo-fstream.binance.com/ws",
+  testnet: "wss://stream.binancefuture.com/ws",
   production: "wss://fstream.binance.com/ws",
 };
 
