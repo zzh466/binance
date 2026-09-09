@@ -1260,6 +1260,17 @@ function renderTradingRounds(rounds, { merge = false } = {}) {
 
   for (const round of visibleRounds) {
     const row = document.createElement("tr");
+    if(round.status !== 'COMPLETED' && round.symbol === chartSymbol){
+      const direction = round.remainingDirection === 'LONG'? '1' : '0';
+      const price = 0;
+      if(chart.traded.price !== price && chart.traded.direction !== direction){
+        chart.traded = {
+          direction,
+          price
+        };
+        chart.renderTradeOrder();
+      }
+    }
     const values = [
       String(round.id || "-").slice(0, 8),
       getMarketLabel(round.marketType),
@@ -1867,9 +1878,9 @@ async function refreshManagerUserInfo({ showResult = true } = {}) {
         `${warnings.map((warning) => warning.message).join("；") || "部分接口不可用"}` +
         `${notes.length ? `；${notes.join("；")}` : ""}`;
     } else {
-      elements.managerUserInfoStatus.textContent =
-        `管理端身份 + Binance 资金已更新；` +
-        `${result.data.accounts?.length || 0} 个账号 / ` +
+    elements.managerUserInfoStatus.textContent =
+      `管理端身份 + Binance 资金已更新；` +
+      `${result.data.accounts?.length || 0} 个账号 / ` +
         new Date().toLocaleString() +
         `${notes.length ? `；${notes.join("；")}` : ""}`;
     }
@@ -2219,6 +2230,7 @@ elements.refreshOrderHistoryButton.addEventListener("click", () => {
 async function refreshTradingRounds({ showResult = false } = {}) {
   elements.refreshTradingRoundsButton.disabled = true;
   elements.tradingRoundsStatus.textContent = "加载中…";
+  
   try {
     const result = await window.binance.tradingRounds({});
     if (showResult) printResult("交易回合列表", result);
@@ -3520,11 +3532,13 @@ window.binance.onTradingRoundsUpdate((payload) => {
   if (!Array.isArray(payload?.rounds)) return;
   renderTradingRounds(payload.rounds, { merge: Boolean(payload.partial) });
   const allRounds = [...tradingRoundsById.values()];
-  const openCount = allRounds.filter(
+  
+  const openRouds = allRounds.filter(
     (round) => round.status === "OPEN"
   ).length;
+  
   elements.tradingRoundsStatus.textContent =
-    `成交已更新 / 进行中 ${openCount} 个 / ` +
+    `成交已更新 / 进行中 ${openRouds.length} 个 / ` +
     `${new Date(payload.time || Date.now()).toLocaleString()}`;
 });
 
