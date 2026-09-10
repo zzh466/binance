@@ -1156,7 +1156,7 @@ class BinanceUsdMClient extends BinanceSpotClient {
     };
   }
 
-  async cancelOrder({ symbol, orderId, origClientOrderId }) {
+  async cancelOrder({ symbol, orderId, origClientOrderId, algoOrder }) {
     if (!orderId && !origClientOrderId) {
       throw new BinanceApiError("撤单必须提供 orderId 或 origClientOrderId。");
     }
@@ -1165,7 +1165,7 @@ class BinanceUsdMClient extends BinanceSpotClient {
       orderId,
       origClientOrderId,
     };
-    if (this.isKnownAlgoOrder(params)) {
+    if (algoOrder === true || this.isKnownAlgoOrder(params)) {
       return this.cancelAlgoOrder({
         symbol: params.symbol,
         algoId: orderId,
@@ -1186,7 +1186,7 @@ class BinanceUsdMClient extends BinanceSpotClient {
         )
       );
     } catch (error) {
-      if (!this.isOrderNotFoundError(error)) throw error;
+      if (!this.isOrderNotFoundError(error) || algoOrder === false) throw error;
       return this.cancelAlgoOrder({
         symbol: params.symbol,
         algoId: orderId,

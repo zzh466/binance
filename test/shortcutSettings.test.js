@@ -15,6 +15,7 @@ const {
   formatPriceOffset,
   getActionLabel,
   isOrderAction,
+  resolveDirectionalPriceOffset,
 } = require("../src/shortcutSettings");
 
 test("快捷键默认列表包含 Num 1 报空、Num 3 报多、Num 5 撤单和 P 一键平所有", () => {
@@ -71,6 +72,13 @@ test("按数量和按总价下单动作使用明确的展示名称", () => {
   assert.equal(getActionLabel(ACTION_ORDER), "下单（按数量）");
   assert.equal(getActionLabel(ACTION_ORDER_QUOTE_TOTAL), "下单（按总价）");
   assert.equal(getActionLabel(ACTION_CLOSE_ALL_POSITIONS), "一键平所有");
+});
+
+test("快捷键超价根据多空方向转换为实际价格偏移", () => {
+  assert.equal(resolveDirectionalPriceOffset(DIRECTION_LONG, 0.1), 0.1);
+  assert.equal(resolveDirectionalPriceOffset(DIRECTION_LONG, -0.1), -0.1);
+  assert.equal(resolveDirectionalPriceOffset(DIRECTION_SHORT, 0.1), -0.1);
+  assert.equal(resolveDirectionalPriceOffset(DIRECTION_SHORT, -0.1), 0.1);
 });
 
 test("按总价下单快捷键拒绝无效方向、超价和非正数总价", () => {

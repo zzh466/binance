@@ -216,6 +216,16 @@
     return numericValue >= 0 ? `+${numericValue}` : String(numericValue);
   }
 
+  function resolveDirectionalPriceOffset(direction, priceOffset) {
+    const numericOffset = Number(priceOffset);
+    if (!directions.has(direction) || !Number.isFinite(numericOffset)) {
+      return null;
+    }
+    // 正超价表示沿成交方向提高成交概率：买单加价、卖单减价。
+    // 负超价则反向移动：买单减价、卖单加价。
+    return direction === DIRECTION_SHORT ? -numericOffset : numericOffset;
+  }
+
   function describeShortcut(shortcut) {
     if (shortcut.action === ACTION_CANCEL_ALL) return "撤销全部未成交订单";
     if (shortcut.action === ACTION_CLOSE_ALL_POSITIONS) return "一键平所有";
@@ -244,6 +254,7 @@
     isOrderAction,
     getDirectionLabel,
     formatPriceOffset,
+    resolveDirectionalPriceOffset,
     describeShortcut,
   };
 });

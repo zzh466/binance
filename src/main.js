@@ -53,6 +53,7 @@ const {
   revealBrowserWindow,
 } = require("./windowLifecycle");
 const { buildPositionSnapshot } = require("./positionSafety");
+const { resolveCancelOrderRequest } = require("./cancelOrderResolver");
 
 function loadEnvironmentFile() {
   const packagedEnvironmentPath = getPackagedEnvironmentPath({
@@ -1599,10 +1600,16 @@ function registerIpcHandlers() {
   });
 
   ipcMain.handle("binance:cancel-order", async (_event, payload) => {
-    return safeCall(() => trackOrderCall(
-      () => client.cancelOrder(payload || {}),
-      { defaultStatus: "CANCELED", source: "cancel-order" }
-    ));
+    return safeCall(() => {
+      const cancelRequest = resolveCancelOrderRequest(
+        payload || {},
+        listRecentOrders({}, client)
+      );
+      return trackOrderCall(
+        () => client.cancelOrder(cancelRequest),
+        { defaultStatus: "CANCELED", source: "cancel-order" }
+      );
+    });
   });
 
   ipcMain.handle("binance:query-order", async (_event, payload) => {

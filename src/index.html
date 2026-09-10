@@ -237,6 +237,13 @@
         font-weight: 600;
       }
 
+      .shortcut-offset-help {
+        grid-column: 1 / -1;
+        margin-top: -4px;
+        opacity: 0.76;
+        font-size: 12px;
+      }
+
       .shortcut-error {
         min-height: 20px;
         margin: 10px 0 0;
@@ -466,6 +473,7 @@
         top: 80px;
         z-index: 10;
         height: 200px;
+        pointer-events: none;
       }
       .chart-symbol-toolbar {
         display: flex;
@@ -1444,6 +1452,9 @@
 
           <label for="shortcutEditorPriceOffset">超价</label>
           <input id="shortcutEditorPriceOffset" name="priceOffset" type="number" step="any" />
+          <small class="shortcut-offset-help">
+            正数沿成交方向超价（多单加价、空单减价）；负数反向移动。
+          </small>
 
           <label id="shortcutEditorAmountLabel" for="shortcutEditorQuantity">手数</label>
           <input id="shortcutEditorQuantity" name="quantity" type="number" step="any" min="0" />

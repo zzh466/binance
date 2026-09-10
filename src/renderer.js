@@ -1305,15 +1305,36 @@ document.querySelector("#testOrderButton").addEventListener("click", async () =>
 
 document
   .querySelector("#cancelOrderButton")
-  .addEventListener("click", async () => {
+  .addEventListener("click", async (event) => {
+    const button = event.currentTarget;
     const request = {
       symbol: getSelectedSymbol(),
       orderId: elements.orderId.value.trim(),
     };
-    const result = await window.binance.cancelOrder(request);
-
-    printResult("撤单结果", result);
-    if (result.ok) applyOpenOrderUpdate(result.data);
+    button.disabled = true;
+    button.textContent = "撤单中…";
+    try {
+      const result = await window.binance.cancelOrder(request);
+      printResult("撤单结果", result);
+      if (result.ok) {
+        // Binance 已确认撤单后立即写入终态；即使响应没有 marketType/status，
+        // 也能按交易对和订单 ID 删除图上的挂单，账户流稍后的事件只用于对账。
+        applyOpenOrderUpdate({
+          ...(result.data || {}),
+          symbol: result.data?.symbol || request.symbol,
+          orderId: result.data?.orderId ?? request.orderId,
+          status: "CANCELED",
+        });
+      }
+    } catch (error) {
+      printResult("撤单调用失败", {
+        ok: false,
+        error: { name: error.name, message: error.message },
+      });
+    } finally {
+      button.disabled = false;
+      button.textContent = "撤销委托";
+    }
   });
 
 async function refreshOrderHistory(
@@ -1697,7 +1718,6 @@ function resolveChartPointer(event) {
 
 chartDom.addEventListener('mousemove', function(event){
   const selection = resolveChartPointer(event);
-  console.log(selection)
   if (!selection) {
     mousebar.style.display = 'none';
     return;
@@ -1709,7 +1729,6 @@ chartDom.addEventListener('mousemove', function(event){
 });
 
 parentDom.addEventListener('mouseleave', () => {
-  console.log('mouseleave')
   mousebar.style.display = 'none';
 });
 
@@ -2173,7 +2192,6 @@ const openOrdersByKey = new Map();
 const {
   isOpenOrder,
   normalizeOpenOrder,
-  openOrderKey,
   updateOpenOrderMap,
 } = window.OpenOrderState;
 const executionReportStatusByClientId = new Map();
@@ -2208,7 +2226,13 @@ async function placeOrderFromNumpad(shortcut) {
   const side = shortcut.direction === shortcutApi.DIRECTION_SHORT
     ? "SELL"
     : "BUY";
-  const price = offsetTradePrice(latestPrice, shortcut.priceOffset);
+  const directionalOffset = shortcutApi.resolveDirectionalPriceOffset(
+    shortcut.direction,
+    shortcut.priceOffset
+  );
+  const price = directionalOffset === null
+    ? null
+    : offsetTradePrice(latestPrice, directionalOffset);
   const shortcutLabel = shortcutApi.getKeyLabel(shortcut.key);
   const quoteTotalMode =
     shortcut.action === shortcutApi.ACTION_ORDER_QUOTE_TOTAL;
@@ -2453,7 +2477,8 @@ async function refreshTrackedOpenOrders(symbol = getSelectedSymbol()) {
   for (const order of result.data || []) {
     const normalized = normalizeOpenOrder(order, snapshotStartedAt);
     if (normalized && isOpenOrder(normalized)) {
-      openOrdersByKey.set(openOrderKey(normalized), normalized);
+      // 快照开始后可能已经收到撤单终态，不能让较旧快照把订单重新加回。
+      updateOpenOrderMap(openOrdersByKey, normalized, snapshotStartedAt);
     }
   }
   syncTrackedOpenOrders();

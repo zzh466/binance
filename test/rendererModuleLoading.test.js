@@ -23,3 +23,13 @@ test("主页面先加载独立模块，最后加载渲染入口", () => {
   assert.equal(positions.every((position) => position >= 0), true);
   assert.deepEqual([...positions].sort((left, right) => left - right), positions);
 });
+
+test("行情价格标记条不拦截画布双击下单事件", () => {
+  const html = fs.readFileSync(
+    path.join(__dirname, "..", "src", "index.html"),
+    "utf8"
+  );
+  const priceTickRule = html.match(/\.price-tick\s*\{([^}]+)\}/)?.[1] || "";
+
+  assert.match(priceTickRule, /pointer-events\s*:\s*none/);
+});
