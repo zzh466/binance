@@ -1649,6 +1649,7 @@ elements.orderType.addEventListener("change", () => {
   elements.icebergQty.disabled = !supportsIceberg;
 });
 const chartDom = document.querySelector('#can');
+const parentDom = document.querySelector('#parent')
 const mousebar= document.querySelector("#mousebar")
 mousebar.style.width = '13px'
 const chart = new Chart(chartDom,980, 300, 0.01,{
@@ -1691,6 +1692,7 @@ function resolveChartPointer(event) {
 
 chartDom.addEventListener('mousemove', function(event){
   const selection = resolveChartPointer(event);
+  console.log(selection)
   if (!selection) {
     mousebar.style.display = 'none';
     return;
@@ -1701,7 +1703,8 @@ chartDom.addEventListener('mousemove', function(event){
   mousebar.style.width = `${Math.max(1, selection.cssBarWidth)}px`;
 });
 
-chartDom.addEventListener('mouseleave', () => {
+parentDom.addEventListener('mouseleave', () => {
+  console.log('mouseleave')
   mousebar.style.display = 'none';
 });
 
