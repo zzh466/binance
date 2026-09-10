@@ -4,6 +4,7 @@ const { BinanceApiError } = require("../src/binance/binanceSpotClient");
 const {
   BinanceUsdMClient,
   FUTURES_REST_BASE,
+  FUTURES_USER_DATA_WS_BASE,
   FUTURES_WS_BASE,
   FUTURES_WS_API_BASE,
 } = require("../src/binance/binanceUsdMClient");
@@ -750,8 +751,35 @@ test("USDⓈ-M 正式和测试环境使用各自官方 WebSocket API", () => {
   assert.equal(testnet.restBase, FUTURES_REST_BASE.testnet);
   assert.equal(testnet.wsBase, "wss://stream.binancefuture.com/ws");
   assert.equal(testnet.wsBase, FUTURES_WS_BASE.testnet);
+  assert.equal(
+    production.wsBase,
+    "wss://fstream.binance.com/public/ws"
+  );
+  assert.equal(production.wsBase, FUTURES_WS_BASE.production);
+  assert.equal(
+    production.userDataWsBase,
+    "wss://fstream.binance.com/private/ws"
+  );
+  assert.equal(
+    production.userDataWsBase,
+    FUTURES_USER_DATA_WS_BASE.production
+  );
+  assert.equal(
+    production.createFuturesUserDataSocketUrl("listen/key"),
+    "wss://fstream.binance.com/private/ws/listen%2Fkey"
+  );
   production.close();
   testnet.close();
+});
+
+test("darwin 与 win32 的正式 U 本位行情都使用官方 public 路径", () => {
+  for (const platform of ["darwin", "win32"]) {
+    const client = new BinanceUsdMClient({ testnet: false, platform });
+    assert.equal(client.wsBase, FUTURES_WS_BASE.production);
+    assert.equal(client.marketWebSocketOptions, null);
+    assert.equal(client.userDataWsBase, FUTURES_USER_DATA_WS_BASE.production);
+    client.close();
+  }
 });
 
 test("正式环境可为当前 USDⓈ-M 子账号签署 TradFi-Perps 协议", async () => {

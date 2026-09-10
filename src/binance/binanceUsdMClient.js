@@ -1,8 +1,6 @@
 const { execFile } = require("node:child_process");
 const https = require("node:https");
-const net = require("node:net");
 const { performance } = require("node:perf_hooks");
-const tls = require("node:tls");
 const { promisify } = require("node:util");
 const WebSocket = require("ws");
 const { resolveCurlExecutable } = require("../platformSupport");
@@ -23,7 +21,12 @@ const FUTURES_REST_BASE = {
 
 const FUTURES_WS_BASE = {
   testnet: "wss://stream.binancefuture.com/ws",
-  production: "wss://fstream.binance.com/ws",
+  production: "wss://fstream.binance.com/public/ws",
+};
+
+const FUTURES_USER_DATA_WS_BASE = {
+  testnet: "wss://stream.binancefuture.com/ws",
+  production: "wss://fstream.binance.com/private/ws",
 };
 
 const FUTURES_WS_API_BASE = {
@@ -31,112 +34,11 @@ const FUTURES_WS_API_BASE = {
   production: "wss://ws-fapi.binance.com/ws-fapi/v1",
 };
 
-const FUTURES_DOH_ENDPOINT = "https://doh.pub/dns-query";
 const FUTURES_REST_HOST = "fapi.binance.com";
-const FUTURES_STREAM_HOST = "fstream.binance.com";
-const FUTURES_FRONT_SNI = "data-stream.binance.vision";
 const FUTURES_PUBLIC_REST_BASE = "https://d2ukl3c6tymv7q.cloudfront.net";
 const POSITION_MODE_ONE_WAY = "ONE_WAY";
 const POSITION_MODE_HEDGE = "HEDGE";
-const FUTURES_STREAM_BOOTSTRAP_ADDRESSES = [
-  "52.192.95.242",
-  "54.150.96.238",
-  "52.192.28.89",
-  "52.195.59.139",
-  "52.69.115.12",
-  "54.64.207.111",
-  "35.73.94.225",
-  "43.206.204.231",
-];
 const execFileAsync = promisify(execFile);
-
-function fetchJson(url, timeoutMs = 8_000) {
-  return new Promise((resolve, reject) => {
-    const request = https.get(url, {
-      headers: { Accept: "application/dns-json" },
-      timeout: timeoutMs,
-    }, (response) => {
-      const chunks = [];
-      response.setEncoding("utf8");
-      response.on("data", (chunk) => chunks.push(chunk));
-      response.on("end", () => {
-        if (response.statusCode < 200 || response.statusCode >= 300) {
-          reject(new Error(`DoH HTTP ${response.statusCode}`));
-          return;
-        }
-        try {
-          resolve(JSON.parse(chunks.join("")));
-        } catch (error) {
-          reject(new Error(`DoH 响应解析失败：${error.message}`));
-        }
-      });
-    });
-    request.on("timeout", () => request.destroy(new Error("DoH 请求超时")));
-    request.on("error", reject);
-  });
-}
-
-function normalizeDohAnswers(payload, hostname) {
-  const answers = Array.isArray(payload?.Answer) ? payload.Answer : [];
-  const addresses = [...new Set(
-    answers
-      .filter((answer) => Number(answer.type) === 1)
-      .map((answer) => String(answer.data || "").trim())
-      .filter((address) => net.isIP(address) === 4)
-  )];
-  const canonicalName = answers
-    .find((answer) => Number(answer.type) === 5)
-    ?.data?.replace(/\.$/, "");
-
-  if (!addresses.length) {
-    throw new Error(`加密 DNS 未返回 ${hostname} 的 IPv4 地址。`);
-  }
-
-  return { hostname, addresses, canonicalName };
-}
-
-async function resolveOverDoh(hostname) {
-  const query = new URLSearchParams({ name: hostname, type: "A" });
-  const payload = await fetchJson(`${FUTURES_DOH_ENDPOINT}?${query}`);
-  return normalizeDohAnswers(payload, hostname);
-}
-
-function createRotatingLookup(addresses) {
-  let cursor = 0;
-  return (_hostname, options, callback) => {
-    const normalizedOptions = typeof options === "object" ? options : {};
-    const normalizedCallback = typeof options === "function" ? options : callback;
-    if (normalizedOptions.all) {
-      normalizedCallback(null, addresses.map((address) => ({ address, family: 4 })));
-      return;
-    }
-    const address = addresses[cursor % addresses.length];
-    cursor += 1;
-    normalizedCallback(null, address, 4);
-  };
-}
-
-function probeFuturesStreamAddress(address, timeoutMs = 4_000) {
-  return new Promise((resolve) => {
-    const socket = tls.connect({
-      host: address,
-      port: 443,
-      servername: FUTURES_FRONT_SNI,
-      checkServerIdentity(_hostname, certificate) {
-        return tls.checkServerIdentity(FUTURES_STREAM_HOST, certificate);
-      },
-      rejectUnauthorized: true,
-    });
-    const finish = (result) => {
-      clearTimeout(timer);
-      socket.destroy();
-      resolve(result);
-    };
-    const timer = setTimeout(() => finish(null), timeoutMs);
-    socket.once("secureConnect", () => finish(address));
-    socket.once("error", () => finish(null));
-  });
-}
 
 const FUTURES_TYPE_MAP = {
   LIMIT_MAKER: { type: "LIMIT", timeInForce: "GTX" },
@@ -177,6 +79,9 @@ class BinanceUsdMClient extends BinanceSpotClient {
     this.wsBase = this.testnet
       ? FUTURES_WS_BASE.testnet
       : FUTURES_WS_BASE.production;
+    this.userDataWsBase = this.testnet
+      ? FUTURES_USER_DATA_WS_BASE.testnet
+      : FUTURES_USER_DATA_WS_BASE.production;
     this.wsApiBase = this.testnet
       ? FUTURES_WS_API_BASE.testnet
       : FUTURES_WS_API_BASE.production;
@@ -191,7 +96,6 @@ class BinanceUsdMClient extends BinanceSpotClient {
     this.exchangeInfoSnapshotRefreshAttemptAt = 0;
     this.futuresListenKey = null;
     this.futuresListenKeyKeepAliveTimer = null;
-    this.productionMarketTransportPromise = null;
     this.platform = options.platform || process.platform;
     this.publicMarketFetch = options.publicMarketFetch || null;
     this.publicMarketTransport = null;
@@ -332,52 +236,6 @@ class BinanceUsdMClient extends BinanceSpotClient {
   isPositionSideMismatchError(error) {
     return Number(error?.code) === -4061 ||
       /position side does not match/i.test(error?.message || "");
-  }
-
-  async ensureProductionMarketTransport() {
-    if (this.testnet) return null;
-    if (this.productionMarketTransportPromise) {
-      return this.productionMarketTransportPromise;
-    }
-
-    this.productionMarketTransportPromise = (async () => {
-      let resolvedAddresses = [];
-      try {
-        resolvedAddresses = (await resolveOverDoh(FUTURES_STREAM_HOST)).addresses;
-      } catch {
-        // DoH 在部分网络会被阻断或污染；下方证书探测会校验候选地址。
-      }
-      const candidates = [...new Set([
-        ...resolvedAddresses,
-        ...FUTURES_STREAM_BOOTSTRAP_ADDRESSES,
-      ])];
-      const streamAddresses = (await Promise.all(
-        candidates.map((address) => probeFuturesStreamAddress(address))
-      )).filter(Boolean);
-      if (!streamAddresses.length) {
-        throw new Error("没有通过 Binance 证书校验的 Futures 行情流节点。");
-      }
-
-      this.marketWebSocketOptions = {
-        lookup: createRotatingLookup(streamAddresses),
-        servername: FUTURES_FRONT_SNI,
-        checkServerIdentity(_hostname, certificate) {
-          return tls.checkServerIdentity(FUTURES_STREAM_HOST, certificate);
-        },
-      };
-
-      return {
-        restBase: this.restBase,
-        streamAddresses,
-      };
-    })().catch((error) => {
-      this.productionMarketTransportPromise = null;
-      throw new BinanceApiError(`准备 Futures 行情直连失败：${error.message}`, {
-        data: { cause: error.name },
-      });
-    });
-
-    return this.productionMarketTransportPromise;
   }
 
   async request(
@@ -638,11 +496,6 @@ class BinanceUsdMClient extends BinanceSpotClient {
       status: statusCode,
     });
     return this.parsePublicMarketResponse(statusCode, rawText);
-  }
-
-  async connectDepth(symbol) {
-    await this.ensureProductionMarketTransport();
-    return super.connectDepth(symbol);
   }
 
   assertTradingCredentials() {
@@ -1784,6 +1637,14 @@ class BinanceUsdMClient extends BinanceSpotClient {
     return this.openFuturesUserDataSocket();
   }
 
+  createFuturesUserDataSocketUrl(listenKey = this.futuresListenKey) {
+    const normalizedListenKey = String(listenKey || "").trim();
+    if (!normalizedListenKey) {
+      throw new BinanceApiError("永续账户事件缺少 listenKey。");
+    }
+    return `${this.userDataWsBase}/${encodeURIComponent(normalizedListenKey)}`;
+  }
+
   openFuturesUserDataSocket() {
     const listenKey = this.futuresListenKey;
     if (!listenKey) {
@@ -1791,7 +1652,7 @@ class BinanceUsdMClient extends BinanceSpotClient {
     }
 
     return new Promise((resolve, reject) => {
-      const url = `${this.wsBase}/${listenKey}`;
+      const url = this.createFuturesUserDataSocketUrl(listenKey);
       const connectStartedAt = performance.now();
       const socket = new WebSocket(url);
       let connected = false;
@@ -1952,6 +1813,7 @@ class BinanceUsdMClient extends BinanceSpotClient {
 module.exports = {
   BinanceUsdMClient,
   FUTURES_REST_BASE,
+  FUTURES_USER_DATA_WS_BASE,
   FUTURES_WS_BASE,
   FUTURES_WS_API_BASE,
 };
