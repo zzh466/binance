@@ -422,9 +422,10 @@ function renderTradingRounds(rounds, { merge = false } = {}) {
       const _long = round.remainingDirection === 'LONG';
       const direction = _long? '0' : '1';
       let price = _long?round.longAveragePrice: round.shortAveragePrice;
-      const amount = _long? (+round.openLongQty || +round.closeLongQty): (+round.openShortQty|| +round.closeShortQty)
+      const amount = round.remainingQty;
+      
       price = parseFloat(price).toFixed(2)
-      if(chart.traded.price !== price && chart.traded.direction !== direction && chart.traded.amount !== amount){
+      if(chart.traded.price !== price || chart.traded.direction !== direction || chart.traded.amount !== amount){
         chart.traded = {
           direction,
           price,
@@ -2291,7 +2292,7 @@ async function cancelAllOpenOrdersFromNumpad(shortcut) {
     printResult(`${shortcutLabel} 查询全部未成交订单失败`, openResult);
     return;
   }
-
+  debugger
   const targets = [...new Map(
     (openResult.data || [])
       .map((order) => ({
