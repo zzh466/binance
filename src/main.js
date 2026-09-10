@@ -54,6 +54,7 @@ const {
 } = require("./windowLifecycle");
 const { buildPositionSnapshot } = require("./positionSafety");
 const { resolveCancelOrderRequest } = require("./cancelOrderResolver");
+const { resolveDefaultTestnet } = require("./environmentSelection");
 
 function loadEnvironmentFile() {
   const packagedEnvironmentPath = getPackagedEnvironmentPath({
@@ -107,7 +108,7 @@ let managerTradingInfoSyncInterval = null;
 let tradingRoundPriceBackfillPromise = null;
 let tradingRoundPriceBackfillClient = null;
 let stopDevelopmentHotReload = () => {};
-const defaultTestnet = process.env.BINANCE_TESTNET !== "false";
+const defaultTestnet = resolveDefaultTestnet(process.env);
 const shortcutConfigPath = path.join(
   app.getPath("appData"),
   "Binance统一交易台",

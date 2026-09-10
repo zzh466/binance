@@ -4,6 +4,7 @@ const path = require("node:path");
 const MAIN_RENDERER_FILES = new Set([
   "chart.js",
   "chartOrderSelection.js",
+  "cancelAllOrderTargets.js",
   "index.html",
   "openOrderState.js",
   "positionSafety.js",

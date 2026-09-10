@@ -2286,21 +2286,22 @@ async function placeOrderFromNumpad(shortcut) {
 
 async function cancelAllOpenOrdersFromNumpad(shortcut) {
   const shortcutLabel = shortcutApi.getKeyLabel(shortcut.key);
-  const openResult = await window.binance.openOrders({});
-  if (!openResult.ok) {
+  const [openResult, recentResult] = await Promise.all([
+    window.binance.openOrders({}),
+    window.binance.recentOrders({}),
+  ]);
+  const discovery = window.CancelAllOrderTargets.collectCancelAllOrderTargets({
+    remoteOrders: openResult.ok ? openResult.data : [],
+    recentOrders: recentResult.ok ? recentResult.data : [],
+    trackedOrders: [...openOrdersByKey.values()],
+  });
+
+  if (!discovery.targets.length && !openResult.ok) {
     printResult(`${shortcutLabel} 查询全部未成交订单失败`, openResult);
     return;
   }
 
-  const targets = [...new Map(
-    (openResult.data || [])
-      .map((order) => ({
-        symbol: String(order.symbol || "").toUpperCase(),
-        marketType: order.marketType,
-      }))
-      .filter((target) => target.symbol)
-      .map((target) => [`${target.marketType || "auto"}:${target.symbol}`, target])
-  ).values()];
+  const targets = discovery.targets;
   if (!targets.length) {
     printResult(`${shortcutLabel} 撤销全部未成交订单`, {
       ok: true,
@@ -2315,6 +2316,19 @@ async function cancelAllOpenOrdersFromNumpad(shortcut) {
     cancellations.push({ ...target, ...result });
     if (result.ok) {
       for (const order of result.data || []) applyOpenOrderUpdate(order);
+      // cancelAll 成功代表该市场/交易对已经没有活动挂单。即使前置
+      // openOrders 快照因 ACK 可见性延迟返回空，也可以安全清理本地显示。
+      for (const order of discovery.orders.filter((candidate) =>
+        window.CancelAllOrderTargets.orderMatchesTarget(candidate, target)
+      )) {
+        applyOpenOrderUpdate({
+          ...order,
+          marketType: order.marketType || target.marketType,
+          symbol: target.symbol,
+          status: "CANCELED",
+          updateTime: Date.now(),
+        });
+      }
     }
   }
 
@@ -2323,11 +2337,16 @@ async function cancelAllOpenOrdersFromNumpad(shortcut) {
     ok: failed.length === 0,
     data: {
       symbols: targets.map((target) => target.symbol),
-      canceledOrderCount: cancellations.reduce(
-        (count, result) => count + (Array.isArray(result.data) ? result.data.length : 0),
-        0
-      ),
+      canceledOrderCount: discovery.orders.filter((order) =>
+        cancellations.some((result) => result.ok &&
+          window.CancelAllOrderTargets.orderMatchesTarget(order, result)
+        )
+      ).length,
       cancellations,
+      discovery: {
+        binanceOpenOrdersOk: openResult.ok,
+        recentOrdersOk: recentResult.ok,
+      },
     },
     ...(failed.length ? { error: { message: `${failed.length} 个交易对撤单失败。` } } : {}),
   });

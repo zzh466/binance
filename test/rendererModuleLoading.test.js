@@ -15,6 +15,7 @@ test("主页面先加载独立模块，最后加载渲染入口", () => {
     "./positionSafety.js",
     "./shortcutSettings.js",
     "./openOrderState.js",
+    "./cancelAllOrderTargets.js",
     "./chartOrderSelection.js",
     "./renderer.js",
   ];

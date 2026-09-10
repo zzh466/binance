@@ -50,7 +50,7 @@ cp .env.example .env
 ```
 
 ```dotenv
-BINANCE_TESTNET=true
+BINANCE_TESTNET=false
 BINANCE_TESTNET_API_KEY=你的_Testnet_API_Key
 BINANCE_TESTNET_API_SECRET=你的_Testnet_API_Secret
 BINANCE_PRODUCTION_API_KEY=你的_正式环境_API_Key
