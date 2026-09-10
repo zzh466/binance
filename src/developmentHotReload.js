@@ -11,11 +11,13 @@ const MAIN_RENDERER_FILES = new Set([
   "rendererElements.js",
   "renderer.js",
   "shortcutSettings.js",
+  "tablePagination.js",
 ]);
 const LOGIN_RENDERER_FILES = new Set([
   "login.html",
   "loginPreload.js",
   "loginRenderer.js",
+  "tablePagination.js",
 ]);
 
 function getRendererReloadTargets(filename) {

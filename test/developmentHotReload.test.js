@@ -22,6 +22,10 @@ test("页面文件热刷新，后台交易代码触发 Electron 重启", () => {
     main: true,
     login: false,
   });
+  assert.deepEqual(getRendererReloadTargets("tablePagination.js"), {
+    main: true,
+    login: true,
+  });
   assert.deepEqual(getRendererReloadTargets("loginRenderer.js"), {
     main: false,
     login: true,

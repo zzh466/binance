@@ -68,7 +68,9 @@
 
       dialog {
         width: min(440px, calc(100vw - 40px));
+        max-height: calc(100vh - 40px);
         padding: 0;
+        overflow: auto;
         border: 1px solid color-mix(in srgb, CanvasText 24%, transparent);
         border-radius: 14px;
         background: Canvas;
@@ -78,7 +80,13 @@
       dialog::backdrop { background: rgb(0 0 0 / 55%); }
       .account-content { padding: 22px; }
       .account-content h2 { margin: 0 0 6px; }
-      .account-list { display: grid; gap: 8px; margin-top: 18px; }
+      .account-list {
+        display: grid;
+        gap: 8px;
+        max-height: min(540px, calc(100vh - 280px));
+        margin-top: 18px;
+        overflow: auto;
+      }
       .account-option {
         display: flex;
         align-items: center;
@@ -93,6 +101,30 @@
       .dialog-actions { display: flex; gap: 10px; }
       .dialog-actions button { margin-top: 18px; }
       .secondary { background: color-mix(in srgb, CanvasText 12%, Canvas); color: CanvasText; }
+      .table-pagination {
+        display: flex;
+        align-items: center;
+        justify-content: flex-end;
+        flex-wrap: wrap;
+        gap: 6px;
+        margin-top: 8px;
+        font-size: 12px;
+      }
+      .table-pagination button,
+      .table-pagination select {
+        width: auto;
+        min-height: 30px;
+        margin: 0;
+        padding: 4px 8px;
+        border: 1px solid color-mix(in srgb, CanvasText 28%, transparent);
+        border-radius: 6px;
+        background: Canvas;
+        color: CanvasText;
+        font: inherit;
+      }
+      .table-pagination button:disabled { cursor: default; opacity: 0.45; }
+      .table-pagination-status { opacity: 0.72; }
+      [data-paginated-list] > [hidden] { display: none !important; }
     </style>
   </head>
   <body>
@@ -123,7 +155,7 @@
         <h2>选择交易账号</h2>
         <p class="subtitle">当前用户关联了多个账号，请选择本次要使用的账号。</p>
         <form id="accountForm">
-          <div id="accountList" class="account-list"></div>
+          <div id="accountList" class="account-list" data-paginated-list></div>
           <p id="accountStatus" class="status" role="status"></p>
           <div class="dialog-actions">
             <button id="cancelAccountButton" class="secondary" type="button">返回</button>
@@ -133,6 +165,7 @@
       </div>
     </dialog>
 
+    <script src="tablePagination.js"></script>
     <script src="loginRenderer.js"></script>
   </body>
 </html>

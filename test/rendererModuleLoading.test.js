@@ -11,6 +11,7 @@ test("主页面先加载独立模块，最后加载渲染入口", () => {
   const expectedOrder = [
     "./chart.js",
     "./rendererElements.js",
+    "./tablePagination.js",
     "./positionSafety.js",
     "./shortcutSettings.js",
     "./openOrderState.js",
