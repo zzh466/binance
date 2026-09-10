@@ -380,7 +380,14 @@ class BinanceUsdMClient extends BinanceSpotClient {
     return this.productionMarketTransportPromise;
   }
 
-  async request(method, path, params = {}, signed = false, baseUrl = this.restBase) {
+  async request(
+    method,
+    path,
+    params = {},
+    signed = false,
+    baseUrl = this.restBase,
+    requestOptions = {}
+  ) {
     if (
       !this.testnet &&
       !signed &&
@@ -390,7 +397,14 @@ class BinanceUsdMClient extends BinanceSpotClient {
     ) {
       return this.requestPublicMarketData(method, path, params);
     }
-    return super.request(method, path, params, signed, baseUrl);
+    return super.request(
+      method,
+      path,
+      params,
+      signed,
+      baseUrl,
+      requestOptions
+    );
   }
 
   createPublicMarketUrl(baseUrl, path, params = {}) {
@@ -1360,13 +1374,13 @@ class BinanceUsdMClient extends BinanceSpotClient {
     }
   }
 
-  async openOrders({ symbol } = {}) {
+  async openOrders({ symbol, critical = false } = {}) {
     const normalizedSymbol = symbol ? this.validateSymbol(symbol) : undefined;
     const [regularOrders, algoOrders] = await Promise.all([
       this.signedRest("GET", "/fapi/v1/openOrders", {
         symbol: normalizedSymbol,
-      }),
-      this.openAlgoOrders({ symbol: normalizedSymbol }),
+      }, { critical }),
+      this.openAlgoOrders({ symbol: normalizedSymbol, critical }),
     ]);
     return [
       ...regularOrders,
@@ -1376,7 +1390,10 @@ class BinanceUsdMClient extends BinanceSpotClient {
 
   async cancelAllOpenOrders({ symbol }) {
     const normalizedSymbol = this.validateSymbol(symbol);
-    const existing = await this.openOrders({ symbol: normalizedSymbol });
+    const existing = await this.openOrders({
+      symbol: normalizedSymbol,
+      critical: true,
+    });
     await Promise.all([
       this.signedRest("DELETE", "/fapi/v1/allOpenOrders", {
         symbol: normalizedSymbol,
@@ -1487,12 +1504,12 @@ class BinanceUsdMClient extends BinanceSpotClient {
     });
   }
 
-  async openAlgoOrders({ symbol, algoId } = {}) {
+  async openAlgoOrders({ symbol, algoId, critical = false } = {}) {
     const orders = await this.signedRest("GET", "/fapi/v1/openAlgoOrders", {
       algoType: "CONDITIONAL",
       symbol: symbol ? this.validateSymbol(symbol) : undefined,
       algoId,
-    });
+    }, { critical });
     return orders.map((order) => this.normalizeAlgoOrder(order));
   }
 
@@ -1530,11 +1547,13 @@ class BinanceUsdMClient extends BinanceSpotClient {
     }));
   }
 
-  async accountStatus({ omitZeroBalances } = {}) {
+  async accountStatus({ omitZeroBalances, critical = false } = {}) {
     const account = await this.signedWsOrRest(
       "account.status",
       "GET",
-      "/fapi/v3/account"
+      "/fapi/v3/account",
+      {},
+      { critical }
     );
     let assets = Array.isArray(account.assets) ? account.assets : [];
     if (omitZeroBalances) {

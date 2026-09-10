@@ -18,9 +18,11 @@ test("首次读取时把旧设置迁移到 JSON 配置文件", (context) => {
   const settings = readShortcutConfig(configPath, { fallbackSettings });
   const stored = JSON.parse(fs.readFileSync(configPath, "utf8"));
 
-  assert.deepEqual(settings, fallbackSettings);
-  assert.equal(stored.version, 2);
-  assert.deepEqual(stored.shortcuts, fallbackSettings);
+  assert.equal(settings.length, 3);
+  assert.deepEqual(settings.slice(0, 2), fallbackSettings);
+  assert.equal(settings.at(-1).action, "CLOSE_ALL_POSITIONS");
+  assert.equal(stored.version, 3);
+  assert.deepEqual(stored.shortcuts, settings);
 });
 
 test("新增快捷键后完整列表会写入并可重新读取", (context) => {
@@ -43,7 +45,7 @@ test("新增快捷键后完整列表会写入并可重新读取", (context) => {
   writeShortcutConfig(configPath, settings);
   const reloaded = readShortcutConfig(configPath);
 
-  assert.equal(reloaded.length, 4);
+  assert.equal(reloaded.length, 5);
   assert.deepEqual(reloaded.at(-1), settings.at(-1));
 });
 
@@ -68,7 +70,7 @@ test("按总价下单快捷键会以独立字段持久化", (context) => {
   const stored = JSON.parse(fs.readFileSync(configPath, "utf8"));
   const reloaded = readShortcutConfig(configPath);
 
-  assert.equal(stored.version, 2);
+  assert.equal(stored.version, 3);
   assert.equal(stored.shortcuts.at(-1).quoteOrderQty, "250");
   assert.deepEqual(reloaded.at(-1), settings.at(-1));
 });
@@ -86,4 +88,32 @@ test("JSON 文件拒绝重复按键，且不会覆盖原配置", (context) => {
     /已被/
   );
   assert.equal(fs.readFileSync(configPath, "utf8"), originalText);
+});
+
+test("版本 2 配置升级时自动增加 P 一键平所有，升级后允许用户删除", (context) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "binance-shortcuts-"));
+  context.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const configPath = path.join(directory, "shortcut-settings.json");
+  const legacySettings = cloneDefaults().filter(
+    ({ action }) => action !== "CLOSE_ALL_POSITIONS"
+  );
+  fs.writeFileSync(configPath, JSON.stringify({
+    version: 2,
+    shortcuts: legacySettings,
+  }));
+
+  const upgraded = readShortcutConfig(configPath);
+  assert.equal(upgraded.at(-1).key, "KeyP");
+  assert.equal(upgraded.at(-1).action, "CLOSE_ALL_POSITIONS");
+  assert.equal(JSON.parse(fs.readFileSync(configPath, "utf8")).version, 3);
+
+  writeShortcutConfig(
+    configPath,
+    upgraded.filter(({ action }) => action !== "CLOSE_ALL_POSITIONS")
+  );
+  const reloaded = readShortcutConfig(configPath);
+  assert.equal(
+    reloaded.some(({ action }) => action === "CLOSE_ALL_POSITIONS"),
+    false
+  );
 });

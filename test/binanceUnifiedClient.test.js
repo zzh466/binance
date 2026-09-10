@@ -930,6 +930,303 @@ test("已查询订单携带的内部市场类型可精确路由撤单", async ()
   client.close();
 });
 
+test("一键平所有先撤 U 本位挂单，再按持仓反方向提交 reduceOnly 市价单并复核", async () => {
+  const client = new BinanceUnifiedClient({
+    testnet: false,
+    futuresCredentials: {
+      apiKey: "future-key",
+      apiSecret: "future-secret",
+    },
+  });
+  const openAccount = {
+    positions: [
+      {
+        symbol: "BTCUSDT",
+        positionAmt: "0.010",
+        entryPrice: "70000",
+        unrealizedProfit: "1.5",
+        positionSide: "BOTH",
+      },
+      {
+        symbol: "ETHUSDT",
+        positionAmt: "-0.200",
+        entryPrice: "3500",
+        unrealizedProfit: "-2",
+        positionSide: "BOTH",
+      },
+    ],
+  };
+  const accounts = [
+    openAccount,
+    openAccount,
+    { positions: [] },
+    { positions: [] },
+  ];
+  client.futures.accountStatus = async () => accounts.shift();
+  let openOrderQueryCount = 0;
+  client.futures.openOrders = async () => {
+    openOrderQueryCount += 1;
+    return openOrderQueryCount === 1
+      ? [{ symbol: "BTCUSDT", orderId: 7, status: "NEW" }]
+      : [];
+  };
+  const canceledSymbols = [];
+  client.futures.cancelAllOpenOrders = async ({ symbol }) => {
+    canceledSymbols.push(symbol);
+    return symbol === "BTCUSDT"
+      ? [{ symbol, orderId: 7, status: "CANCELED" }]
+      : [];
+  };
+  const submitted = [];
+  client.futures.placeOrder = async (order) => {
+    submitted.push(order);
+    return {
+      symbol: order.symbol,
+      orderId: order.symbol === "BTCUSDT" ? 8 : 9,
+      status: "ACKNOWLEDGED",
+      marketType: MARKET_FUTURES,
+    };
+  };
+
+  const result = await client.closeAllFuturesPositions({
+    verificationDelays: [0, 0],
+  });
+
+  assert.deepEqual(canceledSymbols.sort(), ["BTCUSDT", "ETHUSDT"]);
+  assert.deepEqual(submitted, [
+    {
+      symbol: "BTCUSDT",
+      side: "SELL",
+      positionSide: "BOTH",
+      positionEffect: "CLOSE",
+      reduceOnly: true,
+      type: "MARKET",
+      quantity: "0.010",
+      newOrderRespType: "ACK",
+    },
+    {
+      symbol: "ETHUSDT",
+      side: "BUY",
+      positionSide: "BOTH",
+      positionEffect: "CLOSE",
+      reduceOnly: true,
+      type: "MARKET",
+      quantity: "0.2",
+      newOrderRespType: "ACK",
+    },
+  ]);
+  assert.equal(result.verifiedFlat, true);
+  assert.equal(result.positionFlatConfirmations, 2);
+  assert.equal(result.remainingPositions.length, 0);
+  assert.equal(result.remainingOpenOrders.length, 0);
+  assert.equal(result.orders.length, 3);
+  client.close();
+});
+
+test("一键平所有有委托失败或仍有持仓时不会误报已全部平仓", async () => {
+  const client = new BinanceUnifiedClient({
+    testnet: false,
+    futuresCredentials: {
+      apiKey: "future-key",
+      apiSecret: "future-secret",
+    },
+  });
+  const openAccount = {
+    positions: [{
+      symbol: "BTCUSDT",
+      positionAmt: "0.010",
+      positionSide: "BOTH",
+    }],
+  };
+  client.futures.accountStatus = async () => openAccount;
+  client.futures.openOrders = async () => [];
+  client.futures.cancelAllOpenOrders = async () => [];
+  client.futures.placeOrder = async () => {
+    throw new BinanceApiError("余额或权限不足", { code: -2010 });
+  };
+
+  const result = await client.closeAllFuturesPositions({
+    verificationDelays: [0],
+  });
+
+  assert.equal(result.verifiedFlat, false);
+  assert.equal(result.positionsVerified, true);
+  assert.equal(result.remainingPositions.length, 1);
+  assert.equal(result.closeAttempts.length, 1);
+  assert.equal(result.closeAttempts[0].ok, false);
+  assert.equal(result.closeAttempts[0].error.code, -2010);
+  client.close();
+});
+
+test("一键平所有会先撤现货挂单，再把全部非 USDT 可用余额市价卖出", async () => {
+  const client = new BinanceUnifiedClient({
+    testnet: false,
+    spotCredentials: {
+      apiKey: "spot-key",
+      apiSecret: "spot-secret",
+    },
+  });
+  const initialAccount = {
+    balances: [
+      { asset: "USDT", free: "100", locked: "0" },
+      { asset: "ETH", free: "2", locked: "1" },
+    ],
+  };
+  const unlockedAccount = {
+    balances: [
+      { asset: "USDT", free: "100", locked: "0" },
+      { asset: "ETH", free: "3", locked: "0" },
+    ],
+  };
+  const flatAccount = {
+    balances: [{ asset: "USDT", free: "10100", locked: "0" }],
+  };
+  client.spot.exchangeInfoCatalog = async () => [{
+    symbol: "ETHUSDT",
+    status: "TRADING",
+    baseAsset: "ETH",
+    quoteAsset: "USDT",
+  }];
+  const accounts = [initialAccount, unlockedAccount, flatAccount, flatAccount];
+  client.spot.accountStatus = async () => accounts.shift();
+  let openOrderQueryCount = 0;
+  client.spot.openOrders = async () => {
+    openOrderQueryCount += 1;
+    return openOrderQueryCount === 1
+      ? [{ symbol: "ETHUSDT", orderId: 10, status: "NEW" }]
+      : [];
+  };
+  const canceledSymbols = [];
+  client.spot.cancelAllOpenOrders = async ({ symbol }) => {
+    canceledSymbols.push(symbol);
+    return [{ symbol, orderId: 10, status: "CANCELED" }];
+  };
+  const submitted = [];
+  client.spot.placeOrder = async (order) => {
+    submitted.push(order);
+    return { symbol: order.symbol, orderId: 11, status: "ACKNOWLEDGED" };
+  };
+
+  const result = await client.closeAllSpotPositions({
+    verificationDelays: [0, 0],
+  });
+
+  assert.deepEqual(canceledSymbols, ["ETHUSDT"]);
+  assert.deepEqual(submitted, [{
+    symbol: "ETHUSDT",
+    side: "SELL",
+    type: "MARKET",
+    quantity: "3",
+    newOrderRespType: "ACK",
+  }]);
+  assert.equal(result.verifiedFlat, true);
+  assert.equal(result.assetFlatConfirmations, 2);
+  assert.equal(result.remainingAssets.length, 0);
+  assert.equal(result.remainingOpenOrders.length, 0);
+  assert.equal(result.orders.length, 2);
+  assert.equal(result.orders.every(({ marketType }) => marketType === MARKET_SPOT), true);
+  client.close();
+});
+
+test("一键平所有遇到明确的 429 拒绝会等待并自动续跑该资产", async () => {
+  const client = new BinanceUnifiedClient({
+    testnet: false,
+    spotCredentials: {
+      apiKey: "spot-key",
+      apiSecret: "spot-secret",
+    },
+  });
+  const openAccount = {
+    balances: [
+      { asset: "USDT", free: "100", locked: "0" },
+      { asset: "ETH", free: "1", locked: "0" },
+    ],
+  };
+  const flatAccount = {
+    balances: [{ asset: "USDT", free: "1100", locked: "0" }],
+  };
+  const accounts = [openAccount, openAccount, flatAccount, flatAccount];
+  client.spot.accountStatus = async () => accounts.shift();
+  client.spot.openOrders = async () => [];
+  client.spot.exchangeInfoCatalog = async () => [{
+    symbol: "ETHUSDT",
+    status: "TRADING",
+    baseAsset: "ETH",
+    quoteAsset: "USDT",
+  }];
+  let attempts = 0;
+  client.spot.placeOrder = async (order) => {
+    attempts += 1;
+    if (attempts === 1) {
+      throw new BinanceApiError("Too many requests", {
+        status: 429,
+        code: -1003,
+        data: { banUntil: Date.now() + 1 },
+      });
+    }
+    return { symbol: order.symbol, orderId: 19, status: "ACKNOWLEDGED" };
+  };
+  const waits = [];
+
+  const result = await client.closeAllSpotPositions({
+    verificationDelays: [0, 0],
+    waitFn: async (milliseconds) => waits.push(milliseconds),
+  });
+
+  assert.equal(result.verifiedFlat, true);
+  assert.equal(attempts, 2);
+  assert.equal(result.rateLimitWaitCount, 1);
+  assert.equal(waits.some((milliseconds) => milliseconds >= 1_000), true);
+  client.close();
+});
+
+test("一键平所有会区分无 USDT 交易对、锁定余额和可卖出现货", () => {
+  const client = new BinanceUnifiedClient({ testnet: false });
+  const classified = client.classifySpotAssetsForLiquidation([
+    { asset: "ETH", symbol: "ETHUSDT", free: "2", locked: "0", total: "2" },
+    { asset: "AED", symbol: "AEDUSDT", free: "10", locked: "0", total: "10" },
+    { asset: "BNB", symbol: "BNBUSDT", free: "0", locked: "1", total: "1" },
+  ], [{
+    symbol: "ETHUSDT",
+    status: "TRADING",
+    baseAsset: "ETH",
+    quoteAsset: "USDT",
+  }]);
+
+  assert.deepEqual(classified.sellableAssets.map(({ asset }) => asset), ["ETH"]);
+  assert.deepEqual(classified.nonTradableAssets.map(({ asset }) => asset), ["AED"]);
+  assert.deepEqual(classified.lockedAssets.map(({ asset }) => asset), ["BNB"]);
+  client.close();
+});
+
+test("一键平所有会同时执行现货和 U 本位，任一市场失败都不会报全部成功", async () => {
+  const client = new BinanceUnifiedClient({ testnet: false });
+  let futuresCalled = false;
+  client.closeAllSpotPositions = async () => {
+    throw new BinanceApiError("现货查询失败", { code: -1000 });
+  };
+  client.closeAllFuturesPositions = async () => {
+    futuresCalled = true;
+    return {
+      marketType: MARKET_FUTURES,
+      verifiedFlat: true,
+      remainingPositions: [],
+      remainingOpenOrders: [],
+      orders: [{ symbol: "BTCUSDT", orderId: 12, marketType: MARKET_FUTURES }],
+    };
+  };
+
+  const result = await client.closeAllPositions();
+
+  assert.equal(futuresCalled, true);
+  assert.equal(result.verifiedFlat, false);
+  assert.equal(result.markets.spot.verifiedFlat, false);
+  assert.equal(result.markets.spot.error.code, -1000);
+  assert.equal(result.markets.futures.verifiedFlat, true);
+  assert.equal(result.orders.length, 1);
+  client.close();
+});
+
 test("永续 ORDER_TRADE_UPDATE 被转换为现有界面可消费的 executionReport", () => {
   const client = new BinanceUsdMClient();
   const result = client.normalizeFuturesUserEvent({

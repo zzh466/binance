@@ -1,8 +1,25 @@
 const fs = require("node:fs");
 const path = require("node:path");
-const { cloneDefaults, validate } = require("./shortcutSettings");
+const {
+  ACTION_CLOSE_ALL_POSITIONS,
+  cloneDefaults,
+  validate,
+} = require("./shortcutSettings");
 
-const SHORTCUT_CONFIG_VERSION = 2;
+const SHORTCUT_CONFIG_VERSION = 3;
+
+function addCloseAllShortcutForV3(settings) {
+  if (settings.some(({ action }) => action === ACTION_CLOSE_ALL_POSITIONS)) {
+    return settings;
+  }
+  const defaultCloseAll = cloneDefaults().find(
+    ({ action }) => action === ACTION_CLOSE_ALL_POSITIONS
+  );
+  if (!defaultCloseAll || settings.some(({ key }) => key === defaultCloseAll.key)) {
+    return settings;
+  }
+  return [...settings, defaultCloseAll];
+}
 
 function normalizeShortcutConfig(payload) {
   const source = Array.isArray(payload)
@@ -50,19 +67,30 @@ function writeShortcutConfig(configPath, settings) {
 function readShortcutConfig(configPath, { fallbackSettings } = {}) {
   if (fs.existsSync(configPath)) {
     const payload = JSON.parse(fs.readFileSync(configPath, "utf8"));
-    return normalizeShortcutConfig(payload);
+    const settings = normalizeShortcutConfig(payload);
+    const version = Number(payload?.version) || 0;
+    if (version < SHORTCUT_CONFIG_VERSION) {
+      return writeShortcutConfig(
+        configPath,
+        addCloseAllShortcutForV3(settings)
+      );
+    }
+    return settings;
   }
 
   let initialSettings = cloneDefaults();
   if (fallbackSettings !== undefined && fallbackSettings !== null) {
     const fallbackResult = validate(fallbackSettings);
-    if (fallbackResult.valid) initialSettings = fallbackResult.settings;
+    if (fallbackResult.valid) {
+      initialSettings = addCloseAllShortcutForV3(fallbackResult.settings);
+    }
   }
   return writeShortcutConfig(configPath, initialSettings);
 }
 
 module.exports = {
   SHORTCUT_CONFIG_VERSION,
+  addCloseAllShortcutForV3,
   normalizeShortcutConfig,
   readShortcutConfig,
   writeShortcutConfig,

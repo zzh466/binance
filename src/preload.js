@@ -50,6 +50,8 @@ contextBridge.exposeInMainWorld("binance", {
     ipcRenderer.invoke("binance:open-orders", options || {}),
   cancelAllOpenOrders: (options) =>
     ipcRenderer.invoke("binance:cancel-all-open-orders", options || {}),
+  closeAllPositions: () =>
+    ipcRenderer.invoke("binance:close-all-positions"),
   amendOrder: (options) =>
     ipcRenderer.invoke("binance:amend-order", options || {}),
   cancelReplace: (options) =>
@@ -119,6 +121,8 @@ contextBridge.exposeInMainWorld("binance", {
     subscribe("manager:trading-info-sync-status", callback),
   onRateLimitUpdate: (callback) =>
     subscribe("binance:rate-limit-update", callback),
+  onCloseAllProgress: (callback) =>
+    subscribe("binance:close-all-progress", callback),
   onUserDataEvent: (callback) =>
     subscribe("binance:user-data-event", callback),
   onUserDataStatus: (callback) =>

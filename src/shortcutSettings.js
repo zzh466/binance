@@ -11,14 +11,16 @@
   const ACTION_ORDER = "ORDER";
   const ACTION_ORDER_QUOTE_TOTAL = "ORDER_QUOTE_TOTAL";
   const ACTION_CANCEL_ALL = "CANCEL_ALL";
+  const ACTION_CLOSE_ALL_POSITIONS = "CLOSE_ALL_POSITIONS";
   const DIRECTION_SHORT = "SHORT";
   const DIRECTION_LONG = "LONG";
 
-  const AVAILABLE_KEYS = Object.freeze(
-    Array.from({ length: 10 }, (_value, number) =>
+  const AVAILABLE_KEYS = Object.freeze([
+    ...Array.from({ length: 10 }, (_value, number) =>
       Object.freeze({ code: `Numpad${number}`, label: `Num ${number}` })
-    )
-  );
+    ),
+    Object.freeze({ code: "KeyP", label: "P" }),
+  ]);
 
   const DEFAULT_SHORTCUTS = Object.freeze([
     Object.freeze({
@@ -48,6 +50,15 @@
       quantity: "",
       quoteOrderQty: "",
     }),
+    Object.freeze({
+      id: "close-all-positions",
+      key: "KeyP",
+      action: ACTION_CLOSE_ALL_POSITIONS,
+      direction: "",
+      priceOffset: null,
+      quantity: "",
+      quoteOrderQty: "",
+    }),
   ]);
 
   const availableCodes = new Set(AVAILABLE_KEYS.map(({ code }) => code));
@@ -55,6 +66,7 @@
     ACTION_ORDER,
     ACTION_ORDER_QUOTE_TOTAL,
     ACTION_CANCEL_ALL,
+    ACTION_CLOSE_ALL_POSITIONS,
   ]);
   const directions = new Set([DIRECTION_SHORT, DIRECTION_LONG]);
 
@@ -89,7 +101,7 @@
       ? record.id.trim()
       : `shortcut-${index}-${key}`;
 
-    if (action === ACTION_CANCEL_ALL) {
+    if (!isOrderAction(action)) {
       return {
         id,
         key,
@@ -183,7 +195,9 @@
   function getActionLabel(action) {
     if (action === ACTION_ORDER) return "下单（按数量）";
     if (action === ACTION_ORDER_QUOTE_TOTAL) return "下单（按总价）";
-    return "撤单";
+    if (action === ACTION_CANCEL_ALL) return "撤销全部未成交订单";
+    if (action === ACTION_CLOSE_ALL_POSITIONS) return "一键平所有";
+    return "未知动作";
   }
 
   function isOrderAction(action) {
@@ -204,6 +218,7 @@
 
   function describeShortcut(shortcut) {
     if (shortcut.action === ACTION_CANCEL_ALL) return "撤销全部未成交订单";
+    if (shortcut.action === ACTION_CLOSE_ALL_POSITIONS) return "一键平所有";
     const sizing = shortcut.action === ACTION_ORDER_QUOTE_TOTAL
       ? `，总价 ${shortcut.quoteOrderQty}`
       : `，手数 ${shortcut.quantity}`;
@@ -214,6 +229,7 @@
     ACTION_ORDER,
     ACTION_ORDER_QUOTE_TOTAL,
     ACTION_CANCEL_ALL,
+    ACTION_CLOSE_ALL_POSITIONS,
     DIRECTION_SHORT,
     DIRECTION_LONG,
     AVAILABLE_KEYS,

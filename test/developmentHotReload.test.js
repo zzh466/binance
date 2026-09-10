@@ -18,6 +18,10 @@ test("页面文件热刷新，后台交易代码触发 Electron 重启", () => {
     main: true,
     login: false,
   });
+  assert.deepEqual(getRendererReloadTargets("rendererElements.js"), {
+    main: true,
+    login: false,
+  });
   assert.deepEqual(getRendererReloadTargets("loginRenderer.js"), {
     main: false,
     login: true,
@@ -83,6 +87,7 @@ test("渲染文件保存后按窗口类型防抖刷新", async () => {
   });
 
   changeListener("change", "renderer.js");
+  changeListener("change", "positionSafety.js");
   changeListener("rename", "index.html");
   await new Promise((resolve) => setTimeout(resolve, 10));
   assert.equal(mainReloads, 1);

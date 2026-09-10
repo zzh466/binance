@@ -6,7 +6,9 @@ const MAIN_RENDERER_FILES = new Set([
   "chartOrderSelection.js",
   "index.html",
   "openOrderState.js",
+  "positionSafety.js",
   "preload.js",
+  "rendererElements.js",
   "renderer.js",
   "shortcutSettings.js",
 ]);

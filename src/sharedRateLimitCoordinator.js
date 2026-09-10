@@ -33,8 +33,8 @@ class SharedRateLimitCoordinator {
     this.now = now;
     this.threshold = threshold;
     this.saveDelayMs = saveDelayMs;
-    this.localState = { updatedAt: 0, banUntil: 0, limits: {} };
-    this.sharedState = { updatedAt: 0, banUntil: 0, limits: {} };
+    this.localState = { updatedAt: 0, banUntil: 0, marketBans: {}, limits: {} };
+    this.sharedState = { updatedAt: 0, banUntil: 0, marketBans: {}, limits: {} };
     this.saveTimer = null;
     this.refresh();
     this.refreshTimer = setInterval(() => this.refresh(), refreshIntervalMs);
@@ -48,6 +48,13 @@ class SharedRateLimitCoordinator {
   mergeState(target, source) {
     target.updatedAt = Math.max(Number(target.updatedAt) || 0, Number(source.updatedAt) || 0);
     target.banUntil = Math.max(Number(target.banUntil) || 0, Number(source.banUntil) || 0);
+    target.marketBans ||= {};
+    for (const [marketType, banUntil] of Object.entries(source.marketBans || {})) {
+      target.marketBans[marketType] = Math.max(
+        Number(target.marketBans[marketType]) || 0,
+        Number(banUntil) || 0
+      );
+    }
     for (const [key, incoming] of Object.entries(source.limits || {})) {
       const existing = target.limits[key];
       if (!existing || Number(incoming.observedAt) >= Number(existing.observedAt)) {
@@ -58,7 +65,7 @@ class SharedRateLimitCoordinator {
   }
 
   refresh() {
-    const combined = { updatedAt: 0, banUntil: 0, limits: {} };
+    const combined = { updatedAt: 0, banUntil: 0, marketBans: {}, limits: {} };
     try {
       if (fs.existsSync(this.directoryPath)) {
         for (const entry of fs.readdirSync(this.directoryPath)) {
@@ -133,10 +140,19 @@ class SharedRateLimitCoordinator {
     }
     if ([418, 429].includes(Number(status))) {
       const retryAfterSeconds = Number(normalizedHeaders["retry-after"]);
-      this.localState.banUntil = Math.max(
-        this.localState.banUntil,
-        now + (Number.isFinite(retryAfterSeconds) ? retryAfterSeconds * 1_000 : 60_000)
+      const banUntil = now + (
+        Number.isFinite(retryAfterSeconds) ? retryAfterSeconds * 1_000 : 60_000
       );
+      const normalizedMarketType = String(marketType || "").trim().toLowerCase();
+      if (normalizedMarketType) {
+        this.localState.marketBans[normalizedMarketType] = Math.max(
+          Number(this.localState.marketBans[normalizedMarketType]) || 0,
+          banUntil
+        );
+      } else {
+        // 兼容无法识别市场来源的旧调用；这种情况下只能按全局禁用处理。
+        this.localState.banUntil = Math.max(this.localState.banUntil, banUntil);
+      }
     }
     this.localState.updatedAt = now;
     this.mergeState(this.sharedState, this.localState);
@@ -144,16 +160,34 @@ class SharedRateLimitCoordinator {
     return this.snapshot();
   }
 
-  beforeRequest({ critical = false } = {}) {
+  beforeRequest({ critical = false, marketType } = {}) {
     const now = this.now();
-    if (Number(this.sharedState.banUntil) > now) {
+    const normalizedMarketType = String(marketType || "").trim().toLowerCase();
+    const marketBanUntil = normalizedMarketType
+      ? Number(this.sharedState.marketBans?.[normalizedMarketType]) || 0
+      : Math.max(
+          0,
+          ...Object.values(this.sharedState.marketBans || {}).map(Number)
+        );
+    const banUntil = Math.max(
+      Number(this.sharedState.banUntil) || 0,
+      marketBanUntil
+    );
+    if (banUntil > now) {
       throw new BinanceRateLimitGuardError(
-        `Binance 限流保护中，请在 ${new Date(this.sharedState.banUntil).toLocaleTimeString()} 后重试。`,
-        { banUntil: this.sharedState.banUntil }
+        `Binance 限流保护中，请在 ${new Date(banUntil).toLocaleTimeString()} 后重试。`,
+        { banUntil, marketType: normalizedMarketType || undefined }
       );
     }
     if (critical) return;
     for (const limit of Object.values(this.sharedState.limits)) {
+      if (
+        normalizedMarketType &&
+        limit.marketType &&
+        String(limit.marketType).toLowerCase() !== normalizedMarketType
+      ) {
+        continue;
+      }
       const intervalMs = (INTERVAL_MS[limit.interval] || 0) * limit.intervalNum;
       if (!limit.limit || !intervalMs || now - limit.observedAt >= intervalMs) continue;
       const usage = limit.count / limit.limit;
@@ -197,11 +231,27 @@ class SharedRateLimitCoordinator {
           (INTERVAL_MS[limit.interval] || 0) * limit.intervalNum
       ),
     }));
+    const globalBanUntil = Number(this.sharedState.banUntil) > now
+      ? Number(this.sharedState.banUntil)
+      : 0;
+    const marketBans = Object.fromEntries(
+      Object.entries(this.sharedState.marketBans || {}).map(
+        ([marketType, banUntil]) => [
+          marketType,
+          Number(banUntil) > now ? Number(banUntil) : 0,
+        ]
+      )
+    );
+    const banUntil = Math.max(
+      globalBanUntil,
+      0,
+      ...Object.values(marketBans).filter(Number.isFinite)
+    );
     return {
       updatedAt: this.sharedState.updatedAt,
-      banUntil: Number(this.sharedState.banUntil) > now
-        ? this.sharedState.banUntil
-        : 0,
+      banUntil,
+      globalBanUntil,
+      marketBans,
       limits,
       nearLimit: limits.some((limit) =>
         limit.active &&

@@ -48,6 +48,11 @@ const {
   BinanceAccountMetricsService,
 } = require("./binanceAccountMetricsService");
 const { addDecimal } = require("./binance/decimalMath");
+const {
+  registerWindowLoadFallbacks,
+  revealBrowserWindow,
+} = require("./windowLifecycle");
+const { buildPositionSnapshot } = require("./positionSafety");
 
 function loadEnvironmentFile() {
   const packagedEnvironmentPath = getPackagedEnvironmentPath({
@@ -93,6 +98,8 @@ let accountMetricsRefreshClient = null;
 let accountMetricsRefreshMode = null;
 let accountMetricsRefreshTimer = null;
 let accountMetricsInterval = null;
+let accountMetricsScheduledReconcileHistory = false;
+let lastAccountMetricsHistoryRefreshAt = 0;
 let managerTradingInfoSyncPromise = null;
 let managerTradingInfoSyncTimer = null;
 let managerTradingInfoSyncInterval = null;
@@ -121,7 +128,10 @@ const rateLimitCoordinator = new SharedRateLimitCoordinator(
   { instanceId: instanceId || `pid-${process.pid}` }
 );
 const unknownOrderReconciliationTimers = new Set();
-const ACCOUNT_METRICS_REFRESH_MS = 30_000;
+const ACCOUNT_METRICS_REFRESH_MS = 2_000;
+// 成交事件由 WebSocket 增量维护；完整 24 小时历史只用于定期对账。
+// 现货交易对较多时逐个查询历史的权重很高，不能每 30 秒执行一次。
+const ACCOUNT_METRICS_HISTORY_REFRESH_MS = 5 * 60_000;
 const MANAGER_TRADING_INFO_SYNC_MS = 2_000;
 const MAX_ROUND_PRICE_BACKFILL_ORDERS_PER_RUN = 200;
 const CONFIRMED_OPEN_ORDER_STATUSES = new Set([
@@ -228,6 +238,16 @@ function trackOrderPayload(
       partial: true,
       time: Date.now(),
     });
+  }
+  if (saved.length && targetClient === client && latestBinanceAccountMetrics) {
+    latestBinanceAccountMetrics = {
+      ...latestBinanceAccountMetrics,
+      orderVolume: countConfirmedOpenOrders(targetClient),
+    };
+    sendToRenderer(
+      "binance:positions-update",
+      buildCurrentPositionsPayload(latestBinanceAccountMetrics)
+    );
   }
   return saved;
 }
@@ -757,32 +777,6 @@ function openAdditionalInstances(count = 2) {
   return { launchedCount: launched.length, instances: launched };
 }
 
-function revealBrowserWindow(targetWindow) {
-  if (!targetWindow || targetWindow.isDestroyed()) return false;
-  if (targetWindow.isMinimized()) targetWindow.restore();
-  targetWindow.show();
-  targetWindow.focus();
-  return true;
-}
-
-function registerWindowLoadFallbacks(targetWindow, label) {
-  targetWindow.once("ready-to-show", () => revealBrowserWindow(targetWindow));
-  targetWindow.webContents.once("did-finish-load", () => {
-    revealBrowserWindow(targetWindow);
-  });
-  targetWindow.webContents.on(
-    "did-fail-load",
-    (_event, errorCode, errorDescription, validatedURL, isMainFrame) => {
-      if (isMainFrame === false) return;
-      process.stderr.write(
-        `[窗口加载失败] ${label}：${errorDescription || "未知错误"}` +
-        `（${errorCode || "无错误码"}）${validatedURL ? ` ${validatedURL}` : ""}\n`
-      );
-      revealBrowserWindow(targetWindow);
-    }
-  );
-}
-
 function createWindow() {
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.show();
@@ -800,6 +794,7 @@ function createWindow() {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
+      backgroundThrottling: false,
     },
   });
 
@@ -1068,13 +1063,19 @@ function sendAccountOverviewToRenderer() {
 }
 
 function buildCurrentPositionsPayload(metrics = latestBinanceAccountMetrics) {
-  return {
-    positions: Array.isArray(metrics?.positions) ? metrics.positions : [],
-    environment: metrics?.environment || (client.testnet ? "testnet" : "production"),
-    updatedAt: metrics?.updatedAt || null,
-    complete: metrics?.positionsComplete !== false,
-    warnings: Array.isArray(metrics?.warnings) ? metrics.warnings : [],
-  };
+  return buildPositionSnapshot(metrics, {
+    environment: client.testnet ? "testnet" : "production",
+    accountName: authenticatedManagerSession?.futureUserName || "",
+  });
+}
+
+function sendPositionRefreshFailure(error) {
+  sendToRenderer("binance:positions-update", {
+    ...buildCurrentPositionsPayload(),
+    complete: false,
+    attemptedAt: Date.now(),
+    error: serializeError(error),
+  });
 }
 
 async function refreshBinanceAccountMetrics(
@@ -1115,6 +1116,9 @@ async function refreshBinanceAccountMetrics(
     openOrderCount: countConfirmedOpenOrders(targetClient),
   }).then((metrics) => {
     if (targetClient !== client) return metrics;
+    if (metrics.historyReconciled) {
+      lastAccountMetricsHistoryRefreshAt = Date.now();
+    }
     latestBinanceAccountMetrics = metrics;
     sendAccountDataToRenderer();
     sendToRenderer("binance:positions-update", buildCurrentPositionsPayload(metrics));
@@ -1139,11 +1143,21 @@ async function refreshBinanceAccountMetrics(
   return refreshPromise;
 }
 
-function scheduleAccountMetricsRefresh(delayMs = 750) {
+function scheduleAccountMetricsRefresh(
+  delayMs = 750,
+  { reconcileHistory = false } = {}
+) {
+  accountMetricsScheduledReconcileHistory ||=
+    Boolean(reconcileHistory);
   clearTimeout(accountMetricsRefreshTimer);
   accountMetricsRefreshTimer = setTimeout(() => {
     accountMetricsRefreshTimer = null;
-    refreshBinanceAccountMetrics(client).catch((error) => {
+    const shouldReconcileHistory = accountMetricsScheduledReconcileHistory;
+    accountMetricsScheduledReconcileHistory = false;
+    refreshBinanceAccountMetrics(client, {
+      reconcileHistory: shouldReconcileHistory,
+    }).catch((error) => {
+      sendPositionRefreshFailure(error);
       sendToRenderer("manager:account-metrics-status", {
         status: "error",
         error: serializeError(error),
@@ -1157,15 +1171,21 @@ function scheduleAccountMetricsRefresh(delayMs = 750) {
 function stopAccountMetricsRefresh() {
   clearTimeout(accountMetricsRefreshTimer);
   accountMetricsRefreshTimer = null;
+  accountMetricsScheduledReconcileHistory = false;
   clearInterval(accountMetricsInterval);
   accountMetricsInterval = null;
 }
 
-function startAccountMetricsRefresh() {
+function startAccountMetricsRefresh({ reconcileHistory = true } = {}) {
   stopAccountMetricsRefresh();
-  scheduleAccountMetricsRefresh(0);
+  lastAccountMetricsHistoryRefreshAt = reconcileHistory ? 0 : Date.now();
+  scheduleAccountMetricsRefresh(0, { reconcileHistory });
   accountMetricsInterval = setInterval(() => {
-    scheduleAccountMetricsRefresh(0);
+    scheduleAccountMetricsRefresh(0, {
+      reconcileHistory:
+        Date.now() - lastAccountMetricsHistoryRefreshAt >=
+        ACCOUNT_METRICS_HISTORY_REFRESH_MS,
+    });
   }, ACCOUNT_METRICS_REFRESH_MS);
   accountMetricsInterval.unref?.();
 }
@@ -1606,6 +1626,68 @@ function registerIpcHandlers() {
     ));
   });
 
+  ipcMain.handle("binance:close-all-positions", async () => {
+    return safeCall(async () => {
+      const targetClient = client;
+      const pausedBackgroundRefresh = targetClient === client;
+      if (pausedBackgroundRefresh) {
+        // 清仓期间暂停高频账户刷新和管理端同步，避免它们争用 Binance
+        // 请求权重；清仓任务结束后会立即恢复。
+        stopAccountMetricsRefresh();
+        stopManagerTradingInfoSync();
+      }
+      let result;
+      try {
+        result = await trackOrderCall(
+          () => targetClient.closeAllPositions(),
+          {
+            targetClient,
+            defaultStatus: "ACKNOWLEDGED",
+            submissionSource: "shortcut:close-all-positions",
+            source: "close-all-positions",
+          }
+        );
+      } finally {
+        if (targetClient === client) {
+          startAccountMetricsRefresh({ reconcileHistory: false });
+          startManagerTradingInfoSync();
+        }
+      }
+      if (!result.verifiedFlat) {
+        const remainingSpotAssetCount = result.remainingSpotAssets?.length || 0;
+        const remainingPositionCount = result.remainingFuturesPositions?.length || 0;
+        const remainingOpenOrderCount = result.remainingOpenOrders?.length || 0;
+        const nonTradableAssetCount =
+          result.markets?.spot?.nonTradableAssets?.length || 0;
+        const lockedAssetCount = result.markets?.spot?.lockedAssets?.length || 0;
+        const dustAssetCount = result.markets?.spot?.dustAssets?.length || 0;
+        const failedMarkets = [
+          result.markets?.spot?.error ? "现货" : "",
+          result.markets?.futures?.error ? "U 本位" : "",
+        ].filter(Boolean);
+        const error = new Error(
+          "未能确认全部清仓：" +
+          `剩余现货资产 ${remainingSpotAssetCount} 项，` +
+          `剩余 U 本位持仓 ${remainingPositionCount} 项，` +
+          `剩余挂单 ${remainingOpenOrderCount} 笔。` +
+          (nonTradableAssetCount
+            ? `其中 ${nonTradableAssetCount} 项没有可直接卖出的 USDT 交易对。`
+            : "") +
+          (lockedAssetCount ? `包含锁定余额 ${lockedAssetCount} 项。` : "") +
+          (dustAssetCount ? `低于交易限制的零头 ${dustAssetCount} 项。` : "") +
+          (failedMarkets.length
+            ? `${failedMarkets.join("、")}清仓流程未完成，剩余数量未知。`
+            : "") +
+          "请查看失败明细并重新查询当前持仓。"
+        );
+        error.name = "CloseAllPositionsIncompleteError";
+        error.data = result;
+        throw error;
+      }
+      return result;
+    });
+  });
+
   ipcMain.handle("binance:amend-order", async (_event, payload) => {
     return safeCall(() => trackOrderCall(
       () => client.amendOrder(payload || {}),
@@ -1773,6 +1855,12 @@ function bindClientEvents(targetClient) {
   targetClient.on("rate-limit-update", (data) => {
     if (targetClient === client) {
       sendToRenderer("binance:rate-limit-update", data);
+    }
+  });
+
+  targetClient.on("close-all-progress", (data) => {
+    if (targetClient === client) {
+      sendToRenderer("binance:close-all-progress", data);
     }
   });
 

@@ -4,6 +4,11 @@ const {
   BinanceApiError,
 } = require("./binanceSpotClient");
 const { BinanceUsdMClient } = require("./binanceUsdMClient");
+const {
+  addDecimal,
+  compareDecimal,
+  subtractDecimal,
+} = require("./decimalMath");
 
 const MARKET_SPOT = "spot";
 const MARKET_FUTURES = "futures";
@@ -12,6 +17,15 @@ const MARKET_RESOLUTION_REFRESH_RETRY_MS = 30_000;
 const RECENT_ORDER_WINDOW_MS = 24 * 60 * 60 * 1000;
 const MAX_ACCOUNT_ORDER_QUERY_LIMIT = 1_000;
 const GLOBAL_ALGO_DISCOVERY_TTL_MS = 300_000;
+const CLOSE_ALL_DEFAULT_TIMEOUT_MS = 10 * 60 * 1_000;
+const CLOSE_ALL_DEFAULT_CONCURRENCY = 4;
+const CLOSE_ALL_RATE_LIMIT_BUFFER_MS = 100;
+const RATE_LIMIT_INTERVAL_MS = {
+  SECOND: 1_000,
+  MINUTE: 60_000,
+  HOUR: 3_600_000,
+  DAY: 86_400_000,
+};
 const ROUTED_EVENTS = [
   "depth-update",
   "trade-update",
@@ -24,6 +38,65 @@ const ROUTED_EVENTS = [
   "user-data-status",
   "user-data-error",
 ];
+
+function delay(milliseconds) {
+  const timeout = Math.max(0, Number(milliseconds) || 0);
+  if (!timeout) return Promise.resolve();
+  return new Promise((resolve) => setTimeout(resolve, timeout));
+}
+
+function normalizeOpenFuturesPosition(position) {
+  const positionAmt = String(position?.positionAmt ?? "0").trim();
+  let comparison;
+  try {
+    comparison = compareDecimal(positionAmt, "0");
+  } catch {
+    return null;
+  }
+  if (comparison === 0) return null;
+  return {
+    symbol: String(position?.symbol || "").toUpperCase(),
+    positionAmt,
+    quantity: comparison < 0
+      ? subtractDecimal("0", positionAmt)
+      : positionAmt.replace(/^\+/, ""),
+    closeSide: comparison < 0 ? "BUY" : "SELL",
+    entryPrice: String(position?.entryPrice ?? "0"),
+    unrealizedProfit: String(position?.unrealizedProfit ?? "0"),
+    positionSide: String(position?.positionSide || "BOTH").toUpperCase(),
+  };
+}
+
+function listOpenFuturesPositions(account) {
+  return (Array.isArray(account?.positions) ? account.positions : [])
+    .map(normalizeOpenFuturesPosition)
+    .filter((position) => position?.symbol);
+}
+
+function listNonUsdtSpotBalances(account) {
+  return (Array.isArray(account?.balances) ? account.balances : []).flatMap(
+    (balance) => {
+      const asset = String(balance?.asset || "").toUpperCase();
+      if (!asset || asset === "USDT") return [];
+      const free = String(balance?.free ?? "0");
+      const locked = String(balance?.locked ?? "0");
+      let total;
+      try {
+        total = addDecimal(free, locked);
+        if (compareDecimal(total, "0") <= 0) return [];
+      } catch {
+        return [];
+      }
+      return [{
+        asset,
+        symbol: `${asset}USDT`,
+        free,
+        locked,
+        total,
+      }];
+    }
+  );
+}
 
 class BinanceUnifiedClient extends EventEmitter {
   constructor({
@@ -73,6 +146,10 @@ class BinanceUnifiedClient extends EventEmitter {
     this.marketResolutionRefreshPromises = new Map();
     this.marketResolutionRefreshAttemptAt = new Map();
     this.futuresInitializationPromise = null;
+    this.closeAllPositionsPromise = null;
+    this.closeAllSpotPositionsPromise = null;
+    this.closeAllFuturesPositionsPromise = null;
+    this.closed = false;
     this.lastGlobalAlgoDiscoveryAt = 0;
     this.bindChildEvents(this.spot, MARKET_SPOT);
     this.bindChildEvents(this.futures, MARKET_FUTURES);
@@ -541,6 +618,758 @@ class BinanceUnifiedClient extends EventEmitter {
       (client) => client.cancelAllOpenOrders(options),
       options
     );
+  }
+
+  createCloseAllContext({
+    marketType,
+    maxDurationMs = CLOSE_ALL_DEFAULT_TIMEOUT_MS,
+    concurrency = CLOSE_ALL_DEFAULT_CONCURRENCY,
+    waitFn = delay,
+  } = {}) {
+    const startedAt = Date.now();
+    return {
+      marketType,
+      startedAt,
+      deadlineAt: startedAt + Math.max(1_000, Number(maxDurationMs) || 0),
+      concurrency: Math.max(1, Math.min(8, Math.floor(Number(concurrency) || 1))),
+      waitFn: typeof waitFn === "function" ? waitFn : delay,
+      waitedMs: 0,
+      rateLimitWaitCount: 0,
+    };
+  }
+
+  emitCloseAllProgress(context, details = {}) {
+    this.emit("close-all-progress", {
+      marketType: context.marketType,
+      waitedMs: context.waitedMs,
+      rateLimitWaitCount: context.rateLimitWaitCount,
+      startedAt: context.startedAt,
+      time: Date.now(),
+      ...details,
+    });
+  }
+
+  assertCloseAllCanContinue(context) {
+    if (this.closed) {
+      const error = new BinanceApiError(
+        "客户端已关闭或环境已切换，一键平仓任务已停止。"
+      );
+      error.name = "CloseAllPositionsStoppedError";
+      throw error;
+    }
+    if (Date.now() >= context.deadlineAt) {
+      const error = new BinanceApiError(
+        "一键平仓等待 Binance 限流恢复的时间过长，任务已安全停止；请重新确认持仓后再次执行。",
+        {
+          data: {
+            marketType: context.marketType,
+            startedAt: context.startedAt,
+            deadlineAt: context.deadlineAt,
+            waitedMs: context.waitedMs,
+          },
+        }
+      );
+      error.name = "CloseAllPositionsTimeoutError";
+      throw error;
+    }
+  }
+
+  getCloseAllRateLimitWaitMs(context, {
+    errors = [],
+    proactive = false,
+    upcomingCount = 1,
+  } = {}) {
+    const now = Date.now();
+    const coordinator = this.spot.rateLimitCoordinator;
+    const snapshot = coordinator?.snapshot?.() || {};
+    const candidates = [];
+    const marketBanUntil = Number(
+      snapshot.marketBans?.[context.marketType]
+    );
+    if (Number.isFinite(marketBanUntil) && marketBanUntil > now) {
+      candidates.push(marketBanUntil);
+    }
+    const globalBanUntil = Number(snapshot.globalBanUntil);
+    if (Number.isFinite(globalBanUntil) && globalBanUntil > now) {
+      candidates.push(globalBanUntil);
+    }
+
+    for (const error of errors) {
+      const banUntil = Number(error?.data?.banUntil);
+      if (Number.isFinite(banUntil) && banUntil > now) {
+        candidates.push(banUntil);
+      }
+    }
+
+    if (proactive) {
+      for (const limit of snapshot.limits || []) {
+        if (
+          limit.marketType &&
+          String(limit.marketType).toLowerCase() !== context.marketType
+        ) {
+          continue;
+        }
+        if (!limit.active || !Number(limit.limit)) continue;
+        const type = String(limit.rateLimitType || "").toUpperCase();
+        const countAfterBatch = Number(limit.count || 0) + upcomingCount;
+        const shouldPause = type === "ORDERS"
+          ? countAfterBatch / Number(limit.limit) >= 0.9
+          : type === "REQUEST_WEIGHT"
+            ? countAfterBatch / Number(limit.limit) >= 0.97
+            : false;
+        if (!shouldPause) continue;
+        const intervalMs =
+          (RATE_LIMIT_INTERVAL_MS[String(limit.interval).toUpperCase()] || 0) *
+          (Number(limit.intervalNum) || 1);
+        if (intervalMs > 0) {
+          candidates.push(Number(limit.observedAt) + intervalMs);
+        }
+      }
+    }
+
+    const waitUntil = Math.max(now, ...candidates.filter(Number.isFinite));
+    return waitUntil > now
+      ? waitUntil - now + CLOSE_ALL_RATE_LIMIT_BUFFER_MS
+      : 0;
+  }
+
+  isRetryableCloseAllRateLimit(error) {
+    if (error?.data?.executionStatus === "UNKNOWN") return false;
+    if (error?.data?.orderAttempt?.status === "UNKNOWN") return false;
+    return Number(error?.status) === 429 ||
+      (Number(error?.code) === -1003 && error?.data?.localRateLimitGuard === true);
+  }
+
+  async waitForCloseAllRateLimit(context, waitMs, details = {}) {
+    if (!(waitMs > 0)) return;
+    this.assertCloseAllCanContinue(context);
+    const remainingMs = context.deadlineAt - Date.now();
+    if (waitMs >= remainingMs) {
+      this.assertCloseAllCanContinue({ ...context, deadlineAt: Date.now() });
+    }
+    context.waitedMs += waitMs;
+    context.rateLimitWaitCount += 1;
+    this.emitCloseAllProgress(context, {
+      stage: "rate-limit-wait",
+      message: `Binance ${context.marketType === MARKET_SPOT ? "现货" : "U 本位"}接口接近或触发限流，` +
+        `将在 ${(waitMs / 1_000).toFixed(1)} 秒后自动继续。`,
+      retryAt: Date.now() + waitMs,
+      ...details,
+    });
+    await context.waitFn(waitMs);
+    this.assertCloseAllCanContinue(context);
+  }
+
+  async runCloseAllOperation(context, action, { stage } = {}) {
+    for (;;) {
+      this.assertCloseAllCanContinue(context);
+      const activeBanWaitMs = this.getCloseAllRateLimitWaitMs(context);
+      if (activeBanWaitMs > 0) {
+        await this.waitForCloseAllRateLimit(context, activeBanWaitMs, { stage });
+      }
+      try {
+        return await action();
+      } catch (error) {
+        if (!this.isRetryableCloseAllRateLimit(error)) throw error;
+        const waitMs = Math.max(
+          1_000,
+          this.getCloseAllRateLimitWaitMs(context, { errors: [error] })
+        );
+        await this.waitForCloseAllRateLimit(context, waitMs, {
+          stage,
+          lastError: this.serializeAccountSyncError(error),
+        });
+      }
+    }
+  }
+
+  async runCloseAllQueue(context, items, worker, { stage } = {}) {
+    const pending = items.map((item, index) => ({ item, index }));
+    const results = Array(items.length);
+    let completed = 0;
+    while (pending.length) {
+      this.assertCloseAllCanContinue(context);
+      const batchSize = Math.min(context.concurrency, pending.length);
+      const proactiveWaitMs = this.getCloseAllRateLimitWaitMs(context, {
+        proactive: true,
+        upcomingCount: batchSize,
+      });
+      if (proactiveWaitMs > 0) {
+        await this.waitForCloseAllRateLimit(context, proactiveWaitMs, {
+          stage,
+          completed,
+          pending: pending.length,
+          total: items.length,
+        });
+      }
+
+      const batch = pending.splice(0, batchSize);
+      const settlements = await Promise.allSettled(
+        batch.map(({ item }) => worker(item))
+      );
+      const retryItems = [];
+      const rateLimitErrors = [];
+      settlements.forEach((settlement, batchIndex) => {
+        const entry = batch[batchIndex];
+        if (settlement.status === "rejected" &&
+            this.isRetryableCloseAllRateLimit(settlement.reason)) {
+          retryItems.push(entry);
+          rateLimitErrors.push(settlement.reason);
+          return;
+        }
+        results[entry.index] = settlement;
+        completed += 1;
+      });
+      pending.unshift(...retryItems);
+      this.emitCloseAllProgress(context, {
+        stage,
+        completed,
+        pending: pending.length,
+        total: items.length,
+        message: `${stage || "清仓"}：已完成 ${completed}/${items.length}，剩余 ${pending.length}。`,
+      });
+      if (retryItems.length) {
+        const waitMs = Math.max(
+          1_000,
+          this.getCloseAllRateLimitWaitMs(context, {
+            errors: rateLimitErrors,
+            proactive: true,
+            upcomingCount: Math.min(context.concurrency, pending.length),
+          })
+        );
+        await this.waitForCloseAllRateLimit(context, waitMs, {
+          stage,
+          completed,
+          pending: pending.length,
+          total: items.length,
+          lastError: this.serializeAccountSyncError(rateLimitErrors[0]),
+        });
+      }
+    }
+    return results;
+  }
+
+  classifySpotAssetsForLiquidation(assets, symbolCatalog) {
+    const symbols = new Map(
+      (Array.isArray(symbolCatalog) ? symbolCatalog : []).map((symbol) => [
+        String(symbol?.symbol || "").toUpperCase(),
+        symbol,
+      ])
+    );
+    const sellableAssets = [];
+    const nonTradableAssets = [];
+    const lockedAssets = [];
+    for (const asset of assets) {
+      if (compareDecimal(asset.locked, "0") > 0) lockedAssets.push(asset);
+      if (compareDecimal(asset.free, "0") <= 0) continue;
+      const symbolInfo = symbols.get(asset.symbol);
+      if (
+        !symbolInfo ||
+        String(symbolInfo.status || "").toUpperCase() !== "TRADING" ||
+        String(symbolInfo.baseAsset || "").toUpperCase() !== asset.asset ||
+        String(symbolInfo.quoteAsset || "").toUpperCase() !== "USDT"
+      ) {
+        nonTradableAssets.push({
+          ...asset,
+          reason: symbolInfo
+            ? `${asset.symbol} 当前不可交易`
+            : `不存在可直接卖出的 ${asset.symbol} 交易对`,
+        });
+        continue;
+      }
+      sellableAssets.push(asset);
+    }
+    return { sellableAssets, nonTradableAssets, lockedAssets };
+  }
+
+  isSpotDustFailure(error) {
+    const message = String(error?.message || "");
+    return Number(error?.code) === -1013 &&
+      /NOTIONAL|LOT_SIZE|quantity|最小值|订单金额/i.test(message);
+  }
+
+  async closeAllPositions() {
+    if (this.closeAllPositionsPromise) return this.closeAllPositionsPromise;
+
+    const operation = this.performCloseAllPositions().finally(() => {
+      if (this.closeAllPositionsPromise === operation) {
+        this.closeAllPositionsPromise = null;
+      }
+    });
+    this.closeAllPositionsPromise = operation;
+    return operation;
+  }
+
+  async performCloseAllPositions() {
+    const [spotSettlement, futuresSettlement] = await Promise.allSettled([
+      this.closeAllSpotPositions(),
+      this.closeAllFuturesPositions(),
+    ]);
+    const toMarketResult = (settlement, marketType) => {
+      if (settlement.status === "fulfilled") return settlement.value;
+      return {
+        marketType,
+        verifiedFlat: false,
+        error: this.serializeAccountSyncError(settlement.reason),
+        orders: [],
+      };
+    };
+    const spot = toMarketResult(spotSettlement, MARKET_SPOT);
+    const futures = toMarketResult(futuresSettlement, MARKET_FUTURES);
+    const remainingSpotAssets = spot.remainingAssets || [];
+    const remainingFuturesPositions = futures.remainingPositions || [];
+    const remainingOpenOrders = [
+      ...(spot.remainingOpenOrders || []).map((order) => ({
+        ...order,
+        marketType: MARKET_SPOT,
+      })),
+      ...(futures.remainingOpenOrders || []).map((order) => ({
+        ...order,
+        marketType: MARKET_FUTURES,
+      })),
+    ];
+
+    return {
+      verifiedFlat: spot.verifiedFlat === true && futures.verifiedFlat === true,
+      markets: { spot, futures },
+      remainingSpotAssets,
+      remainingFuturesPositions,
+      remainingPositions: remainingFuturesPositions,
+      remainingOpenOrders,
+      orders: [...(spot.orders || []), ...(futures.orders || [])],
+      completedAt: Date.now(),
+    };
+  }
+
+  async closeAllSpotPositions({
+    verificationDelays = [0, 150, 400, 1_000, 2_000],
+    maxDurationMs = CLOSE_ALL_DEFAULT_TIMEOUT_MS,
+    concurrency = CLOSE_ALL_DEFAULT_CONCURRENCY,
+    waitFn = delay,
+  } = {}) {
+    if (this.closeAllSpotPositionsPromise) {
+      return this.closeAllSpotPositionsPromise;
+    }
+    const context = this.createCloseAllContext({
+      marketType: MARKET_SPOT,
+      maxDurationMs,
+      concurrency,
+      waitFn,
+    });
+    const operation = this.performCloseAllSpotPositions({
+      verificationDelays,
+      context,
+    }).finally(() => {
+      if (this.closeAllSpotPositionsPromise === operation) {
+        this.closeAllSpotPositionsPromise = null;
+      }
+    });
+    this.closeAllSpotPositionsPromise = operation;
+    return operation;
+  }
+
+  async performCloseAllSpotPositions({ verificationDelays, context }) {
+    this.spot.assertTradingCredentials();
+    this.emitCloseAllProgress(context, {
+      stage: "spot-preflight",
+      message: "正在读取现货账户、挂单和可交易的 USDT 交易对。",
+    });
+    const [initialAccount, initialOpenOrders, symbolCatalog] = await Promise.all([
+      this.runCloseAllOperation(
+        context,
+        () => this.spot.accountStatus({
+          omitZeroBalances: false,
+          critical: true,
+        }),
+        { stage: "spot-account" }
+      ),
+      this.runCloseAllOperation(
+        context,
+        () => this.spot.openOrders({ critical: true }),
+        { stage: "spot-open-orders" }
+      ),
+      this.runCloseAllOperation(
+        context,
+        () => this.spot.exchangeInfoCatalog({ critical: true }),
+        { stage: "spot-exchange-info" }
+      ),
+    ]);
+    const initialAssets = listNonUsdtSpotBalances(initialAccount);
+    const openOrderSymbols = [...new Set(initialOpenOrders
+      .map((order) => String(order?.symbol || "").toUpperCase())
+      .filter(Boolean))].sort();
+    const cancelSettlements = await this.runCloseAllQueue(
+      context,
+      openOrderSymbols,
+      (symbol) => this.spot.cancelAllOpenOrders({ symbol }),
+      { stage: "spot-cancel-orders" }
+    );
+    const cancellations = cancelSettlements.map((settlement, index) => {
+      const symbol = openOrderSymbols[index];
+      if (settlement.status === "fulfilled") {
+        const canceledOrders = this.addMarketType(
+          Array.isArray(settlement.value) ? settlement.value : [],
+          MARKET_SPOT
+        );
+        return {
+          symbol,
+          ok: true,
+          canceledOrders,
+          canceledOrderCount: canceledOrders.length,
+        };
+      }
+      return {
+        symbol,
+        ok: false,
+        error: this.serializeAccountSyncError(settlement.reason),
+      };
+    });
+
+    let preSellAccount = initialAccount;
+    let preSellRefreshError = null;
+    try {
+      preSellAccount = await this.runCloseAllOperation(
+        context,
+        () => this.spot.accountStatus({
+          omitZeroBalances: false,
+          critical: true,
+        }),
+        { stage: "spot-refresh-balance" }
+      );
+    } catch (error) {
+      preSellRefreshError = this.serializeAccountSyncError(error);
+    }
+    const assetsToSell = listNonUsdtSpotBalances(preSellAccount);
+    const {
+      sellableAssets,
+      nonTradableAssets,
+      lockedAssets,
+    } = this.classifySpotAssetsForLiquidation(assetsToSell, symbolCatalog);
+    this.emitCloseAllProgress(context, {
+      stage: "spot-sell-assets",
+      total: sellableAssets.length,
+      pending: sellableAssets.length,
+      nonTradableCount: nonTradableAssets.length,
+      lockedCount: lockedAssets.length,
+      message: `准备卖出 ${sellableAssets.length} 项现货资产；` +
+        `${nonTradableAssets.length} 项没有可直接卖出的 USDT 交易对，` +
+        `${lockedAssets.length} 项包含锁定余额。`,
+    });
+    const sellSettlements = await this.runCloseAllQueue(
+      context,
+      sellableAssets,
+      async (asset) => this.addMarketType(await this.spot.placeOrder({
+        symbol: asset.symbol,
+        side: "SELL",
+        type: "MARKET",
+        quantity: asset.free,
+        newOrderRespType: "ACK",
+      }), MARKET_SPOT),
+      { stage: "spot-sell-assets" }
+    );
+    const sellAttempts = sellSettlements.map((settlement, index) => {
+      const asset = sellableAssets[index];
+      if (settlement.status === "fulfilled") {
+        return { ...asset, ok: true, order: settlement.value };
+      }
+      return {
+        ...asset,
+        ok: false,
+        error: this.serializeAccountSyncError(settlement.reason),
+      };
+    });
+    const dustAssets = sellAttempts.filter(
+      (attempt) => !attempt.ok && this.isSpotDustFailure(attempt.error)
+    );
+
+    const normalizedVerificationDelays = (
+      Array.isArray(verificationDelays) && verificationDelays.length
+        ? verificationDelays
+        : [0]
+    ).map((value) => Math.max(0, Number(value) || 0));
+    let assetsVerified = false;
+    let assetFlatConfirmations = 0;
+    let remainingAssets = assetsToSell;
+    const verificationErrors = [];
+    for (const waitMs of normalizedVerificationDelays) {
+      await context.waitFn(waitMs);
+      try {
+        const account = await this.runCloseAllOperation(
+          context,
+          () => this.spot.accountStatus({
+            omitZeroBalances: false,
+            critical: true,
+          }),
+          { stage: "spot-verify-balance" }
+        );
+        assetsVerified = true;
+        remainingAssets = listNonUsdtSpotBalances(account);
+        if (remainingAssets.length) {
+          assetFlatConfirmations = 0;
+        } else {
+          assetFlatConfirmations += 1;
+          if (assetFlatConfirmations >= 2) break;
+        }
+      } catch (error) {
+        verificationErrors.push(this.serializeAccountSyncError(error));
+      }
+    }
+
+    let openOrdersVerified = false;
+    let remainingOpenOrders = initialOpenOrders;
+    let openOrdersVerificationError = null;
+    try {
+      remainingOpenOrders = await this.runCloseAllOperation(
+        context,
+        () => this.spot.openOrders({ critical: true }),
+        { stage: "spot-verify-open-orders" }
+      );
+      openOrdersVerified = true;
+    } catch (error) {
+      openOrdersVerificationError = this.serializeAccountSyncError(error);
+    }
+    const canceledOrders = cancellations.flatMap((item) =>
+      item.ok ? item.canceledOrders : []
+    );
+    const sellOrders = sellAttempts.flatMap((item) =>
+      item.ok && item.order ? [item.order] : []
+    );
+    const verifiedFlat = assetsVerified && assetFlatConfirmations >= 2 &&
+      openOrdersVerified && remainingAssets.length === 0 &&
+      remainingOpenOrders.length === 0;
+
+    return {
+      marketType: MARKET_SPOT,
+      verifiedFlat,
+      assetsVerified,
+      assetFlatConfirmations,
+      openOrdersVerified,
+      initialAssets,
+      assetsToSell,
+      initialOpenOrderCount: initialOpenOrders.length,
+      cancellations,
+      sellAttempts,
+      nonTradableAssets,
+      lockedAssets,
+      dustAssets,
+      remainingAssets,
+      remainingOpenOrders,
+      preSellRefreshError,
+      verificationErrors,
+      openOrdersVerificationError,
+      orders: [...canceledOrders, ...sellOrders],
+      waitedMs: context.waitedMs,
+      rateLimitWaitCount: context.rateLimitWaitCount,
+      completedAt: Date.now(),
+    };
+  }
+
+  async closeAllFuturesPositions({
+    verificationDelays = [0, 150, 400, 1_000, 2_000],
+    maxDurationMs = CLOSE_ALL_DEFAULT_TIMEOUT_MS,
+    concurrency = CLOSE_ALL_DEFAULT_CONCURRENCY,
+    waitFn = delay,
+  } = {}) {
+    if (this.closeAllFuturesPositionsPromise) {
+      return this.closeAllFuturesPositionsPromise;
+    }
+
+    const context = this.createCloseAllContext({
+      marketType: MARKET_FUTURES,
+      maxDurationMs,
+      concurrency,
+      waitFn,
+    });
+    const operation = this.performCloseAllFuturesPositions({
+      verificationDelays,
+      context,
+    }).finally(() => {
+      if (this.closeAllFuturesPositionsPromise === operation) {
+        this.closeAllFuturesPositionsPromise = null;
+      }
+    });
+    this.closeAllFuturesPositionsPromise = operation;
+    return operation;
+  }
+
+  async performCloseAllFuturesPositions({ verificationDelays, context }) {
+    this.futures.assertTradingCredentials();
+    this.emitCloseAllProgress(context, {
+      stage: "futures-preflight",
+      message: "正在读取并复核 U 本位持仓、普通挂单和条件单。",
+    });
+
+    // 必须先完整读到持仓和挂单。无法确认挂单时贸然平仓，残留订单稍后成交
+    // 可能再次建立持仓，因此这里选择明确失败而不是给出虚假的“已平仓”。
+    const [initialAccount, initialOpenOrders] = await Promise.all([
+      this.runCloseAllOperation(
+        context,
+        () => this.futures.accountStatus({
+          omitZeroBalances: false,
+          critical: true,
+        }),
+        { stage: "futures-account" }
+      ),
+      this.runCloseAllOperation(
+        context,
+        () => this.futures.openOrders({ critical: true }),
+        { stage: "futures-open-orders" }
+      ),
+    ]);
+    const initialPositions = listOpenFuturesPositions(initialAccount);
+    const symbols = [...new Set([
+      ...initialPositions.map(({ symbol }) => symbol),
+      ...initialOpenOrders.map((order) => String(order?.symbol || "").toUpperCase()),
+    ].filter(Boolean))].sort();
+
+    const cancelSettlements = await this.runCloseAllQueue(
+      context,
+      symbols,
+      (symbol) => this.futures.cancelAllOpenOrders({ symbol }),
+      { stage: "futures-cancel-orders" }
+    );
+    const cancellations = cancelSettlements.map((settlement, index) => {
+      const symbol = symbols[index];
+      if (settlement.status === "fulfilled") {
+        return {
+          symbol,
+          ok: true,
+          canceledOrders: settlement.value,
+          canceledOrderCount: Array.isArray(settlement.value)
+            ? settlement.value.length
+            : 0,
+        };
+      }
+      return {
+        symbol,
+        ok: false,
+        error: this.serializeAccountSyncError(settlement.reason),
+      };
+    });
+
+    let preCloseAccount = initialAccount;
+    let preCloseRefreshError = null;
+    try {
+      preCloseAccount = await this.runCloseAllOperation(
+        context,
+        () => this.futures.accountStatus({
+          omitZeroBalances: false,
+          critical: true,
+        }),
+        { stage: "futures-refresh-position" }
+      );
+    } catch (error) {
+      // 仍使用操作开始时刚从 Binance 取得的持仓快照执行 reduceOnly 平仓；
+      // 最终复核无法通过时整体结果会明确标记为失败。
+      preCloseRefreshError = this.serializeAccountSyncError(error);
+    }
+    const positionsToClose = listOpenFuturesPositions(preCloseAccount);
+    const closeSettlements = await this.runCloseAllQueue(
+      context,
+      positionsToClose,
+      (position) => this.futures.placeOrder({
+        symbol: position.symbol,
+        side: position.closeSide,
+        positionSide: "BOTH",
+        positionEffect: "CLOSE",
+        reduceOnly: true,
+        type: "MARKET",
+        quantity: position.quantity,
+        newOrderRespType: "ACK",
+      }),
+      { stage: "futures-close-positions" }
+    );
+    const closeAttempts = closeSettlements.map((settlement, index) => {
+      const position = positionsToClose[index];
+      if (settlement.status === "fulfilled") {
+        return { ...position, ok: true, order: settlement.value };
+      }
+      return {
+        ...position,
+        ok: false,
+        error: this.serializeAccountSyncError(settlement.reason),
+      };
+    });
+
+    const normalizedVerificationDelays = (
+      Array.isArray(verificationDelays) && verificationDelays.length
+        ? verificationDelays
+        : [0]
+    ).map((value) => Math.max(0, Number(value) || 0));
+    let positionsVerified = false;
+    let remainingPositions = positionsToClose;
+    let positionFlatConfirmations = 0;
+    const verificationErrors = [];
+    for (const waitMs of normalizedVerificationDelays) {
+      await context.waitFn(waitMs);
+      try {
+        const account = await this.runCloseAllOperation(
+          context,
+          () => this.futures.accountStatus({
+            omitZeroBalances: false,
+            critical: true,
+          }),
+          { stage: "futures-verify-position" }
+        );
+        positionsVerified = true;
+        remainingPositions = listOpenFuturesPositions(account);
+        if (remainingPositions.length) {
+          positionFlatConfirmations = 0;
+        } else {
+          positionFlatConfirmations += 1;
+          if (positionFlatConfirmations >= 2) break;
+        }
+      } catch (error) {
+        verificationErrors.push(this.serializeAccountSyncError(error));
+      }
+    }
+
+    let openOrdersVerified = false;
+    let remainingOpenOrders = initialOpenOrders;
+    let openOrdersVerificationError = null;
+    try {
+      remainingOpenOrders = await this.runCloseAllOperation(
+        context,
+        () => this.futures.openOrders({ critical: true }),
+        { stage: "futures-verify-open-orders" }
+      );
+      openOrdersVerified = true;
+    } catch (error) {
+      openOrdersVerificationError = this.serializeAccountSyncError(error);
+    }
+
+    const canceledOrders = cancellations.flatMap((item) =>
+      item.ok && Array.isArray(item.canceledOrders) ? item.canceledOrders : []
+    );
+    const closeOrders = closeAttempts.flatMap((item) =>
+      item.ok && item.order ? [item.order] : []
+    );
+    const verifiedFlat = positionsVerified && positionFlatConfirmations >= 2 &&
+      openOrdersVerified &&
+      remainingPositions.length === 0 && remainingOpenOrders.length === 0;
+
+    return {
+      marketType: MARKET_FUTURES,
+      verifiedFlat,
+      positionsVerified,
+      positionFlatConfirmations,
+      openOrdersVerified,
+      initialPositions,
+      positionsToClose,
+      initialOpenOrderCount: initialOpenOrders.length,
+      cancellations,
+      closeAttempts,
+      remainingPositions,
+      remainingOpenOrders,
+      preCloseRefreshError,
+      verificationErrors,
+      openOrdersVerificationError,
+      // 供主进程统一订单状态仓库消费，撤单和 ACK 平仓单都会被记录。
+      orders: [...canceledOrders, ...closeOrders],
+      waitedMs: context.waitedMs,
+      rateLimitWaitCount: context.rateLimitWaitCount,
+      completedAt: Date.now(),
+    };
   }
 
   async amendOrder(options) {
@@ -1053,6 +1882,7 @@ class BinanceUnifiedClient extends EventEmitter {
   }
 
   close() {
+    this.closed = true;
     this.spot.close();
     this.futures.close();
     this.marketResolutionCache.clear();

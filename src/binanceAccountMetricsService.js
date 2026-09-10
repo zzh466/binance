@@ -984,6 +984,24 @@ class BinanceAccountMetricsService {
       ...futuresMetrics.positions,
       ...spotMetrics.positions,
     ].sort(comparePositionRows);
+    const positionSources = {
+      spot: {
+        configured: hasSpot,
+        ok: hasSpot && spotResult.status === "fulfilled",
+        updatedAt: spotResult.status === "fulfilled" ? now : null,
+        error: spotResult.status === "rejected"
+          ? serializeWarning("spot", "account.status", spotResult.reason)
+          : null,
+      },
+      futures: {
+        configured: hasFutures,
+        ok: hasFutures && futuresResult.status === "fulfilled",
+        updatedAt: futuresResult.status === "fulfilled" ? now : null,
+        error: futuresResult.status === "rejected"
+          ? serializeWarning("futures", "account.status", futuresResult.reason)
+          : null,
+      },
+    };
 
     return {
       environment,
@@ -1036,11 +1054,10 @@ class BinanceAccountMetricsService {
       ),
       historyReconciled: shouldReconcileHistory,
       positions,
-      positionsComplete: (
-        (!hasSpot || spotResult.status === "fulfilled") &&
-        (!hasSpot || tickerResult.status === "fulfilled") &&
-        (!hasFutures || futuresResult.status === "fulfilled")
-      ),
+      // 持仓安全状态必须同时覆盖现货和 U 本位。行情价格查询失败只会
+      // 影响估值，不影响余额/持仓数量本身是否已经从 Binance 取回。
+      positionsComplete: positionSources.spot.ok && positionSources.futures.ok,
+      positionSources,
       spot: spotMetrics,
       futures: futuresMetrics,
       warnings,

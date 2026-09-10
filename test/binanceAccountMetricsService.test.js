@@ -327,7 +327,45 @@ test("U 本位账户暂时失败时仍保留已经查到的现货持仓", async 
   assert.equal(metrics.positions[0].marketType, "spot");
   assert.equal(metrics.positions[0].symbol, "BTCUSDT");
   assert.equal(metrics.positionsComplete, false);
+  assert.equal(metrics.positionSources.spot.ok, true);
+  assert.equal(metrics.positionSources.futures.ok, false);
+  assert.match(metrics.positionSources.futures.error.message, /futures unavailable/);
   assert.equal(metrics.warnings[0].marketType, "futures");
+});
+
+test("现货行情估值失败时仍可确认现货持仓数量已经查询成功", async () => {
+  const service = new BinanceAccountMetricsService({ now: () => 16_000_000 });
+  const metrics = await service.refresh({
+    client: {
+      spot: {
+        apiKey: "spot-key",
+        apiSecret: "spot-secret",
+        accountStatus: async () => ({
+          balances: [{ asset: "BTC", free: "0.2", locked: "0" }],
+        }),
+        tickerPrices: async () => {
+          throw new Error("ticker unavailable");
+        },
+      },
+      futures: {
+        apiKey: "futures-key",
+        apiSecret: "futures-secret",
+        accountStatus: async () => ({ positions: [] }),
+        incomeHistory: async () => [],
+      },
+    },
+    environment: "production",
+    accountFingerprint: "account",
+  });
+
+  assert.equal(metrics.positions.length, 1);
+  assert.equal(metrics.positions[0].symbol, "BTC");
+  assert.equal(metrics.positionsComplete, true);
+  assert.equal(metrics.positionSources.spot.ok, true);
+  assert.equal(metrics.positionSources.futures.ok, true);
+  assert.equal(metrics.warnings.some((warning) =>
+    warning.operation === "ticker.price"
+  ), true);
 });
 
 test("现货 executionReport 成交可以即时写入已初始化账本", async () => {

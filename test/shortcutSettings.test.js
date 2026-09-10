@@ -4,6 +4,7 @@ const {
   ACTION_ORDER,
   ACTION_ORDER_QUOTE_TOTAL,
   ACTION_CANCEL_ALL,
+  ACTION_CLOSE_ALL_POSITIONS,
   DIRECTION_SHORT,
   DIRECTION_LONG,
   DEFAULT_SHORTCUTS,
@@ -16,7 +17,7 @@ const {
   isOrderAction,
 } = require("../src/shortcutSettings");
 
-test("快捷键默认列表包含 Num 1 报空、Num 3 报多和 Num 5 撤单", () => {
+test("快捷键默认列表包含 Num 1 报空、Num 3 报多、Num 5 撤单和 P 一键平所有", () => {
   const result = validate(DEFAULT_SHORTCUTS);
 
   assert.equal(result.valid, true);
@@ -30,7 +31,12 @@ test("快捷键默认列表包含 Num 1 报空、Num 3 报多和 Num 5 撤单", 
     quoteOrderQty: "",
   });
   assert.equal(getShortcutForCode("Numpad5", result.settings).action, ACTION_CANCEL_ALL);
+  assert.equal(
+    getShortcutForCode("KeyP", result.settings).action,
+    ACTION_CLOSE_ALL_POSITIONS
+  );
   assert.equal(getKeyLabel("Numpad1"), "Num 1");
+  assert.equal(getKeyLabel("KeyP"), "P");
   assert.equal(formatPriceOffset(0.1), "+0.1");
 });
 
@@ -64,6 +70,7 @@ test("按总价下单快捷键保留方向、超价和计价资产总价", () =>
 test("按数量和按总价下单动作使用明确的展示名称", () => {
   assert.equal(getActionLabel(ACTION_ORDER), "下单（按数量）");
   assert.equal(getActionLabel(ACTION_ORDER_QUOTE_TOTAL), "下单（按总价）");
+  assert.equal(getActionLabel(ACTION_CLOSE_ALL_POSITIONS), "一键平所有");
 });
 
 test("按总价下单快捷键拒绝无效方向、超价和非正数总价", () => {
@@ -88,9 +95,13 @@ test("旧版按动作保存的快捷键可以迁移为规则列表", () => {
     cancelAll: "",
   });
 
-  assert.equal(migrated.length, 2);
+  assert.equal(migrated.length, 3);
   assert.equal(getShortcutForCode("Numpad7", migrated).id, "order-short");
   assert.equal(getShortcutForCode("Numpad9", migrated).id, "order-long");
+  assert.equal(
+    getShortcutForCode("KeyP", migrated).action,
+    ACTION_CLOSE_ALL_POSITIONS
+  );
 });
 
 test("快捷键列表拒绝重复按键和无效下单参数", () => {

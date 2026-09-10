@@ -392,7 +392,10 @@ class BinanceSpotClient extends EventEmitter {
   guardRateLimit({ operation, critical = false } = {}) {
     if (!this.rateLimitCoordinator) return;
     try {
-      this.rateLimitCoordinator.beforeRequest({ critical });
+      this.rateLimitCoordinator.beforeRequest({
+        critical,
+        marketType: this.marketType,
+      });
     } catch (error) {
       throw new BinanceApiError(error.message, {
         status: 429,
@@ -421,11 +424,12 @@ class BinanceSpotClient extends EventEmitter {
     path,
     params = {},
     signed = false,
-    baseUrl = this.restBase
+    baseUrl = this.restBase,
+    requestOptions = {}
   ) {
     const upperMethod = String(method).toUpperCase();
     const operation = `${upperMethod} ${path}`;
-    const critical = path.endsWith("/time") ||
+    const critical = requestOptions.critical === true || path.endsWith("/time") ||
       (signed && ["POST", "PUT", "DELETE"].includes(upperMethod));
     this.guardRateLimit({ operation, critical });
     const normalized = this.normalizeParams(params);
@@ -529,7 +533,7 @@ class BinanceSpotClient extends EventEmitter {
     return !Number.isFinite(status) || status >= 500;
   }
 
-  async requestPublicWsApi(path, params = {}) {
+  async requestPublicWsApi(path, params = {}, options = {}) {
     const wsMethod = TESTNET_PUBLIC_WS_METHODS.get(path);
     if (!wsMethod) {
       throw new BinanceApiError(`现货 WebSocket API 不支持公共接口 ${path}。`);
@@ -542,17 +546,23 @@ class BinanceSpotClient extends EventEmitter {
     );
     return this.requestWsApiOnSocket(socket, wsMethod, normalizedParams, {
       url: this.tradingWsApiBase,
+      critical: options.critical === true,
     });
   }
 
-  async requestPublicGet(path, params = {}, baseUrl = this.restBase) {
+  async requestPublicGet(
+    path,
+    params = {},
+    baseUrl = this.restBase,
+    options = {}
+  ) {
     try {
-      return await this.request("GET", path, params, false, baseUrl);
+      return await this.request("GET", path, params, false, baseUrl, options);
     } catch (error) {
       if (!this.shouldFallbackTestnetPublicRequest(error, path, baseUrl)) {
         throw error;
       }
-      return this.requestPublicWsApi(path, params);
+      return this.requestPublicWsApi(path, params, options);
     }
   }
 
@@ -587,6 +597,32 @@ class BinanceSpotClient extends EventEmitter {
     }
 
     return this.refreshExchangeInfo(normalizedSymbol);
+  }
+
+  async exchangeInfoCatalog({ critical = false } = {}) {
+    const result = await this.requestPublicGet(
+      "/v3/exchangeInfo",
+      {},
+      this.restBase,
+      { critical }
+    );
+    const symbols = Array.isArray(result?.symbols) ? result.symbols : [];
+    const loadedAt = Date.now();
+    const common = {
+      timezone: result?.timezone,
+      serverTime: result?.serverTime,
+      rateLimits: result?.rateLimits,
+      exchangeFilters: result?.exchangeFilters,
+    };
+    for (const symbol of symbols) {
+      const symbolName = String(symbol?.symbol || "").toUpperCase();
+      if (!symbolName) continue;
+      this.exchangeInfoCache.set(symbolName, {
+        loadedAt,
+        data: { ...common, symbols: [symbol], symbol },
+      });
+    }
+    return symbols;
   }
 
   refreshExchangeInfoInBackground(symbol) {
@@ -1099,7 +1135,7 @@ class BinanceSpotClient extends EventEmitter {
     };
   }
 
-  async signedRest(method, path, params = {}) {
+  async signedRest(method, path, params = {}, options = {}) {
     this.assertTradingCredentials();
     await this.ensureTradingServerTime();
     return this.request(
@@ -1107,7 +1143,8 @@ class BinanceSpotClient extends EventEmitter {
       path,
       params,
       true,
-      this.tradingRestBase
+      this.tradingRestBase,
+      options
     );
   }
 
@@ -1126,7 +1163,8 @@ class BinanceSpotClient extends EventEmitter {
         restPath,
         params,
         true,
-        this.tradingRestBase
+        this.tradingRestBase,
+        { critical: options.critical === true }
       ),
       options
     );
@@ -1144,10 +1182,10 @@ class BinanceSpotClient extends EventEmitter {
     });
   }
 
-  async openOrders({ symbol } = {}) {
+  async openOrders({ symbol, critical = false } = {}) {
     return this.signedWsOrRest("openOrders.status", "GET", "/v3/openOrders", {
       symbol: symbol ? this.validateSymbol(symbol) : undefined,
-    });
+    }, { critical });
   }
 
   async cancelAllOpenOrders({ symbol }) {
@@ -1756,7 +1794,11 @@ class BinanceSpotClient extends EventEmitter {
     method,
     params,
     restFallback,
-    { retrySafe = true, waitForWebSocketReady = false } = {}
+    {
+      retrySafe = true,
+      waitForWebSocketReady = false,
+      critical = false,
+    } = {}
   ) {
     this.assertTradingCredentials();
     await this.ensureTradingServerTime();
@@ -1787,7 +1829,7 @@ class BinanceSpotClient extends EventEmitter {
           socket,
           method,
           this.createSignedWsApiParams(params),
-          { url: this.tradingWsApiBase }
+          { url: this.tradingWsApiBase, critical }
         ),
         transport: "websocket",
       };
@@ -1820,12 +1862,18 @@ class BinanceSpotClient extends EventEmitter {
     }
   }
 
-  requestWsApiOnSocket(socket, method, params, { url = this.wsApiBase } = {}) {
+  requestWsApiOnSocket(
+    socket,
+    method,
+    params,
+    { url = this.wsApiBase, critical = false } = {}
+  ) {
     return new Promise((resolve, reject) => {
       try {
         this.guardRateLimit({
           operation: method,
-          critical: /(?:^|\.)(?:place|cancel|cancelAll|amend|modify)$/.test(method) ||
+          critical: critical === true ||
+            /(?:^|\.)(?:place|cancel|cancelAll|amend|modify)$/.test(method) ||
             method === "order.cancelReplace",
         });
       } catch (error) {
@@ -1961,12 +2009,12 @@ class BinanceSpotClient extends EventEmitter {
     });
   }
 
-  async accountStatus({ omitZeroBalances } = {}) {
+  async accountStatus({ omitZeroBalances, critical = false } = {}) {
     return this.signedWsOrRest("account.status", "GET", "/v3/account", {
       ...(omitZeroBalances === undefined
         ? {}
         : { omitZeroBalances: Boolean(omitZeroBalances) }),
-    });
+    }, { critical });
   }
 
   async allOrderLists({ fromId, startTime, endTime, limit = 100 } = {}) {
