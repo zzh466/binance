@@ -414,7 +414,7 @@ function renderTradingRounds(rounds, { merge = false } = {}) {
     elements.tradingRoundsBody.append(row);
     return;
   }
-
+  let UNCOMPLETED = false;
   for (const round of visibleRounds) {
     const row = document.createElement("tr");
     if(round.status !== 'COMPLETED' && round.symbol === chartSymbol){
@@ -422,7 +422,7 @@ function renderTradingRounds(rounds, { merge = false } = {}) {
       const _long = round.remainingDirection === 'LONG';
       const direction = _long? '0' : '1';
       let price = _long?round.longAveragePrice: round.shortAveragePrice;
-      const amount = _long? (+round.openShortQty|| +round.closeShortQty): (+round.openLongQty || +round.closeLongQty)
+      const amount = _long? (+round.openLongQty || +round.closeLongQty): (+round.openShortQty|| +round.closeShortQty)
       price = parseFloat(price).toFixed(2)
       if(chart.traded.price !== price && chart.traded.direction !== direction && chart.traded.amount !== amount){
         chart.traded = {
@@ -432,6 +432,7 @@ function renderTradingRounds(rounds, { merge = false } = {}) {
         };
         chart.renderTradeOrder();
       }
+      UNCOMPLETED = true
     }
     const values = [
       String(round.id || "-").slice(0, 8),
@@ -456,6 +457,10 @@ function renderTradingRounds(rounds, { merge = false } = {}) {
       row.append(cell);
     }
     elements.tradingRoundsBody.append(row);
+  }
+  if(!UNCOMPLETED){
+    chart.traded = {};
+    chart.renderTradeOrder();
   }
 }
 
