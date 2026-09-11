@@ -12,7 +12,8 @@
 
   function normalizeMarketType(value) {
     const marketType = String(value || "").trim().toLowerCase();
-    return ["spot", "futures"].includes(marketType) ? marketType : undefined;
+    if (!marketType || marketType === "futures") return "futures";
+    return null;
   }
 
   function normalizeCandidate(order, source, now, ackMaxAgeMs) {
@@ -28,10 +29,12 @@
       Number.isFinite(observedAt) && observedAt > 0 &&
       now - observedAt <= ackMaxAgeMs;
     if (!CANCELABLE_STATUSES.has(status) && !freshAcknowledgement) return null;
+    const marketType = normalizeMarketType(order.marketType);
+    if (!marketType) return null;
     return {
       ...order,
       symbol,
-      marketType: normalizeMarketType(order.marketType),
+      marketType,
       status,
       discoverySource: source,
     };
@@ -40,7 +43,7 @@
   function candidateIdentity(order) {
     const identity = order.orderId ?? order.i ??
       order.clientOrderId ?? order.c ?? "unknown";
-    return `${order.marketType || "auto"}:${order.symbol}:${identity}`;
+    return `futures:${order.symbol}:${identity}`;
   }
 
   function collectCancelAllOrderTargets({
@@ -66,11 +69,11 @@
 
     const targets = new Map();
     for (const order of candidates.values()) {
-      const key = `${order.marketType || "auto"}:${order.symbol}`;
+      const key = `futures:${order.symbol}`;
       if (!targets.has(key)) {
         targets.set(key, {
           symbol: order.symbol,
-          marketType: order.marketType,
+          marketType: "futures",
         });
       }
     }
@@ -82,8 +85,8 @@
 
   function orderMatchesTarget(order, target) {
     if (!order || !target || order.symbol !== target.symbol) return false;
-    return !order.marketType || !target.marketType ||
-      order.marketType === target.marketType;
+    return normalizeMarketType(order.marketType) === "futures" &&
+      normalizeMarketType(target.marketType) === "futures";
   }
 
   return {

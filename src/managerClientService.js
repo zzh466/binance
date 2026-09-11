@@ -8,7 +8,6 @@ const PROPERTY_PATH = "/property/info";
 const FUTURE_ACCOUNT_TRADING_INFO_PATH =
   "/future/futureAccountTradingInfo";
 const REQUIRED_PROPERTY_KEYS = [
-  "BINANCE_SPOT_LINK_ID",
   "BINANCE_FUTURES_LINK_ID",
 ];
 

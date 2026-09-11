@@ -33,8 +33,13 @@ contextBridge.exposeInMainWorld("binance", {
   marketOverview: (options) =>
     ipcRenderer.invoke("binance:market-overview", options || {}),
 
-  connectDepth: (symbol) =>
-    ipcRenderer.invoke("binance:connect-depth", { symbol }),
+  connectDepth: (symbol, options = {}) =>
+    ipcRenderer.invoke("binance:connect-depth", {
+      symbol,
+      depthLevels: options.depthLevels,
+    }),
+  setDepthLevels: (depthLevels) =>
+    ipcRenderer.invoke("binance:set-depth-levels", { depthLevels }),
   disconnectMarket: () =>
     ipcRenderer.invoke("binance:disconnect-market"),
 
@@ -56,8 +61,6 @@ contextBridge.exposeInMainWorld("binance", {
     ipcRenderer.invoke("binance:amend-order", options || {}),
   cancelReplace: (options) =>
     ipcRenderer.invoke("binance:cancel-replace", options || {}),
-  allOrderLists: (options) =>
-    ipcRenderer.invoke("binance:all-order-lists", options || {}),
   allOrders: (options) =>
     ipcRenderer.invoke("binance:all-orders", options || {}),
   recentOrders: (options) =>
@@ -82,18 +85,6 @@ contextBridge.exposeInMainWorld("binance", {
     ipcRenderer.invoke("binance:sign-tradfi-perps-agreement"),
   setFuturesDeadMan: (options) =>
     ipcRenderer.invoke("binance:set-futures-dead-man", options || {}),
-  queryOrderList: (options) =>
-    ipcRenderer.invoke("binance:query-order-list", options || {}),
-  openOrderLists: (options) =>
-    ipcRenderer.invoke("binance:open-order-lists", options || {}),
-  placeOco: (options) =>
-    ipcRenderer.invoke("binance:place-oco", options || {}),
-  placeOto: (options) =>
-    ipcRenderer.invoke("binance:place-oto", options || {}),
-  placeOtoco: (options) =>
-    ipcRenderer.invoke("binance:place-otoco", options || {}),
-  cancelOrderList: (options) =>
-    ipcRenderer.invoke("binance:cancel-order-list", options || {}),
   connectUserData: (options) =>
     ipcRenderer.invoke("binance:connect-user-data", options || {}),
   disconnectUserData: () =>

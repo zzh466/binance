@@ -5,13 +5,14 @@ const { promisify } = require("node:util");
 const WebSocket = require("ws");
 const { resolveCurlExecutable } = require("../platformSupport");
 const {
-  BinanceSpotClient,
+  BinanceClientBase,
   BinanceApiError,
-} = require("./binanceSpotClient");
+} = require("./binanceClientBase");
 const {
   divideDecimalToStep,
   isPositiveDecimal,
   multiplyDecimal,
+  parseDecimal,
 } = require("./decimalMath");
 
 const FUTURES_REST_BASE = {
@@ -40,13 +41,6 @@ const POSITION_MODE_ONE_WAY = "ONE_WAY";
 const POSITION_MODE_HEDGE = "HEDGE";
 const execFileAsync = promisify(execFile);
 
-const FUTURES_TYPE_MAP = {
-  LIMIT_MAKER: { type: "LIMIT", timeInForce: "GTX" },
-  STOP_LOSS: { type: "STOP_MARKET" },
-  STOP_LOSS_LIMIT: { type: "STOP" },
-  TAKE_PROFIT_LIMIT: { type: "TAKE_PROFIT" },
-  TAKE_PROFIT: { type: "TAKE_PROFIT_MARKET" },
-};
 const FUTURES_ALGO_ORDER_TYPES = new Set([
   "STOP",
   "STOP_MARKET",
@@ -65,7 +59,7 @@ const FUTURES_PRICE_MATCH_MODES = new Set([
   "QUEUE_20",
 ]);
 
-class BinanceUsdMClient extends BinanceSpotClient {
+class BinanceUsdMClient extends BinanceClientBase {
   constructor(options = {}) {
     super(options);
 
@@ -684,8 +678,7 @@ class BinanceUsdMClient extends BinanceSpotClient {
     const symbol = this.validateSymbol(order.symbol);
     const side = String(order.side || "").toUpperCase();
     const requestedType = String(order.type || "").toUpperCase();
-    const mapped = FUTURES_TYPE_MAP[requestedType] || { type: requestedType };
-    const type = mapped.type;
+    const type = requestedType;
     const supportedTypes = new Set([
       "LIMIT",
       "MARKET",
@@ -702,13 +695,6 @@ class BinanceUsdMClient extends BinanceSpotClient {
     if (!supportedTypes.has(type)) {
       throw new BinanceApiError(`当前页面不支持该永续委托类型：${requestedType}`);
     }
-    if (order.icebergQty) {
-      throw new BinanceApiError("当前永续接口不支持页面里的 icebergQty 参数。");
-    }
-    if (order.trailingDelta && !order.callbackRate) {
-      throw new BinanceApiError("永续跟踪止损使用 callbackRate，不能直接使用 Spot trailingDelta。");
-    }
-
     const positionEffect = String(order.positionEffect || "AUTO").toUpperCase();
     if (!["AUTO", "OPEN", "CLOSE"].includes(positionEffect)) {
       throw new BinanceApiError(
@@ -755,7 +741,7 @@ class BinanceUsdMClient extends BinanceSpotClient {
       positionSide: positionMode.positionSide,
       type,
       selfTradePreventionMode: this.requireSelfTradePrevention(symbolInfo),
-      timeInForce: String(mapped.timeInForce || order.timeInForce || "")
+      timeInForce: String(order.timeInForce || "")
         .toUpperCase() || undefined,
       quantity: order.quantity,
       quoteOrderQty: order.quoteOrderQty,
@@ -1401,21 +1387,72 @@ class BinanceUsdMClient extends BinanceSpotClient {
   }
 
   async accountStatus({ omitZeroBalances, critical = false } = {}) {
-    const account = await this.signedWsOrRest(
-      "account.status",
-      "GET",
-      "/fapi/v3/account",
-      {},
-      { critical }
-    );
-    let assets = Array.isArray(account.assets) ? account.assets : [];
+    let account;
+    try {
+      account = await this.signedWsOrRest(
+        "v2/account.status",
+        "GET",
+        "/fapi/v3/account",
+        {},
+        { retrySafe: true, critical }
+      );
+    } catch (error) {
+      // 新版 WS 查询只返回存在持仓或挂单的合约，数据量更小；若某个
+      // Futures WS 节点尚未支持它，只读请求可以安全地降级到 V3 REST。
+      const isWsBusinessError = Boolean(
+        error?.data &&
+        !error.data.localRateLimitGuard &&
+        (Object.prototype.hasOwnProperty.call(error.data, "id") ||
+          Object.prototype.hasOwnProperty.call(error.data, "error"))
+      );
+      if (!isWsBusinessError) throw error;
+      account = await this.signedRest(
+        "GET",
+        "/fapi/v3/account",
+        {},
+        { critical }
+      );
+    }
+    if (!account || typeof account !== "object" || Array.isArray(account)) {
+      throw new BinanceApiError("Binance U 本位账户响应无效。", {
+        data: {
+          operation: "account.status",
+          invalidField: "result",
+        },
+      });
+    }
+
+    const positions = Array.isArray(account.positions)
+      ? this.normalizePositionRiskRows(account.positions, {
+          operation: "account.status",
+        })
+      : account.positions;
+    let assets = Array.isArray(account.assets)
+      ? account.assets.map((asset) => {
+          const unrealizedProfit = String(
+            asset?.unrealizedProfit ?? asset?.unRealizedProfit ?? "0"
+          ).trim();
+          return {
+            ...asset,
+            unrealizedProfit,
+            unRealizedProfit: unrealizedProfit,
+          };
+        })
+      : [];
     if (omitZeroBalances) {
       assets = assets.filter((asset) =>
         Number(asset.walletBalance) !== 0 || Number(asset.unrealizedProfit) !== 0
       );
     }
+    const totalUnrealizedProfit =
+      account.totalUnrealizedProfit ?? account.totalUnRealizedProfit;
     return {
       ...account,
+      ...(totalUnrealizedProfit === undefined
+        ? {}
+        : { totalUnrealizedProfit: String(totalUnrealizedProfit).trim() }),
+      positions,
+      assets,
       marketType: this.marketType,
       accountType: "USDⓈ-M Futures",
       permissions: ["FUTURES"],
@@ -1429,6 +1466,142 @@ class BinanceUsdMClient extends BinanceSpotClient {
         unrealizedProfit: asset.unrealizedProfit,
       })),
     };
+  }
+
+  normalizePositionRiskRows(
+    result,
+    { operation = "v2/account.position" } = {}
+  ) {
+    if (!Array.isArray(result)) {
+      throw new BinanceApiError(
+        "Binance U 本位持仓响应无效：期望 positions 数组。",
+        {
+          data: {
+            operation,
+            invalidField: "result",
+            receivedType: result === null ? "null" : typeof result,
+          },
+        }
+      );
+    }
+
+    return result.map((position, index) => {
+      if (!position || typeof position !== "object" || Array.isArray(position)) {
+        throw new BinanceApiError(
+          `Binance U 本位持仓响应无效：第 ${index + 1} 行不是对象。`,
+          {
+            data: {
+              operation,
+              invalidField: `result[${index}]`,
+            },
+          }
+        );
+      }
+
+      const symbol = String(position.symbol ?? "").trim().toUpperCase();
+      if (!symbol) {
+        throw new BinanceApiError(
+          `Binance U 本位持仓响应无效：第 ${index + 1} 行缺少 symbol。`,
+          {
+            data: {
+              operation,
+              invalidField: `result[${index}].symbol`,
+            },
+          }
+        );
+      }
+
+      const positionAmt = String(position.positionAmt ?? "").trim();
+      try {
+        parseDecimal(positionAmt, "positionAmt");
+      } catch {
+        throw new BinanceApiError(
+          `Binance U 本位持仓响应无效：${symbol} 的 positionAmt 不是有效十进制数。`,
+          {
+            data: {
+              operation,
+              invalidField: `result[${index}].positionAmt`,
+              symbol,
+            },
+          }
+        );
+      }
+
+      const unrealizedProfit = String(
+        position.unrealizedProfit ?? position.unRealizedProfit ?? "0"
+      ).trim();
+      const rawMarginType = String(position.marginType ?? "")
+        .trim()
+        .toLowerCase();
+      const marginType = rawMarginType === "crossed"
+        ? "cross"
+        : rawMarginType;
+      const isolatedText = String(position.isolated ?? "")
+        .trim()
+        .toLowerCase();
+      const explicitIsolated = position.isolated === true ||
+        isolatedText === "true"
+        ? true
+        : position.isolated === false || isolatedText === "false"
+          ? false
+          : undefined;
+      const isolated = explicitIsolated ?? (
+        marginType
+          ? marginType === "isolated"
+          : false
+      );
+
+      return {
+        ...position,
+        symbol,
+        positionAmt,
+        unrealizedProfit,
+        unRealizedProfit: unrealizedProfit,
+        marginType: isolated ? "isolated" : "cross",
+        isolated,
+      };
+    });
+  }
+
+  async positionRisk({ symbol, critical = true } = {}) {
+    const normalizedSymbol = symbol ? this.validateSymbol(symbol) : undefined;
+    const params = { symbol: normalizedSymbol };
+    let positions;
+    try {
+      positions = await this.signedWsOrRest(
+        "v2/account.position",
+        "GET",
+        "/fapi/v3/positionRisk",
+        params,
+        {
+          // 查询接口可安全重试；WebSocket 传输失败后立即用 REST 复核。
+          retrySafe: true,
+          critical,
+        }
+      );
+    } catch (error) {
+      // 不同 Futures WebSocket API 节点可能尚未提供 v2/account.position。
+      // 这种 WS 业务响应对只读持仓查询可安全降级到 REST；REST 自身错误则
+      // 原样抛出，避免对同一个失败请求进行无意义的二次调用。
+      const isWsBusinessError = Boolean(
+        error?.data &&
+        !error.data.localRateLimitGuard &&
+        (Object.prototype.hasOwnProperty.call(error.data, "id") ||
+          Object.prototype.hasOwnProperty.call(error.data, "error"))
+      );
+      if (!isWsBusinessError) throw error;
+      positions = await this.signedRest(
+        "GET",
+        "/fapi/v3/positionRisk",
+        params,
+        { critical }
+      );
+    }
+    return this.normalizePositionRiskRows(positions);
+  }
+
+  async currentPositions(options = {}) {
+    return this.positionRisk(options);
   }
 
   async incomeHistory({
@@ -1599,6 +1772,8 @@ class BinanceUsdMClient extends BinanceSpotClient {
       n: order.n,
       N: order.N,
       t: order.t,
+      rp: order.rp,
+      ma: order.ma,
       ps: order.ps,
       positionSide: order.ps,
       R: order.R,

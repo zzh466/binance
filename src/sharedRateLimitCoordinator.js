@@ -8,6 +8,18 @@ const INTERVAL_MS = {
   DAY: 86_400_000,
 };
 
+function positiveNumberOrNull(value) {
+  if (value === undefined || value === null || value === "") return null;
+  const number = Number(value);
+  return Number.isFinite(number) && number > 0 ? number : null;
+}
+
+function nonNegativeNumberOrNull(value) {
+  if (value === undefined || value === null || value === "") return null;
+  const number = Number(value);
+  return Number.isFinite(number) && number >= 0 ? number : null;
+}
+
 class BinanceRateLimitGuardError extends Error {
   constructor(message, details = {}) {
     super(message);
@@ -94,8 +106,13 @@ class SharedRateLimitCoordinator {
     for (const item of rateLimits || []) {
       const rateLimitType = String(item.rateLimitType || "").toUpperCase();
       const interval = String(item.interval || "").toUpperCase();
-      const intervalNum = Number(item.intervalNum) || 1;
+      const intervalNum = positiveNumberOrNull(item.intervalNum) || 1;
+      const limit = positiveNumberOrNull(item.limit);
+      const count = nonNegativeNumberOrNull(item.count);
       if (!rateLimitType || !interval) continue;
+      // Binance 或中间传输层偶尔会用 -1 表示计数未知。未知值不能参与
+      // 使用率计算，否则 -1 / -1 会被误判为已经使用 100%。
+      if (limit === null || count === null) continue;
       const key = this.limitKey(
         marketType,
         rateLimitType,
@@ -107,8 +124,8 @@ class SharedRateLimitCoordinator {
         rateLimitType,
         interval,
         intervalNum,
-        limit: Number(item.limit) || null,
-        count: Number(item.count) || 0,
+        limit,
+        count,
         observedAt: now,
       };
     }
@@ -125,8 +142,8 @@ class SharedRateLimitCoordinator {
       ["x-mbx-order-count-1m", "ORDERS", "MINUTE", 1],
     ];
     for (const [header, type, interval, intervalNum] of headerMappings) {
-      const count = Number(normalizedHeaders[header]);
-      if (!Number.isFinite(count)) continue;
+      const count = nonNegativeNumberOrNull(normalizedHeaders[header]);
+      if (count === null) continue;
       const key = this.limitKey(marketType, type, interval, intervalNum);
       this.localState.limits[key] = {
         ...(this.localState.limits[key] || this.sharedState.limits[key] || {}),
@@ -189,13 +206,22 @@ class SharedRateLimitCoordinator {
         continue;
       }
       const intervalMs = (INTERVAL_MS[limit.interval] || 0) * limit.intervalNum;
-      if (!limit.limit || !intervalMs || now - limit.observedAt >= intervalMs) continue;
-      const usage = limit.count / limit.limit;
+      const limitValue = positiveNumberOrNull(limit.limit);
+      const countValue = nonNegativeNumberOrNull(limit.count);
+      if (
+        limitValue === null ||
+        countValue === null ||
+        !intervalMs ||
+        now - limit.observedAt >= intervalMs
+      ) {
+        continue;
+      }
+      const usage = countValue / limitValue;
       if (usage >= this.threshold) {
         throw new BinanceRateLimitGuardError(
-          `Binance ${limit.rateLimitType} 已使用 ${limit.count}/${limit.limit}，` +
+          `Binance ${limit.rateLimitType} 已使用 ${countValue}/${limitValue}，` +
           "为订单与撤单预留容量，暂缓非关键查询。",
-          { ...limit, usage }
+          { ...limit, limit: limitValue, count: countValue, usage }
         );
       }
     }
@@ -222,15 +248,24 @@ class SharedRateLimitCoordinator {
 
   snapshot() {
     const now = this.now();
-    const limits = Object.values(this.sharedState.limits).map((limit) => ({
-      ...limit,
-      usage: limit.limit ? limit.count / limit.limit : null,
-      active: Boolean(
-        (INTERVAL_MS[limit.interval] || 0) * limit.intervalNum &&
-        now - limit.observedAt <
-          (INTERVAL_MS[limit.interval] || 0) * limit.intervalNum
-      ),
-    }));
+    const limits = Object.values(this.sharedState.limits).flatMap((limit) => {
+      const limitValue = positiveNumberOrNull(limit.limit);
+      const countValue = nonNegativeNumberOrNull(limit.count);
+      if (limitValue === null && countValue === null) return [];
+      const intervalMs = (INTERVAL_MS[limit.interval] || 0) * limit.intervalNum;
+      return [{
+        ...limit,
+        limit: limitValue,
+        count: countValue,
+        usage: limitValue !== null && countValue !== null
+          ? countValue / limitValue
+          : null,
+        active: Boolean(
+          intervalMs &&
+          now - limit.observedAt < intervalMs
+        ),
+      }];
+    });
     const globalBanUntil = Number(this.sharedState.banUntil) > now
       ? Number(this.sharedState.banUntil)
       : 0;

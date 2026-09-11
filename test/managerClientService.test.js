@@ -210,7 +210,7 @@ test("管理端用户账户信息保留身份配置但不采用其资金指标",
   assert.equal("futureAuthCode" in sanitized.accounts[0], false);
 });
 
-test("系统配置接口读取两个 LinkID", async () => {
+test("系统配置接口只读取 U 本位 LinkID", async () => {
   const requestedUrls = [];
   const service = new ManagerClientService({
     networkInterfaces: () => ({}),
@@ -220,17 +220,14 @@ test("系统配置接口读取两个 LinkID", async () => {
       return jsonResponse({
         code: "REQ_SUCCESS",
         propertyKey,
-        propertyValue: propertyKey === "BINANCE_SPOT_LINK_ID"
-          ? "spot-code"
-          : "futures-code",
+        propertyValue: "futures-code",
       });
     },
   });
   assert.deepEqual(await service.getTradingConfiguration(), {
-    BINANCE_SPOT_LINK_ID: "spot-code",
     BINANCE_FUTURES_LINK_ID: "futures-code",
   });
-  assert.equal(requestedUrls.length, 2);
+  assert.equal(requestedUrls.length, 1);
 });
 
 test("账号交易指标使用 PATCH 且不会携带密钥", async () => {

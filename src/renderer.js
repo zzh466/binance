@@ -8,11 +8,18 @@ const {
 
 let activeEnvironmentTestnet = true;
 let environmentSwitchBusy = false;
+const SUPPORTED_DEPTH_LEVELS = new Set([5, 10, 20]);
+const DEFAULT_DEPTH_LEVELS = 20;
+let activeDepthLevels = DEFAULT_DEPTH_LEVELS;
+let activeDepthSpeed = "100ms";
+let depthLevelSwitchBusy = false;
 let tradFiAgreementBusy = false;
 const tradingRoundsById = new Map();
+let activeRoundChartOverlay = null;
 let latestPositionSnapshot = null;
 let consecutiveFlatPositionConfirmations = 0;
 let lastFlatPositionConfirmationAt = null;
+const FUTURES_MARKET_LABEL = "USDⓈ-M";
 
 function printResult(title, result) {
   const elapsedMs = Number(result?.elapsedMs);
@@ -123,8 +130,22 @@ async function submitOrderWithTradFiAgreement(order, { testOnly = false } = {}) 
   return result;
 }
 
-function renderDepthRows(container, levels) {
-  const visibleLevels = levels.slice(0, 10);
+function normalizeDepthLevels(value, fallback = DEFAULT_DEPTH_LEVELS) {
+  const normalized = Number(value);
+  return SUPPORTED_DEPTH_LEVELS.has(normalized) ? normalized : fallback;
+}
+
+function renderDepthLevelConfiguration(statusText) {
+  elements.depthLevelSelect.value = String(activeDepthLevels);
+  elements.depthLevelSwitchStatus.textContent =
+    statusText || `当前：${activeDepthLevels}档`;
+  elements.depthConfig.textContent =
+    `${activeDepthSpeed} / 部分深度流 ${activeDepthLevels} 档 / ` +
+    `显示 ${activeDepthLevels} 档`;
+}
+
+function renderDepthRows(container, levels, depthLevels = activeDepthLevels) {
+  const visibleLevels = levels.slice(0, normalizeDepthLevels(depthLevels));
   for (const [index, level] of visibleLevels.entries()) {
     let row = container.children[index];
     if (!row) {
@@ -185,14 +206,14 @@ function renderCurrentPositionsSnapshot(snapshot = {}, { replaceRows = true } = 
   elements.positionSafetyBanner.textContent =
     `${getPositionScopeLabel(snapshot)}：${safety.message}`;
 
-  const positions = Array.isArray(snapshot.positions) ? snapshot.positions : [];
+  const positions = safety.positions;
   if (replaceRows) {
     const fragment = document.createDocumentFragment();
 
     if (!positions.length) {
       const row = document.createElement("tr");
       const cell = document.createElement("td");
-      cell.colSpan = 13;
+      cell.colSpan = 12;
       cell.textContent = safety.emptyMessage;
       row.append(cell);
       fragment.append(row);
@@ -201,17 +222,16 @@ function renderCurrentPositionsSnapshot(snapshot = {}, { replaceRows = true } = 
         const row = document.createElement("tr");
         if (position._positionSnapshotStale) {
           row.className = "position-row-stale";
-          row.title = "该市场最近一次查询失败，本行保留自上次成功快照";
+          row.title = "U 本位最近一次查询失败，本行保留自上次成功快照";
         }
         const side = String(position.side || "").toUpperCase();
         const pnlValue = position.unrealizedPnl;
         const values = [
-          getMarketLabel(position.marketType) +
+          FUTURES_MARKET_LABEL +
             (position._positionSnapshotStale ? "（上次成功）" : ""),
           position.symbol || position.asset,
           side === "SHORT" ? "空" : "多",
           position.positionAmount,
-          position.availableAmount,
           position.lockedAmount,
           position.entryPrice,
           position.markPrice,
@@ -228,7 +248,7 @@ function renderCurrentPositionsSnapshot(snapshot = {}, { replaceRows = true } = 
             cell.className = side === "SHORT"
               ? "position-side-short"
               : "position-side-long";
-          } else if (index === 9 && pnlValue !== null && pnlValue !== undefined) {
+          } else if (index === 8 && pnlValue !== null && pnlValue !== undefined) {
             const numericPnl = Number(pnlValue);
             if (numericPnl > 0) cell.className = "position-pnl-positive";
             if (numericPnl < 0) cell.className = "position-pnl-negative";
@@ -248,8 +268,7 @@ function renderCurrentPositionsSnapshot(snapshot = {}, { replaceRows = true } = 
     : "没有有效数据时间";
   const statusParts = [
     getPositionScopeLabel(snapshot),
-    `共 ${positions.length} 项（现货 ${safety.spotCount} / U 本位 ${safety.futuresCount}）`,
-    getPositionSourceStatus(safety.sources.spot, "现货"),
+    `U 本位持仓 ${positions.length} 项`,
     getPositionSourceStatus(safety.sources.futures, "U 本位"),
     `程序已知未成交订单 ${safety.knownOpenOrderCount} 笔`,
     Number.isFinite(updatedAt) && updatedAt > 0
@@ -271,12 +290,6 @@ function renderCurrentPositionsFailure(error) {
     ...(latestPositionSnapshot || {}),
     complete: false,
     sources: {
-      spot: {
-        ...(previousSources.spot || {}),
-        configured: previousSources.spot?.configured !== false,
-        ok: false,
-        error: failure,
-      },
       futures: {
         ...(previousSources.futures || {}),
         configured: previousSources.futures?.configured !== false,
@@ -291,7 +304,7 @@ function renderCurrentPositionsFailure(error) {
 
 async function refreshCurrentPositions({ showResult = true } = {}) {
   elements.refreshCurrentPositionsButton.disabled = true;
-  elements.currentPositionsStatus.textContent = "正在刷新现货与 U 本位持仓…";
+  elements.currentPositionsStatus.textContent = "正在刷新 U 本位持仓…";
   try {
     const result = await window.binance.currentPositions();
     if (showResult) printResult("当前持仓", result);
@@ -329,7 +342,7 @@ function renderOrders(orders, container = elements.orderHistoryBody) {
   for (const order of orders) {
     const row = document.createElement("tr");
     const orderId = document.createElement("td");
-    const marketType = document.createElement("td");
+    const market = document.createElement("td");
     const symbol = document.createElement("td");
     const side = document.createElement("td");
     const type = document.createElement("td");
@@ -341,7 +354,7 @@ function renderOrders(orders, container = elements.orderHistoryBody) {
 
     orderId.className = "numeric";
     orderId.textContent = order.orderId ?? "-";
-    marketType.textContent = getMarketLabel(order.marketType);
+    market.textContent = FUTURES_MARKET_LABEL;
     symbol.textContent = order.symbol || "-";
     side.textContent = order.side || "-";
     type.textContent = order.type || "-";
@@ -355,7 +368,7 @@ function renderOrders(orders, container = elements.orderHistoryBody) {
 
     row.append(
       orderId,
-      marketType,
+      market,
       symbol,
       side,
       type,
@@ -387,6 +400,58 @@ function formatRoundAveragePrice(value) {
     : "-";
 }
 
+function applyTradeOverlay(chartInstance, overlay) {
+  const nextOverlay = overlay || {};
+  if (
+    chartInstance.traded.price === nextOverlay.price &&
+    chartInstance.traded.direction === nextOverlay.direction &&
+    chartInstance.traded.amount === nextOverlay.amount
+  ) {
+    return;
+  }
+  chartInstance.traded = nextOverlay;
+  chartInstance.renderTradeOrder();
+}
+
+function syncTradingRoundChartOverlay() {
+  const activeRound = [...tradingRoundsById.values()]
+    .filter((round) =>
+      round.status !== "COMPLETED" && round.symbol === chartSymbol
+    )
+    .sort((left, right) =>
+      Number(right.createdAt || 0) - Number(left.createdAt || 0)
+    )[0];
+
+  if (!activeRound) {
+    activeRoundChartOverlay = null;
+    applyTradeOverlay(chart, null);
+    applyTradeOverlay(zoomChart, null);
+    return;
+  }
+
+  const isLong = activeRound.remainingDirection === "LONG";
+  const numericPrice = Number(
+    isLong ? activeRound.longAveragePrice : activeRound.shortAveragePrice
+  );
+  if (!Number.isFinite(numericPrice) || numericPrice <= 0) {
+    activeRoundChartOverlay = null;
+    applyTradeOverlay(chart, null);
+    applyTradeOverlay(zoomChart, null);
+    return;
+  }
+
+  activeRoundChartOverlay = {
+    direction: isLong ? "0" : "1",
+    price: numericPrice.toFixed(2),
+    amount: activeRound.remainingQty,
+  };
+  applyTradeOverlay(chart, { ...activeRoundChartOverlay });
+  applyTradeOverlay(zoomChart, {
+    ...activeRoundChartOverlay,
+    price: getZoomBucketPrice(activeRoundChartOverlay.price),
+  });
+}
+
 function renderTradingRounds(rounds, { merge = false } = {}) {
   if (!merge) tradingRoundsById.clear();
   for (const round of rounds) {
@@ -404,6 +469,7 @@ function renderTradingRounds(rounds, { merge = false } = {}) {
       return String(right.id || "").localeCompare(String(left.id || ""));
     }
   );
+  syncTradingRoundChartOverlay();
   elements.tradingRoundsBody.replaceChildren();
   if (!visibleRounds.length) {
     const row = document.createElement("tr");
@@ -414,30 +480,11 @@ function renderTradingRounds(rounds, { merge = false } = {}) {
     elements.tradingRoundsBody.append(row);
     return;
   }
-  let UNCOMPLETED = false;
   for (const round of visibleRounds) {
     const row = document.createElement("tr");
-    if(round.status !== 'COMPLETED' && round.symbol === chartSymbol){
-      
-      const _long = round.remainingDirection === 'LONG';
-      const direction = _long? '0' : '1';
-      let price = _long?round.longAveragePrice: round.shortAveragePrice;
-      const amount = round.remainingQty;
-
-      price = parseFloat(price).toFixed(2)
-      if(chart.traded.price !== price || chart.traded.direction !== direction || chart.traded.amount !== amount){
-        chart.traded = {
-          direction,
-          price,
-          amount
-        };
-        chart.renderTradeOrder();
-      }
-      UNCOMPLETED = true
-    }
     const values = [
       String(round.id || "-").slice(0, 8),
-      getMarketLabel(round.marketType),
+      FUTURES_MARKET_LABEL,
       round.symbol || "-",
       round.status === "COMPLETED" ? "已完成" : "进行中",
       round.openLongQty || "0",
@@ -458,10 +505,6 @@ function renderTradingRounds(rounds, { merge = false } = {}) {
       row.append(cell);
     }
     elements.tradingRoundsBody.append(row);
-  }
-  if(!UNCOMPLETED){
-    chart.traded = {};
-    chart.renderTradeOrder();
   }
 }
 
@@ -550,9 +593,7 @@ function renderAccountInfo(account) {
     ? account.permissions.join(", ") || "-"
     : "-";
   if (Number(account.tradeGroupId) === -1) {
-    elements.accountTradeGroupId.textContent = account.marketType === "futures"
-      ? "-1（U 本位账户未配置交易组）"
-      : "-1（未分组，跨子账号 STP 不生效）";
+    elements.accountTradeGroupId.textContent = "-1（U 本位账户未配置交易组）";
   } else if (account.tradeGroupId !== undefined && account.tradeGroupId !== null) {
     elements.accountTradeGroupId.textContent = String(account.tradeGroupId);
   } else {
@@ -561,15 +602,13 @@ function renderAccountInfo(account) {
   elements.accountUpdateTime.textContent = formatOrderTime(account.updateTime);
 
   elements.accountBalancesBody.replaceChildren();
-  const balances = (Array.isArray(account.balances) ? account.balances : []).filter(
-    (balance) => Number(balance.locked) !== 0
-  );
+  const balances = Array.isArray(account.balances) ? account.balances : [];
 
   if (!balances.length) {
     const row = document.createElement("tr");
     const cell = document.createElement("td");
-    cell.colSpan = 3;
-    cell.textContent = "当前账户没有锁定余额不为 0 的资产";
+    cell.colSpan = 4;
+    cell.textContent = "当前 U 本位账户没有非零保证金资产";
     row.append(cell);
     elements.accountBalancesBody.append(row);
     return;
@@ -578,13 +617,15 @@ function renderAccountInfo(account) {
   for (const balance of balances) {
     const row = document.createElement("tr");
     const asset = document.createElement("td");
+    const walletBalance = document.createElement("td");
     const free = document.createElement("td");
-    const locked = document.createElement("td");
+    const unrealizedProfit = document.createElement("td");
 
     asset.textContent = balance.asset || "-";
+    walletBalance.textContent = balance.walletBalance ?? "-";
     free.textContent = balance.free ?? "-";
-    locked.textContent = balance.locked ?? "-";
-    row.append(asset, free, locked);
+    unrealizedProfit.textContent = balance.unrealizedProfit ?? "-";
+    row.append(asset, walletBalance, free, unrealizedProfit);
     elements.accountBalancesBody.append(row);
   }
 }
@@ -665,32 +706,21 @@ function renderRiskRows(rows) {
   for (const row of rows) appendTextRow(elements.riskBody, row, 5);
 }
 
-function renderOrderLists(lists) {
-  elements.orderListsBody.replaceChildren();
-  const normalized = Array.isArray(lists) ? lists : lists ? [lists] : [];
-  if (!normalized.length) {
-    appendTextRow(elements.orderListsBody, ["没有组合订单记录"], 7);
-    return;
-  }
-  for (const list of normalized) {
-    appendTextRow(elements.orderListsBody, [
-      list.orderListId, list.symbol, list.contingencyType,
-      list.listStatusType, list.listOrderStatus,
-      Array.isArray(list.orders) ? list.orders.length : "-",
-      formatOrderTime(list.transactionTime),
-    ], 7);
-  }
-}
-
 function summarizeUserDataEvent(event) {
   if (event.e === "executionReport") {
     return `${event.S || ""} ${event.o || ""} ${event.q || ""} @ ${event.p || ""}`.trim();
   }
-  if (event.e === "outboundAccountPosition") {
-    return (event.B || []).map((balance) => `${balance.a}: ${balance.f}/${balance.l}`).join(", ");
+  if (event.e === "ACCOUNT_UPDATE") {
+    const balances = (event.a?.B || []).map(
+      (balance) => `${balance.a}: 余额 ${balance.wb ?? "-"}`
+    );
+    const positions = (event.a?.P || [])
+      .filter((position) => Number(position.pa) !== 0)
+      .map((position) => `${position.s}: ${position.pa}`);
+    return [...balances, ...positions].join(", ") || "U 本位账户已更新";
   }
-  if (event.e === "balanceUpdate") {
-    return `余额变化 ${event.d ?? "-"}`;
+  if (event.e === "TRADE_LITE") {
+    return `${event.S || ""} ${event.q || ""} @ ${event.L || event.p || ""}`.trim();
   }
   return JSON.stringify(event).slice(0, 240);
 }
@@ -700,10 +730,16 @@ function prependUserDataEvent(payload) {
     elements.userDataBody.replaceChildren();
   }
   const event = payload.event || {};
+  const eventScope = event.s ||
+    (event.a?.P || []).map((position) => position.s).filter(Boolean).join(", ") ||
+    (event.a?.B || []).map((balance) => balance.a).filter(Boolean).join(", ") ||
+    "-";
+  const eventStatus = event.X || event.x || event.a?.m ||
+    (event.e === "ACCOUNT_UPDATE" ? "账户已更新" : "-");
   const row = document.createElement("tr");
   for (const value of [
     formatOrderTime(payload.receivedAt), event.e || "未知事件",
-    event.s || event.a || "-", event.X || event.x || event.l || "-",
+    eventScope, eventStatus,
     event.i ?? "-", summarizeUserDataEvent(event),
   ]) {
     const cell = document.createElement("td");
@@ -722,23 +758,29 @@ function getSelectedSymbol() {
   return symbol;
 }
 
-function getMarketLabel(marketType) {
-  return marketType === "futures" ? "USDⓈ-M" : "Spot";
-}
-
 function readOrderForm() {
   const type = elements.orderType.value;
   const quoteTotalMode = elements.orderSizingMode.value === "quote-total";
+  const needsPrice = ["LIMIT", "STOP", "TAKE_PROFIT"].includes(type);
+  const needsStopPrice = [
+    "STOP",
+    "STOP_MARKET",
+    "TAKE_PROFIT",
+    "TAKE_PROFIT_MARKET",
+  ].includes(type);
+  const isTrailingStop = type === "TRAILING_STOP_MARKET";
   const order = {
     symbol: getSelectedSymbol(),
     side: elements.side.value,
     positionEffect: elements.positionEffect.value,
     type,
-    price: elements.price.value.trim(),
-    stopPrice: elements.stopPrice.value.trim(),
-    trailingDelta: elements.trailingDelta.value.trim(),
-    icebergQty: elements.icebergQty.value.trim(),
-    timeInForce: ["LIMIT", "STOP_LOSS_LIMIT", "TAKE_PROFIT_LIMIT"].includes(type) ? "GTC" : undefined,
+    price: needsPrice ? elements.price.value.trim() : "",
+    stopPrice: needsStopPrice ? elements.stopPrice.value.trim() : "",
+    activationPrice: isTrailingStop
+      ? elements.activationPrice.value.trim()
+      : "",
+    callbackRate: isTrailingStop ? elements.callbackRate.value.trim() : "",
+    timeInForce: ["LIMIT", "STOP", "TAKE_PROFIT"].includes(type) ? "GTC" : undefined,
   };
   if (quoteTotalMode) {
     order.quoteOrderQty = elements.quoteOrderQty.value.trim();
@@ -755,8 +797,7 @@ function updateOrderSizingFields() {
   elements.quoteOrderQtyLabel.hidden = !quoteTotalMode;
   elements.quoteOrderQty.hidden = !quoteTotalMode;
   elements.orderSizingHint.textContent = quoteTotalMode
-    ? "总价是计价资产的名义金额（例如 USDT），不是永续保证金。" +
-      "现货市价单直接按总价提交；其他订单由程序按委托价、触发价或最新成交价换算数量。"
+    ? "总价是 USDT 名义金额，不是保证金。程序会按委托价、触发价或最新成交价换算 U 本位合约数量。"
     : "当前按交易数量下单。快捷键始终使用配置中的手数。";
 }
 
@@ -827,30 +868,29 @@ async function loadStatus() {
     !activeEnvironmentTestnet
   );
   elements.environmentWarning.textContent = activeEnvironmentTestnet
-    ? "当前连接 Binance Testnet。输入合约后，后台自动识别 Spot 或 USDⓈ-M，并选择对应接口。"
-    : "当前连接 Binance 正式环境：后台会自动选择 Spot 或 USDⓈ-M；报单和撤单会影响真实资产，请确认合约、价格和数量。";
+    ? "当前连接 Binance U 本位永续 Testnet，所有行情和交易操作均使用 USDⓈ-M 接口。"
+    : "当前连接 Binance U 本位永续正式环境；报单和撤单会影响真实资产，请确认合约、价格和数量。";
   elements.environment.textContent = status.testnet
     ? "Binance Testnet"
     : "Binance Production";
-  elements.tradingEnvironment.textContent = "按全局合约自动路由";
-  elements.orderHistoryEnvironment.textContent = "现货 + U 本位全账户汇总";
-  elements.tradeHistoryEnvironment.textContent = "按全局合约自动路由";
-  elements.accountEnvironment.textContent = "按全局合约自动路由";
-  const spotCredentialsReady = Boolean(
-    status.markets?.spot?.hasApiKey && status.markets?.spot?.hasApiSecret
-  );
+  elements.tradingEnvironment.textContent = "USDⓈ-M U 本位永续";
+  elements.orderHistoryEnvironment.textContent = "U 本位全合约订单";
+  elements.tradeHistoryEnvironment.textContent = "USDⓈ-M U 本位永续";
+  elements.accountEnvironment.textContent = "USDⓈ-M U 本位账户";
   const futuresCredentialsReady = Boolean(
     status.markets?.futures?.hasApiKey && status.markets?.futures?.hasApiSecret
   );
-  elements.credentials.textContent =
-    `Spot ${spotCredentialsReady ? "已配置" : "未配置"} / ` +
-    `USDⓈ-M ${futuresCredentialsReady ? "已配置" : "未配置"}`;
+  elements.credentials.textContent = `USDⓈ-M ${
+    futuresCredentialsReady ? "已配置" : "未配置"
+  }`;
   elements.timeOffset.textContent =
-    `Spot ${status.markets?.spot?.serverTimeOffsetMs ?? 0} ms / ` +
     `USDⓈ-M ${status.markets?.futures?.serverTimeOffsetMs ?? 0} ms`;
-  elements.depthConfig.textContent =
-    `${status.depthSpeed} / 部分深度流 ${status.depthStreamLevels || 10} 档 / ` +
-    `显示 ${status.depthDisplayLevels || 10} 档`;
+  activeDepthSpeed = status.depthSpeed || "100ms";
+  activeDepthLevels = normalizeDepthLevels(
+    status.depthStreamLevels,
+    normalizeDepthLevels(status.depthDisplayLevels)
+  );
+  renderDepthLevelConfiguration();
   renderRateLimitStatus(status.rateLimits);
   elements.futuresDeadManToggle.checked = Boolean(status.futuresDeadMan?.enabled);
   elements.futuresDeadManStatus.textContent = status.futuresDeadMan?.enabled
@@ -863,15 +903,14 @@ async function loadStatus() {
       return;
     }
     const safety = safetyResult.data;
-    const labels = ["spot", "futures"].map((marketType) => {
-      const market = safety.markets?.[marketType];
-      const label = getMarketLabel(marketType);
-      if (!market?.configured) return `${label} 未配置`;
-      if (!market.verified) return `${label} 校验失败`;
-      return `${label} tradeGroupId=${market.tradeGroupId}`;
-    });
+    const market = safety.markets?.futures;
+    const marketStatus = !market?.configured
+      ? "USDⓈ-M 未配置"
+      : !market.verified
+        ? "USDⓈ-M 校验失败"
+        : `USDⓈ-M tradeGroupId=${market.tradeGroupId}`;
     elements.stpSafetyStatus.textContent = [
-      ...labels,
+      marketStatus,
       safety.crossAccountReady ? "跨子账号已就绪" : "请检查警告",
       ...(safety.warnings || []),
     ].join(" / ");
@@ -881,20 +920,33 @@ async function loadStatus() {
 }
 
 function renderRateLimitStatus(snapshot) {
-  const limits = Array.isArray(snapshot?.limits) ? snapshot.limits : [];
+  const limits = Array.isArray(snapshot?.limits)
+    ? snapshot.limits.filter((limit) =>
+      !limit.marketType || limit.marketType === "futures"
+    )
+    : [];
+  const banUntil = Math.max(
+    Number(snapshot?.globalBanUntil) || 0,
+    Number(snapshot?.marketBans?.futures) || 0
+  );
   if (!limits.length) {
-    elements.rateLimitStatus.textContent = "等待 Binance 返回计数";
+    elements.rateLimitStatus.textContent = banUntil > Date.now()
+      ? `USDⓈ-M 限制至 ${new Date(banUntil).toLocaleTimeString("zh-CN", { hour12: false })}`
+      : "等待 Binance 返回计数";
     return;
   }
   const items = limits.map((limit) => {
     const label = limit.rateLimitType === "ORDERS" ? "订单" : "请求权重";
     const maximum = limit.limit || "?";
     const stale = limit.active === false ? "（上一周期）" : "";
-    return `${getMarketLabel(limit.marketType)} ${label} ${limit.count}/${maximum}${stale}`;
+    return `${FUTURES_MARKET_LABEL} ${label} ${limit.count}/${maximum}${stale}`;
   });
-  if (snapshot.banUntil) {
-    items.push(`限制至 ${new Date(snapshot.banUntil).toLocaleTimeString("zh-CN", { hour12: false })}`);
-  } else if (snapshot.nearLimit) {
+  const nearLimit = limits.some((limit) =>
+    limit.active && Number(limit.usage) >= 0.9
+  );
+  if (banUntil > Date.now()) {
+    items.push(`限制至 ${new Date(banUntil).toLocaleTimeString("zh-CN", { hour12: false })}`);
+  } else if (nearLimit) {
     items.push("接近上限，非关键查询已暂缓");
   }
   elements.rateLimitStatus.textContent = items.join(" / ");
@@ -1032,25 +1084,15 @@ async function refreshManagerUserInfo({ showResult = true } = {}) {
     const warnings = Array.isArray(metricsStatus?.warnings)
       ? metricsStatus.warnings
       : [];
-    const notes = [];
-    if (
-      metricsStatus?.environment === "testnet" &&
-      Number(metricsStatus.spotTradeCount) > 0 &&
-      Number(metricsStatus.spotCommission) === 0
-    ) {
-      notes.push("Testnet 现货成交由 Binance 返回零手续费");
-    }
     if (metricsStatus?.complete === false) {
       elements.managerUserInfoStatus.textContent =
         `管理端身份已更新，但 Binance 指标不完整：` +
-        `${warnings.map((warning) => warning.message).join("；") || "部分接口不可用"}` +
-        `${notes.length ? `；${notes.join("；")}` : ""}`;
+        `${warnings.map((warning) => warning.message).join("；") || "部分接口不可用"}`;
     } else {
     elements.managerUserInfoStatus.textContent =
       `管理端身份 + Binance 资金已更新；` +
       `${result.data.accounts?.length || 0} 个账号 / ` +
-        new Date().toLocaleString() +
-        `${notes.length ? `；${notes.join("；")}` : ""}`;
+        new Date().toLocaleString();
     }
   } catch (error) {
     elements.managerUserInfoStatus.textContent = error?.message || "刷新失败";
@@ -1070,7 +1112,7 @@ elements.environmentSwitch.addEventListener("change", async () => {
   if (
     !targetTestnet &&
     !window.confirm(
-      "确定切换到 Binance 正式环境吗？程序会自动选择 Spot 或 USDⓈ-M，报单和撤单会影响真实资产。"
+      "确定切换到 Binance U 本位永续正式环境吗？报单和撤单会影响真实资产。"
     )
   ) {
     elements.environmentSwitch.checked = !activeEnvironmentTestnet;
@@ -1108,6 +1150,61 @@ elements.environmentSwitch.addEventListener("change", async () => {
   window.location.reload();
 });
 
+elements.depthLevelSelect.addEventListener("change", async () => {
+  if (depthLevelSwitchBusy) return;
+
+  const previousDepthLevels = activeDepthLevels;
+  const requestedDepthLevels = normalizeDepthLevels(
+    elements.depthLevelSelect.value,
+    previousDepthLevels
+  );
+  if (requestedDepthLevels === previousDepthLevels) {
+    renderDepthLevelConfiguration();
+    return;
+  }
+
+  depthLevelSwitchBusy = true;
+  activeDepthLevels = requestedDepthLevels;
+  elements.depthLevelSelect.disabled = true;
+  renderDepthLevelConfiguration(`正在切换到${requestedDepthLevels}档…`);
+
+  let result;
+  try {
+    result = await window.binance.setDepthLevels(requestedDepthLevels);
+  } catch (error) {
+    result = {
+      ok: false,
+      error: {
+        name: error?.name || "Error",
+        message: error?.message || "行情档位切换请求失败",
+      },
+    };
+  }
+
+  if (!result.ok) {
+    activeDepthLevels = previousDepthLevels;
+    renderDepthLevelConfiguration("切换失败");
+    printResult("切换行情档位失败", result);
+  } else {
+    activeDepthLevels = normalizeDepthLevels(
+      result.data?.streamLevels,
+      requestedDepthLevels
+    );
+    chart.reset();
+    zoomChart.reset();
+    latestDepthSnapshot = null;
+    latestZoomDepth = null;
+    syncTrackedOpenOrders();
+    syncTradingRoundChartOverlay();
+    updateZoomChartStatus();
+    renderDepthLevelConfiguration();
+    printResult("切换行情档位完成", result);
+  }
+
+  elements.depthLevelSelect.disabled = false;
+  depthLevelSwitchBusy = false;
+});
+
 document
   .querySelector("#syncTimeButton")
   .addEventListener("click", async () => {
@@ -1116,7 +1213,7 @@ document
 
     if (result.ok) {
       elements.timeOffset.textContent =
-        `${getMarketLabel(result.data.marketType)} ${result.data.offsetMs} ms`;
+        `${FUTURES_MARKET_LABEL} ${result.data.offsetMs} ms`;
     }
   });
 
@@ -1235,11 +1332,13 @@ async function connectMarketSymbol(rawSymbol, { showResult = true } = {}) {
     }
 
     synchronizeSymbolInput(symbol);
-    const marketLabel = getMarketLabel(validation.data?.marketType);
+    const marketLabel = FUTURES_MARKET_LABEL;
     elements.chartSymbolSwitchStatus.textContent =
       `正在连接：${symbol} / ${marketLabel}`;
     elements.marketStatus.textContent = `connecting / ${symbol}`;
-    const result = await window.binance.connectDepth(symbol);
+    const result = await window.binance.connectDepth(symbol, {
+      depthLevels: activeDepthLevels,
+    });
     if (showResult) printResult("切换行情请求", result);
     if (!result.ok) {
       elements.chartSymbolSwitchStatus.textContent = formatError(result);
@@ -1265,7 +1364,14 @@ document.querySelector("#connectMarketButton").addEventListener("click", () => {
 });
 
 elements.switchChartSymbolButton.addEventListener("click", () => {
-  chart.data = [];
+  chart.reset();
+  zoomChart.reset();
+  latestDepthSnapshot = null;
+  latestZoomDepth = null;
+  chartSymbol = null;
+  syncTrackedOpenOrders();
+  syncTradingRoundChartOverlay();
+  updateZoomChartStatus();
   connectMarketSymbol(elements.chartSymbolInput.value);
 });
 
@@ -1349,7 +1455,6 @@ async function refreshOrderHistory(
     const syncResult = syncAccount
       ? await window.binance.syncRecentOrders({
         symbol,
-        ...(chartMarketType ? { marketType: chartMarketType } : {}),
       })
       : null;
     if (showResult && syncResult) {
@@ -1363,7 +1468,7 @@ async function refreshOrderHistory(
           },
         }
         : syncResult;
-      printResult("最近 24 小时全账户订单同步结果", printableResult);
+      printResult("最近 24 小时 U 本位订单同步结果", printableResult);
     }
 
     const storedResult = syncResult?.ok
@@ -1378,11 +1483,7 @@ async function refreshOrderHistory(
         elements.orderHistoryStatus.textContent =
           `订单事件已更新，本地最近 24 小时 ${storedOrders.length} 条 / ${new Date().toLocaleString()}`;
       } else if (syncResult.ok) {
-        const spotMarket = syncResult.data.markets?.spot || {};
         const futuresMarket = syncResult.data.markets?.futures || {};
-        const spotText = spotMarket.configured
-          ? `现货已知合约 ${spotMarket.symbols?.length || 0} 个`
-          : "现货未配置";
         const futuresText = !futuresMarket.configured
           ? "U 本位未配置"
           : futuresMarket.queryMode === "all-symbols"
@@ -1390,15 +1491,14 @@ async function refreshOrderHistory(
             : `U 本位已知合约 ${futuresMarket.symbols?.length || 0} 个`;
         const warningCount = syncResult.data.warnings?.length || 0;
         elements.orderHistoryStatus.textContent = [
-          `全账户最近 24 小时 ${storedOrders.length} 条`,
-          spotText,
+          `U 本位全账户最近 24 小时 ${storedOrders.length} 条`,
           futuresText,
           warningCount ? `${warningCount} 项同步警告` : "同步完成",
           new Date().toLocaleString(),
         ].join(" / ");
       } else {
         elements.orderHistoryStatus.textContent =
-          `已显示本地保存的 ${storedOrders.length} 条；Binance 全账户同步失败：${formatError(syncResult)}`;
+          `已显示本地保存的 ${storedOrders.length} 条；Binance U 本位全账户同步失败：${formatError(syncResult)}`;
       }
       return;
     }
@@ -1495,11 +1595,9 @@ elements.refreshAccountButton.addEventListener("click", async () => {
 
     renderAccountInfo(result.data || {});
     const balanceCount = Array.isArray(result.data?.balances)
-      ? result.data.balances.filter(
-          (balance) => Number(balance.locked) !== 0
-        ).length
+      ? result.data.balances.length
       : 0;
-    elements.accountStatus.textContent = `已加载 / 锁定余额不为 0 的资产 ${balanceCount} 项 / ${new Date().toLocaleString()}`;
+    elements.accountStatus.textContent = `U 本位账户已加载 / 保证金资产 ${balanceCount} 项 / ${new Date().toLocaleString()}`;
   } catch (error) {
     elements.accountStatus.textContent = error.message || "加载失败";
     printResult("读取账户信息异常", { message: error.message });
@@ -1547,102 +1645,6 @@ document.querySelector("#refreshRateLimitsButton").addEventListener("click", asy
   elements.riskStatus.textContent = "下单限频已加载";
 });
 
-function readOcoForm() {
-  return {
-    symbol: getSelectedSymbol(), side: elements.ocoSide.value,
-    quantity: elements.ocoQuantity.value.trim(), workingPrice: elements.ocoWorkingPrice.value.trim(),
-    abovePrice: elements.ocoAbovePrice.value.trim(), aboveStopPrice: elements.ocoAboveStopPrice.value.trim(),
-    belowPrice: elements.ocoBelowPrice.value.trim(), belowStopPrice: elements.ocoBelowStopPrice.value.trim(),
-  };
-}
-
-document.querySelector("#placeOcoButton").addEventListener("click", async () => {
-  const result = await window.binance.placeOco(readOcoForm());
-  printResult("创建 OCO 结果", result);
-  elements.orderListsStatus.textContent = result.ok ? "OCO 创建成功" : formatError(result);
-  if (result.ok) {
-    elements.orderListId.value = result.data.orderListId ?? "";
-    renderOrderLists(result.data);
-  }
-});
-
-document.querySelector("#placeOtoButton").addEventListener("click", async () => {
-  const form = readOcoForm();
-  const result = await window.binance.placeOto({
-    symbol: form.symbol,
-    workingSide: form.side,
-    workingPrice: form.workingPrice,
-    workingQuantity: form.quantity,
-    pendingSide: form.side === "BUY" ? "SELL" : "BUY",
-    pendingPrice: form.belowPrice,
-    pendingQuantity: form.quantity,
-  });
-  printResult("创建 OTO 结果", result);
-  elements.orderListsStatus.textContent = result.ok ? "OTO 创建成功" : formatError(result);
-  if (result.ok) {
-    elements.orderListId.value = result.data.orderListId ?? "";
-    renderOrderLists(result.data);
-  }
-});
-
-document.querySelector("#placeOtocoButton").addEventListener("click", async () => {
-  const form = readOcoForm();
-  const result = await window.binance.placeOtoco({
-    symbol: form.symbol,
-    workingSide: form.side,
-    workingPrice: form.workingPrice,
-    workingQuantity: form.quantity,
-    pendingSide: form.side === "BUY" ? "SELL" : "BUY",
-    pendingQuantity: form.quantity,
-    pendingAbovePrice: form.abovePrice,
-    pendingBelowPrice: form.belowPrice,
-    pendingBelowStopPrice: form.belowStopPrice,
-  });
-  printResult("创建 OTOCO 结果", result);
-  elements.orderListsStatus.textContent = result.ok ? "OTOCO 创建成功" : formatError(result);
-  if (result.ok) {
-    elements.orderListId.value = result.data.orderListId ?? "";
-    renderOrderLists(result.data);
-  }
-});
-
-document.querySelector("#refreshAllOrderListsButton").addEventListener("click", async () => {
-  const result = await window.binance.allOrderLists({
-    symbol: getSelectedSymbol(), limit: 100,
-  });
-  printResult("组合订单历史结果", result);
-  elements.orderListsStatus.textContent = result.ok ? `已加载 ${result.data?.length || 0} 条` : formatError(result);
-  if (result.ok) renderOrderLists(result.data);
-});
-
-document.querySelector("#refreshOpenOrderListsButton").addEventListener("click", async () => {
-  const result = await window.binance.openOrderLists({
-    symbol: getSelectedSymbol(),
-  });
-  printResult("当前组合挂单结果", result);
-  elements.orderListsStatus.textContent = result.ok ? `当前组合挂单 ${result.data?.length || 0} 条` : formatError(result);
-  if (result.ok) renderOrderLists(result.data);
-});
-
-document.querySelector("#queryOrderListButton").addEventListener("click", async () => {
-  const result = await window.binance.queryOrderList({
-    symbol: getSelectedSymbol(), orderListId: elements.orderListId.value.trim(),
-  });
-  printResult("组合订单查询结果", result);
-  elements.orderListsStatus.textContent = result.ok ? "组合订单已加载" : formatError(result);
-  if (result.ok) renderOrderLists(result.data);
-});
-
-document.querySelector("#cancelOrderListButton").addEventListener("click", async () => {
-  if (!window.confirm(`确定撤销组合订单 ${elements.orderListId.value.trim()} 吗？`)) return;
-  const result = await window.binance.cancelOrderList({
-    symbol: getSelectedSymbol(), orderListId: elements.orderListId.value.trim(),
-  });
-  printResult("撤销组合订单结果", result);
-  elements.orderListsStatus.textContent = result.ok ? "组合订单已撤销" : formatError(result);
-  if (result.ok) renderOrderLists(result.data);
-});
-
 document.querySelector("#connectUserDataButton").addEventListener("click", async () => {
   elements.userDataStatus.textContent = "连接中…";
   const result = await window.binance.connectUserData({
@@ -1665,21 +1667,34 @@ document.querySelector("#clearUserDataButton").addEventListener("click", () => {
   appendTextRow(elements.userDataBody, ["连接后等待账户事件"], 6);
 });
 
-elements.orderType.addEventListener("change", () => {
+function updateOrderTypeFields() {
   const type = elements.orderType.value;
-  const needsPrice = ["LIMIT", "LIMIT_MAKER", "STOP_LOSS_LIMIT", "TAKE_PROFIT_LIMIT"].includes(type);
-  const needsStop = type.includes("STOP") || type.includes("TAKE_PROFIT");
-  const supportsIceberg = ["LIMIT", "STOP_LOSS_LIMIT", "TAKE_PROFIT_LIMIT"].includes(type);
+  const needsPrice = ["LIMIT", "STOP", "TAKE_PROFIT"].includes(type);
+  const needsStop = [
+    "STOP",
+    "STOP_MARKET",
+    "TAKE_PROFIT",
+    "TAKE_PROFIT_MARKET",
+  ].includes(type);
+  const isTrailingStop = type === "TRAILING_STOP_MARKET";
   elements.price.disabled = !needsPrice;
   elements.stopPrice.disabled = !needsStop;
-  elements.trailingDelta.disabled = !needsStop;
-  elements.icebergQty.disabled = !supportsIceberg;
-});
+  elements.activationPrice.disabled = !isTrailingStop;
+  elements.callbackRate.disabled = !isTrailingStop;
+}
+
+elements.orderType.addEventListener("change", updateOrderTypeFields);
+updateOrderTypeFields();
 const chartDom = document.querySelector('#can');
 const parentDom = document.querySelector('#parent')
 const mousebar= document.querySelector("#mousebar")
-mousebar.style.width = '13px'
-const chart = new Chart(chartDom,980, 300, 0.01,{
+const zoomChartDom = elements.zoomChartCanvas;
+const zoomParentDom = zoomChartDom.parentElement;
+const zoomMousebar = elements.zoomMousebar;
+const depthAggregationApi = window.DepthAggregation;
+const BASE_CHART_PRICE_STEP = "0.01";
+const CHART_HEIGHT = 300;
+const CHART_CONFIG = {
     volumeScaleCount: 3,
     volumeScaleHeight: 25,
     volumeScaleTick: 10,
@@ -1691,30 +1706,52 @@ const chart = new Chart(chartDom,980, 300, 0.01,{
     barVolume: 140,
     barWidth: 13,
     calcBarType: 2
-
-});
+};
+mousebar.style.width = '13px'
+zoomMousebar.style.width = '13px'
+const chart = new Chart(
+    chartDom,
+    980,
+    CHART_HEIGHT,
+    BASE_CHART_PRICE_STEP,
+    CHART_CONFIG
+);
+const zoomChart = new Chart(
+    zoomChartDom,
+    980,
+    CHART_HEIGHT,
+    BASE_CHART_PRICE_STEP,
+    CHART_CONFIG
+);
+let zoomDepthScale = 1;
+let latestDepthSnapshot = null;
+let latestZoomDepth = null;
 const chartOrderApi = window.ChartOrderSelection;
 const CHART_ORDER_COOLDOWN_MS = 800;
 let chartOrderBusy = false;
 let lastChartOrderAt = 0;
 
-function resolveChartPointer(event) {
+function resolveChartPointerFor(chartInstance, canvas, event) {
   return chartOrderApi.resolveChartOrderSelection({
     clientX: event.clientX,
     clientY: event.clientY,
-    bounds: chartDom.getBoundingClientRect(),
-    canvasWidth: chartDom.width,
-    canvasHeight: chartDom.height,
+    bounds: canvas.getBoundingClientRect(),
+    canvasWidth: canvas.width,
+    canvasHeight: canvas.height,
     plotLeft: Chart.PLOT_LEFT,
     plotTop: Chart.PLOT_TOP,
-    plotBottom: chart.height - Chart.PLOT_BOTTOM_PADDING,
-    barWidth: chart.barWidth,
-    count: chart.count,
-    start: chart.start,
-    buyIndex: chart.buyIndex,
-    askIndex: chart.askIndex,
-    data: chart.data,
+    plotBottom: chartInstance.height - Chart.PLOT_BOTTOM_PADDING,
+    barWidth: chartInstance.barWidth,
+    count: chartInstance.count,
+    start: chartInstance.start,
+    buyIndex: chartInstance.buyIndex,
+    askIndex: chartInstance.askIndex,
+    data: chartInstance.data,
   });
+}
+
+function resolveChartPointer(event) {
+  return resolveChartPointerFor(chart, chartDom, event);
 }
 
 chartDom.addEventListener('mousemove', function(event){
@@ -1731,6 +1768,64 @@ chartDom.addEventListener('mousemove', function(event){
 
 parentDom.addEventListener('mouseleave', () => {
   mousebar.style.display = 'none';
+});
+
+zoomChartDom.addEventListener('mousemove', function(event){
+  const selection = resolveChartPointerFor(zoomChart, zoomChartDom, event);
+  if (!selection) {
+    zoomMousebar.style.display = 'none';
+    return;
+  }
+
+  zoomMousebar.style.display = 'block';
+  zoomMousebar.style.left = `${selection.cssLeft}px`;
+  zoomMousebar.style.width = `${Math.max(1, selection.cssBarWidth)}px`;
+});
+
+zoomParentDom.addEventListener('mouseleave', () => {
+  zoomMousebar.style.display = 'none';
+});
+
+function normalizeZoomDepthScale(value, fallback = 1) {
+  const scale = Number(value);
+  return depthAggregationApi.VALID_SCALES.includes(scale) ? scale : fallback;
+}
+
+function getZoomBucketStep(scale = zoomDepthScale) {
+  return depthAggregationApi.aggregateDepth({
+    baseStep: BASE_CHART_PRICE_STEP,
+    scale,
+  }).bucketStep;
+}
+
+function getZoomBucketPrice(price, scale = zoomDepthScale) {
+  try {
+    return depthAggregationApi.bucketPrice(price, {
+      baseStep: BASE_CHART_PRICE_STEP,
+      scale,
+    });
+  } catch {
+    return String(price ?? "");
+  }
+}
+
+elements.zoomDepthScale.addEventListener("change", () => {
+  const nextScale = normalizeZoomDepthScale(
+    elements.zoomDepthScale.value,
+    zoomDepthScale
+  );
+  zoomDepthScale = nextScale;
+  elements.zoomDepthScale.value = String(nextScale);
+  zoomChart.setStep(getZoomBucketStep());
+  zoomChart.setColor(colorblindMode);
+  syncZoomChartOpenOrders();
+  syncTradingRoundChartOverlay();
+
+  if (latestDepthSnapshot) {
+    renderZoomDepthSnapshot(latestDepthSnapshot);
+  } else {
+    updateZoomChartStatus();
+  }
 });
 
 chartDom.addEventListener('dblclick', async function(event){
@@ -1756,8 +1851,8 @@ chartDom.addEventListener('dblclick', async function(event){
     type: 'LIMIT',
     price: selection.price,
     stopPrice: '',
-    trailingDelta: '',
-    icebergQty: '',
+    activationPrice: '',
+    callbackRate: '',
     timeInForce: "GTC",
     triggerSource: "chart-double-click",
   };
@@ -2043,7 +2138,7 @@ document.querySelector("#reloadMenuItem").addEventListener("click", () => {
 
 document.querySelector("#aboutMenuItem").addEventListener("click", () => {
   closeTitleMenus();
-  window.alert("Binance 统一交易测试台\n支持自动识别 Spot / USDⓈ-M、Testnet / 正式环境、行情展示和快捷交易。" );
+  window.alert("Binance U 本位永续交易测试台\n支持 USDⓈ-M Testnet / 正式环境、行情展示和快捷交易。" );
 });
 
 document.querySelector("#shortcutMenuItem").addEventListener("click", () => {
@@ -2155,7 +2250,11 @@ function applyColorblindMode(enabled, { persist = true } = {}) {
   document.querySelector("#colorblindMenuState").textContent =
     colorblindMode ? "已开启" : "未开启";
   chart.setColor(colorblindMode);
+  zoomChart.setColor(colorblindMode);
   if (chart.args?.LastPrice && chart.data.length) chart.render(chart.args);
+  if (zoomChart.args?.LastPrice && zoomChart.data.length) {
+    zoomChart.render(zoomChart.args);
+  }
 
   if (persist) {
     try {
@@ -2178,16 +2277,23 @@ let resizeTimeout;
         const width = Math.max(240, event.target.innerWidth - 80);
         chartDom.width = width;
         chartDom.style.width = `${width}px`;
+        zoomChartDom.width = width;
+        zoomChartDom.style.width = `${width}px`;
         clearTimeout(resizeTimeout);
         resizeTimeout = setTimeout(() => {
-            chart.resize(width, 300);
+            chart.resize(width, CHART_HEIGHT);
             if (chart.args?.LastPrice && chart.data.length) {
                 chart.render(chart.args);
+            }
+            zoomChart.resize(width, CHART_HEIGHT);
+            syncZoomChartOpenOrders();
+            syncTradingRoundChartOverlay();
+            if (latestDepthSnapshot) {
+                renderZoomDepthSnapshot(latestDepthSnapshot);
             }
         }, 200);
     }
 let chartSymbol = null;
-let chartMarketType = null;
 const latestTradePrices = new Map();
 const openOrdersByKey = new Map();
 const {
@@ -2316,14 +2422,14 @@ async function cancelAllOpenOrdersFromNumpad(shortcut) {
     cancellations.push({ ...target, ...result });
     if (result.ok) {
       for (const order of result.data || []) applyOpenOrderUpdate(order);
-      // cancelAll 成功代表该市场/交易对已经没有活动挂单。即使前置
+      // cancelAll 成功代表该 U 本位合约已经没有活动挂单。即使前置
       // openOrders 快照因 ACK 可见性延迟返回空，也可以安全清理本地显示。
       for (const order of discovery.orders.filter((candidate) =>
         window.CancelAllOrderTargets.orderMatchesTarget(candidate, target)
       )) {
         applyOpenOrderUpdate({
           ...order,
-          marketType: order.marketType || target.marketType,
+          marketType: "futures",
           symbol: target.symbol,
           status: "CANCELED",
           updateTime: Date.now(),
@@ -2357,8 +2463,8 @@ async function closeAllPositionsFromShortcut(shortcut) {
   printResult(`${shortcutLabel} 一键平所有正在执行`, {
     ok: true,
     data: {
-      marketType: "all",
-      message: "正在撤销现货与 U 本位挂单、卖出现货、平掉 U 本位持仓并向 Binance 复核结果。",
+      marketType: "futures",
+      message: "正在撤销 U 本位挂单、平掉全部 U 本位持仓并向 Binance 复核结果。",
     },
   });
   const result = await window.binance.closeAllPositions();
@@ -2437,22 +2543,57 @@ function updateChartOrderStatus() {
     `图内 ${visible} 个价位 / 共 ${total} 个价位（柱高为剩余数量）`;
 }
 
+function mapOpenOrderToZoomBucket(order) {
+  const price = Number(order.price) > 0
+    ? getZoomBucketPrice(order.price)
+    : order.price;
+  const stopPrice = Number(order.price) > 0 || Number(order.stopPrice) <= 0
+    ? order.stopPrice
+    : getZoomBucketPrice(order.stopPrice);
+  return { ...order, price, stopPrice };
+}
+
+function updateZoomChartStatus() {
+  const rawBids = latestDepthSnapshot?.bids?.length || 0;
+  const rawAsks = latestDepthSnapshot?.asks?.length || 0;
+  const zoomBids = latestZoomDepth?.bids?.length || 0;
+  const zoomAsks = latestZoomDepth?.asks?.length || 0;
+  const totalOrders = zoomChart.totalPlaceOrderCount ?? zoomChart.placeOrder.length;
+  const visibleOrders = zoomChart.visiblePlaceOrderCount ?? 0;
+  elements.zoomChartStatus.textContent = latestDepthSnapshot
+    ? `当前：${zoomDepthScale}级 / 每格 ${getZoomBucketStep()} / ` +
+      `买盘 ${rawBids}→${zoomBids} 档 / 卖盘 ${rawAsks}→${zoomAsks} 档 / ` +
+      `鲜红色挂单：图内 ${visibleOrders} 个价位，共 ${totalOrders} 个价位`
+    : `当前：${zoomDepthScale}级 / 每格 ${getZoomBucketStep()}，等待行情数据`;
+}
+
+function syncZoomChartOpenOrders(orders) {
+  const sourceOrders = orders || [...openOrdersByKey.values()].filter((order) =>
+    order.symbol === getSelectedSymbol() && isOpenOrder(order)
+  );
+  zoomChart.placeOrder = sourceOrders.map(mapOpenOrderToZoomBucket);
+  zoomChart.totalPlaceOrderCount = zoomChart.placeOrder.length;
+  if (zoomChart.args?.LastPrice && zoomChart.data.length) {
+    zoomChart.render(zoomChart.args);
+  }
+  updateZoomChartStatus();
+}
+
 function syncTrackedOpenOrders() {
   const symbol = getSelectedSymbol();
   const orders = [...openOrdersByKey.values()]
     .filter((order) =>
       order.symbol === symbol &&
-      (!chartMarketType || !order.marketType || order.marketType === chartMarketType) &&
       isOpenOrder(order)
     );
 
   chart.placeOrder = orders;
   chart.totalPlaceOrderCount = orders.length;
+  syncZoomChartOpenOrders(orders);
 
   const tableOrders = [...openOrdersByKey.values()]
     .filter((order) =>
       order.symbol === symbol &&
-      (!chartMarketType || !order.marketType || order.marketType === chartMarketType) &&
       isOpenOrder(order)
     );
   renderOrders(tableOrders, elements.openOrdersBody);
@@ -2470,6 +2611,7 @@ function syncTrackedOpenOrders() {
       });
     }
   }
+  updateZoomChartStatus();
 }
 
 function applyOpenOrderUpdate(order, receivedAt = Date.now()) {
@@ -2487,7 +2629,6 @@ async function refreshTrackedOpenOrders(symbol = getSelectedSymbol()) {
   for (const [key, order] of openOrdersByKey) {
     if (
       order.symbol === normalizedSymbol &&
-      (!chartMarketType || !order.marketType || order.marketType === chartMarketType) &&
       order.receivedAt <= snapshotStartedAt
     ) {
       openOrdersByKey.delete(key);
@@ -2515,8 +2656,9 @@ function fillLatestTradePrice(
 }
 
 function renderLatestTradePrice(symbol = getSelectedSymbol()) {
-  elements.chartLatestTradePrice.textContent =
-    latestTradePrices.get(symbol) || "-";
+  const latestPrice = latestTradePrices.get(symbol) || "-";
+  elements.chartLatestTradePrice.textContent = latestPrice;
+  elements.zoomChartLatestTradePrice.textContent = latestPrice;
 }
 
 elements.latestTradePriceToggle.addEventListener("change", () => {
@@ -2548,18 +2690,56 @@ window.binance.onTradeUpdate((trade) => {
       chart.args.LastPrice = numericPrice;
       chart.renderCurrentPirce(numericPrice, Number(trade.quantity) || 0);
     }
+    if (symbol === chartSymbol && zoomChart.data.length) {
+      const zoomPrice = Number(getZoomBucketPrice(price));
+      if (Number.isFinite(zoomPrice) && zoomPrice > 0) {
+        zoomChart.args ||= {};
+        zoomChart.args.LastPrice = zoomPrice;
+        zoomChart.renderCurrentPirce(
+          zoomPrice,
+          Number(trade.quantity) || 0
+        );
+      }
+    }
   }
 });
 
-function createChartDepthData(depth) {
+function normalizeChartDepthLevelCount(value, fallback = 1) {
+  const numericValue = Math.floor(Number(value));
+  if (Number.isFinite(numericValue) && numericValue > 0) {
+    return Math.min(20, numericValue);
+  }
+
+  const numericFallback = Math.floor(Number(fallback));
+  return Math.min(
+    20,
+    Math.max(1, Number.isFinite(numericFallback) ? numericFallback : 1)
+  );
+}
+
+function createChartDepthData(
+  depth,
+  { depthLevelCount: requestedDepthLevelCount, lastPrice } = {}
+) {
   const data = {};
+  const availableDepthLevelCount = Math.max(
+    depth.bids?.length || 0,
+    depth.asks?.length || 0,
+    1
+  );
+  const depthLevelCount = normalizeChartDepthLevelCount(
+    requestedDepthLevelCount ?? depth.displayLevels,
+    availableDepthLevelCount
+  );
   const sides = [
     ["Bid", depth.bids],
     ["Ask", depth.asks],
   ];
 
   for (const [side, levels] of sides) {
-    for (const [index, level] of (levels || []).slice(0, 10).entries()) {
+    for (const [index, level] of (levels || [])
+      .slice(0, depthLevelCount)
+      .entries()) {
       const price = Number(level.price);
       const volume = Number(level.quantity);
 
@@ -2570,22 +2750,68 @@ function createChartDepthData(depth) {
     }
   }
 
-  data.DepthLevels = 10;
+  data.DepthLevels = depthLevelCount;
+  const requestedLastPrice = Number(lastPrice);
   const latestTradePrice = Number(
     latestTradePrices.get(String(depth.symbol || "").toUpperCase())
   );
-  data.LastPrice = Number.isFinite(latestTradePrice) && latestTradePrice > 0
-    ? latestTradePrice
-    : data.AskPrice1 || data.BidPrice1;
+  data.LastPrice = Number.isFinite(requestedLastPrice) && requestedLastPrice > 0
+    ? requestedLastPrice
+    : Number.isFinite(latestTradePrice) && latestTradePrice > 0
+      ? latestTradePrice
+      : data.AskPrice1 || data.BidPrice1;
   return data;
 }
 
-window.binance.onDepthUpdate((depth) => {
-  renderDepthRows(elements.bidRows, depth.bids || []);
-  renderDepthRows(elements.askRows, depth.asks || []);
+function renderZoomDepthSnapshot(depth) {
+  const aggregated = depthAggregationApi.aggregateDepth({
+    bids: depth.bids || [],
+    asks: depth.asks || [],
+    baseStep: BASE_CHART_PRICE_STEP,
+    scale: zoomDepthScale,
+  });
+  const aggregatedDepthLevelCount = Math.max(
+    aggregated.bids.length,
+    aggregated.asks.length,
+    1
+  );
+  const latestTradePrice = latestTradePrices.get(
+    String(depth.symbol || "").toUpperCase()
+  );
+  const zoomLastPrice = Number.isFinite(Number(latestTradePrice))
+    ? getZoomBucketPrice(latestTradePrice)
+    : undefined;
 
-  const bestBid = depth.bids?.[0]?.price;
-  const bestAsk = depth.asks?.[0]?.price;
+  latestZoomDepth = {
+    ...depth,
+    bids: aggregated.bids,
+    asks: aggregated.asks,
+    displayLevels: aggregatedDepthLevelCount,
+    bucketStep: aggregated.bucketStep,
+  };
+  zoomChart.render(createChartDepthData(latestZoomDepth, {
+    depthLevelCount: aggregatedDepthLevelCount,
+    lastPrice: zoomLastPrice,
+  }));
+  updateZoomChartStatus();
+}
+
+window.binance.onDepthUpdate((depth) => {
+  const depthLevelCount = normalizeDepthLevels(
+    depth.displayLevels,
+    activeDepthLevels
+  );
+  const currentDepth = {
+    ...depth,
+    bids: (depth.bids || []).slice(0, depthLevelCount),
+    asks: (depth.asks || []).slice(0, depthLevelCount),
+    displayLevels: depthLevelCount,
+  };
+  renderDepthRows(elements.bidRows, currentDepth.bids, depthLevelCount);
+  renderDepthRows(elements.askRows, currentDepth.asks, depthLevelCount);
+
+  const bestBid = currentDepth.bids?.[0]?.price;
+  const bestAsk = currentDepth.asks?.[0]?.price;
   const spread =
     bestBid && bestAsk ? Number(bestAsk) - Number(bestBid) : null;
 
@@ -2598,15 +2824,20 @@ window.binance.onDepthUpdate((depth) => {
       ? "-"
       : String(spread);
 
-  if (depth.marketType) chartMarketType = depth.marketType;
   if (depth.symbol && chartSymbol !== depth.symbol) {
     chart.reset();
+    zoomChart.reset();
+    latestDepthSnapshot = null;
+    latestZoomDepth = null;
     chartSymbol = depth.symbol;
     syncTrackedOpenOrders();
+    syncTradingRoundChartOverlay();
   }
 
+  latestDepthSnapshot = currentDepth;
+
   try {
-    chart.render(createChartDepthData(depth));
+    chart.render(createChartDepthData(currentDepth, { depthLevelCount }));
     updateChartOrderStatus();
   } catch (error) {
     printResult("行情图表渲染错误", {
@@ -2617,11 +2848,30 @@ window.binance.onDepthUpdate((depth) => {
       },
     });
   }
+
+  try {
+    renderZoomDepthSnapshot(currentDepth);
+  } catch (error) {
+    updateZoomChartStatus();
+    printResult("缩放行情图表渲染错误", {
+      ok: false,
+      error: {
+        name: error.name,
+        message: error.message,
+      },
+    });
+  }
 });
 
 window.binance.onMarketStatus((status) => {
-  const marketLabel = getMarketLabel(status.marketType);
-  if (status.symbol && status.marketType) chartMarketType = status.marketType;
+  const marketLabel = FUTURES_MARKET_LABEL;
+  if (
+    status.status === "connected" &&
+    SUPPORTED_DEPTH_LEVELS.has(Number(status.streamLevels))
+  ) {
+    activeDepthLevels = Number(status.streamLevels);
+    renderDepthLevelConfiguration();
+  }
   elements.marketStatus.textContent = [
     status.status,
     status.symbol || "",
@@ -2668,7 +2918,7 @@ window.binance.onLatencyUpdate((latency) => {
   const parts = [
     `Binance 接口延迟：${Number.isFinite(elapsedMs) ? elapsedMs.toFixed(3) : "-"} ms`,
     transportLabels[latency.transport] || latency.transport,
-    getMarketLabel(latency.marketType),
+    FUTURES_MARKET_LABEL,
     latency.operation,
     latency.success ? "成功" : "失败",
     Number.isFinite(Number(latency.time))
@@ -2745,7 +2995,7 @@ window.binance.onUserDataEvent((payload) => {
   if (payload.event?.e === "executionReport") {
     const routedEvent = {
       ...payload.event,
-      marketType: payload.marketType || payload.event.marketType,
+      marketType: "futures",
     };
     const clientOrderId = String(payload.event.c || "");
     if (clientOrderId) {
@@ -2779,12 +3029,12 @@ window.binance.onTradingRoundsUpdate((payload) => {
   renderTradingRounds(payload.rounds, { merge: Boolean(payload.partial) });
   const allRounds = [...tradingRoundsById.values()];
   
-  const openRouds = allRounds.filter(
+  const openRounds = allRounds.filter(
     (round) => round.status === "OPEN"
   ).length;
   
   elements.tradingRoundsStatus.textContent =
-    `成交已更新 / 进行中 ${openRouds.length} 个 / ` +
+    `成交已更新 / 进行中 ${openRounds} 个 / ` +
     `${new Date(payload.time || Date.now()).toLocaleString()}`;
 });
 
@@ -2803,7 +3053,7 @@ window.binance.onFuturesDeadManStatus((status) => {
 window.binance.onUserDataStatus((status) => {
   elements.userDataStatus.textContent = [
     status.status,
-    getMarketLabel(status.marketType),
+    FUTURES_MARKET_LABEL,
     status.subscriptionId !== undefined ? `subscriptionId=${status.subscriptionId}` : "",
     status.code !== undefined ? `code=${status.code}` : "",
   ].filter(Boolean).join(" / ");

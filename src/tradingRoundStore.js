@@ -46,7 +46,6 @@ function resolveExecutionAction(order = {}, marketType = "") {
   if (side === "BUY") {
     return closesPosition ? "CLOSE_SHORT" : "OPEN_LONG";
   }
-  if (marketType === "spot") return "CLOSE_LONG";
   return closesPosition ? "CLOSE_LONG" : "OPEN_SHORT";
 }
 

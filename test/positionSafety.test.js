@@ -12,7 +12,6 @@ function completeFlatSnapshot(updatedAt) {
     complete: true,
     updatedAt,
     sources: {
-      spot: { configured: true, ok: true, updatedAt },
       futures: { configured: true, ok: true, updatedAt },
     },
   };
@@ -28,7 +27,7 @@ test("没有账户指标时绝不把空列表标记成已确认空仓", () => {
   assert.match(safety.emptyMessage, /不能据此判断空仓/);
 });
 
-test("现货和 U 本位连续两份不同的完整快照才确认空仓", () => {
+test("U 本位连续两份不同的完整快照才确认空仓", () => {
   const first = evaluatePositionSafety(completeFlatSnapshot(10_000), {
     now: 10_100,
   });
@@ -51,9 +50,10 @@ test("现货和 U 本位连续两份不同的完整快照才确认空仓", () =>
   assert.equal(second.level, "safe");
   assert.equal(second.flatConfirmed, true);
   assert.equal(second.flatConfirmations, 2);
+  assert.match(second.message, /U 本位永续无持仓/);
 });
 
-test("任一市场查询失败或未配置时不能确认空仓", () => {
+test("U 本位查询失败或未配置时不能确认空仓", () => {
   const partial = completeFlatSnapshot(10_000);
   partial.complete = false;
   partial.sources.futures = {
@@ -67,10 +67,10 @@ test("任一市场查询失败或未配置时不能确认空仓", () => {
 
   const unconfigured = completeFlatSnapshot(10_000);
   unconfigured.complete = false;
-  unconfigured.sources.spot = { configured: false, ok: false };
+  unconfigured.sources.futures = { configured: false, ok: false };
   const missing = evaluatePositionSafety(unconfigured, { now: 10_100 });
   assert.equal(missing.level, "unknown");
-  assert.match(missing.message, /现货凭证未配置/);
+  assert.match(missing.message, /U 本位凭证未配置/);
 });
 
 test("过期快照不能继续显示已确认空仓", () => {
@@ -96,56 +96,47 @@ test("仍有已知未成交订单时不能把零持仓显示成休息前安全�
   assert.match(safety.message, /3 笔未成交订单/);
 });
 
-test("已查到持仓时即使另一个市场失败也优先显示危险状态", () => {
+test("已查到 U 本位持仓时即使本次查询失败也优先显示危险状态", () => {
   const snapshot = {
     positions: [{ marketType: "futures", symbol: "BTCUSDT" }],
     complete: false,
     updatedAt: 10_000,
     sources: {
-      spot: { configured: true, ok: false },
-      futures: { configured: true, ok: true },
+      futures: { configured: true, ok: false },
     },
   };
   const safety = evaluatePositionSafety(snapshot, { now: 10_100 });
   assert.equal(safety.level, "danger");
-  assert.equal(safety.futuresCount, 1);
+  assert.equal(safety.positions.length, 1);
   assert.match(safety.message, /列表可能还不完整/);
 });
 
-test("部分市场失败时保留该市场上次成功查到的持仓", () => {
+test("U 本位查询失败时保留上次成功查到的持仓", () => {
   const previous = {
     environment: "production",
     accountName: "account-a",
-    positions: [
-      { marketType: "spot", symbol: "ETHUSDT" },
-      { marketType: "futures", symbol: "BTCUSDT" },
-    ],
+    positions: [{ marketType: "futures", symbol: "BTCUSDT" }],
     complete: true,
     sources: {
-      spot: { configured: true, ok: true },
       futures: { configured: true, ok: true },
     },
   };
   const partial = {
     environment: "production",
     accountName: "account-a",
-    positions: [{ marketType: "spot", symbol: "BNBUSDT" }],
+    positions: [],
     complete: false,
     sources: {
-      spot: { configured: true, ok: true },
       futures: { configured: true, ok: false },
     },
   };
   const merged = mergePositionSnapshots(previous, partial);
 
-  assert.deepEqual(merged.positions.map((row) => [
-    row.marketType,
-    row.symbol,
-    row._positionSnapshotStale,
-  ]), [
-    ["futures", "BTCUSDT", true],
-    ["spot", "BNBUSDT", false],
-  ]);
+  assert.deepEqual(merged.positions, [{
+    marketType: "futures",
+    symbol: "BTCUSDT",
+    _positionSnapshotStale: true,
+  }]);
 });
 
 test("环境或账号切换后绝不沿用旧账户的持仓", () => {
@@ -161,4 +152,62 @@ test("环境或账号切换后绝不沿用旧账户的持仓", () => {
     complete: false,
   };
   assert.equal(mergePositionSnapshots(previous, next), next);
+});
+
+test("同名账号但 API Key 指纹不同，不沿用旧账号持仓", () => {
+  const previous = {
+    environment: "production",
+    accountName: "duplicate-name",
+    accountFingerprint: "fingerprint-a",
+    positions: [{ marketType: "futures", symbol: "BTCUSDT" }],
+  };
+  const next = {
+    environment: "production",
+    accountName: "duplicate-name",
+    accountFingerprint: "fingerprint-b",
+    positions: [],
+    complete: false,
+  };
+
+  assert.equal(mergePositionSnapshots(previous, next), next);
+});
+
+test("构建安全快照优先使用独立的持仓更新时间", () => {
+  const snapshot = buildPositionSnapshot({
+    environment: "production",
+    accountFingerprint: "fingerprint-a",
+    updatedAt: 20_000,
+    positionsUpdatedAt: 10_000,
+    positionsComplete: true,
+    positions: [],
+    positionSources: {
+      futures: { configured: true, ok: true, updatedAt: 10_000 },
+    },
+  });
+
+  assert.equal(snapshot.updatedAt, 10_000);
+  assert.equal(snapshot.positionsUpdatedAt, 10_000);
+  assert.equal(snapshot.accountFingerprint, "fingerprint-a");
+});
+
+test("构建安全快照时只接收 U 本位持仓和数据源", () => {
+  const metrics = {
+    environment: "production",
+    updatedAt: 10_000,
+    positionsComplete: true,
+    positions: [
+      { marketType: "futures", symbol: "BTCUSDT" },
+      { marketType: "legacy", symbol: "IGNORED" },
+    ],
+    positionSources: {
+      futures: { configured: true, ok: true, updatedAt: 10_000 },
+      legacy: { configured: true, ok: true, updatedAt: 10_000 },
+    },
+  };
+  const snapshot = buildPositionSnapshot(metrics);
+
+  assert.deepEqual(snapshot.positions, [
+    { marketType: "futures", symbol: "BTCUSDT" },
+  ]);
+  assert.deepEqual(Object.keys(snapshot.sources), ["futures"]);
 });

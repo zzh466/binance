@@ -8,7 +8,7 @@
       content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'none'; img-src 'self' data:"
     />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Binance 统一交易测试台</title>
+    <title>Binance U 本位永续交易测试台</title>
     <style>
       :root {
         --latency-bar-height: 24px;
@@ -302,6 +302,7 @@
       .environment-switcher {
         display: flex;
         align-items: center;
+        flex-wrap: wrap;
         gap: 10px;
         margin: 0 0 14px;
         padding: 10px 12px;
@@ -364,12 +365,43 @@
         font-size: 13px;
         font-weight: 700;
       }
-        #can {
-      background-color: #000;
-      position: relative;
-      width: 980px;
-      height: 300px;
-    }
+
+      .environment-switch-divider {
+        align-self: stretch;
+        width: 1px;
+        min-height: 28px;
+        background: color-mix(in srgb, CanvasText 22%, transparent);
+      }
+
+      .depth-level-label {
+        display: inline;
+        margin: 0;
+      }
+
+      .depth-level-select {
+        width: auto;
+        min-width: 82px;
+        min-height: 32px;
+        padding: 5px 28px 5px 9px;
+      }
+
+      .depth-level-switch-status {
+        font-size: 13px;
+        font-weight: 700;
+      }
+      #can,
+      #zoomChartCanvas {
+        position: relative;
+        width: 980px;
+        height: 300px;
+        background-color: #000;
+      }
+
+      #zoomChartCanvas {
+        display: block;
+        width: 100%;
+        height: auto;
+      }
       h2,
       h3 {
         margin-top: 0;
@@ -509,6 +541,41 @@
         border-radius: 6px;
         color: #ffb300;
         font: 700 14px ui-monospace, SFMono-Regular, Consolas, monospace;
+      }
+
+      .zoom-chart-panel {
+        box-sizing: border-box;
+        width: 100%;
+        margin: 16px 0;
+      }
+
+      .zoom-chart-toolbar h2 {
+        margin: 0 auto 0 0;
+      }
+
+      .zoom-chart-toolbar select {
+        width: auto;
+        min-width: 72px;
+      }
+
+      .zoom-chart-canvas-scroll {
+        width: 100%;
+        overflow-x: auto;
+      }
+
+      .zoom-chart-canvas-stage {
+        position: relative;
+        width: min(980px, 100%);
+        aspect-ratio: 980 / 300;
+      }
+
+      .zoom-chart-canvas-stage .price-tick {
+        top: 26.6667%;
+        height: 66.6667%;
+      }
+
+      .zoom-chart-readonly-note {
+        margin-bottom: 0;
       }
 
       .chart-order-status .open-order {
@@ -723,16 +790,6 @@
         color: #b3261e;
       }
 
-      .compact-grid {
-        display: grid;
-        grid-template-columns: repeat(3, minmax(0, 1fr));
-        gap: 10px;
-      }
-
-      .compact-grid label {
-        margin-top: 0;
-      }
-
       table {
         width: 100%;
         border-collapse: collapse;
@@ -771,8 +828,7 @@
 
       @media (max-width: 760px) {
         .grid,
-        .depth-grid,
-        .compact-grid {
+        .depth-grid {
           grid-template-columns: 1fr;
         }
 
@@ -805,7 +861,7 @@
       </details>
     </nav>
     <main>
-      <h1>Binance 统一交易测试台</h1>
+      <h1>Binance U 本位永续交易测试台</h1>
 
       <div class="environment-switcher">
         <strong>环境切换</strong>
@@ -815,11 +871,19 @@
           <span class="environment-switch-slider"></span>
         </label>
         <span>正式环境</span>
+        <span class="environment-switch-divider" aria-hidden="true"></span>
+        <label class="depth-level-label" for="depthLevelSelect"><strong>行情档位</strong></label>
+        <select id="depthLevelSelect" class="depth-level-select" aria-label="切换行情档位">
+          <option value="5">5档</option>
+          <option value="10">10档</option>
+          <option value="20" selected>20档</option>
+        </select>
+        <span id="depthLevelSwitchStatus" class="depth-level-switch-status">当前：20档</span>
         <span id="environmentSwitchStatus" class="environment-switch-status">读取中</span>
       </div>
 
       <div id="environmentWarning" class="warning">
-        默认连接 Binance Testnet。输入合约后，后台自动识别 Spot 或 USDⓈ-M，并选择对应接口。
+        默认连接 Binance U 本位永续 Testnet。所有行情、账户和交易操作均使用 USDⓈ-M 接口。
       </div>
       <section class="account-overview-panel">
         <h2>账号信息</h2>
@@ -848,7 +912,7 @@
       </section>
       <div class="chart-symbol-toolbar">
         <label for="chartSymbolInput">全局合约</label>
-        <input id="chartSymbolInput" value=" MUUSDT" autocomplete="off" spellcheck="false" />
+        <input id="chartSymbolInput" value="MUUSDT" autocomplete="off" spellcheck="false" />
         <button id="switchChartSymbolButton" type="button">切换行情</button>
         <span id="chartSymbolSwitchStatus" class="chart-symbol-status">当前：BTCUSDT</span>
         <span class="chart-latest-trade">
@@ -867,14 +931,46 @@
         双击行情画布中的有效买卖档位下单；数量或总价取自“下单”窗口，一次只提交一笔。
       </p>
       <p id="shortcutSummary" class="chart-order-status">
-        快捷键：Num 1 = 卖出限价单，Num 3 = 买入限价单，Num 5 = 撤销全部未成交订单，P = 一键平所有（分批卖出可直接兑换 USDT 的现货并平掉 U 本位持仓）。
+        快捷键：Num 1 = 卖出限价单，Num 3 = 买入限价单，Num 5 = 撤销全部 U 本位未成交订单，P = 一键平掉全部 U 本位持仓。
       </p>
+      <section class="zoom-chart-panel" aria-labelledby="zoomChartHeading">
+        <div class="chart-symbol-toolbar zoom-chart-toolbar">
+          <h2 id="zoomChartHeading">缩放行情</h2>
+          <label for="zoomDepthScale">横轴聚合</label>
+          <select id="zoomDepthScale" aria-label="切换缩放行情横轴聚合级别">
+            <option value="1" selected>1级</option>
+            <option value="5">5级</option>
+            <option value="10">10级</option>
+          </select>
+          <span class="chart-latest-trade">
+            最新成交价：<span id="zoomChartLatestTradePrice">-</span>
+          </span>
+        </div>
+        <p id="zoomChartStatus" class="chart-order-status" role="status" aria-live="polite">
+          当前：1级，等待行情数据
+        </p>
+        <div class="zoom-chart-canvas-scroll">
+          <div class="zoom-chart-canvas-stage">
+            <canvas
+              id="zoomChartCanvas"
+              width="980"
+              height="300"
+              aria-label="缩放行情，只读画布"
+              aria-describedby="zoomChartReadonlyNote"
+            ></canvas>
+            <div id="zoomMousebar" class="price-tick" style="display: none"></div>
+          </div>
+        </div>
+        <p id="zoomChartReadonlyNote" class="chart-order-status zoom-chart-readonly-note">
+          此画布仅供查看，不支持鼠标下单；行情仅聚合当前已接收的档位。
+        </p>
+      </section>
       <div class="grid">
         <section class="full">
-          <h2>当前持仓（现货 + U 本位永续）</h2>
+          <h2>U 本位永续当前持仓</h2>
           <p class="muted">
-            现货展示当前账号除 USDT 外余额不为 0 的资产；U 本位展示持仓数量不为 0 的永续合约。
-            每 2 秒向 Binance 复核，并在账户事件或成交后提前更新。只有两个市场连续两次完整返回零持仓，才会确认空仓。
+            展示当前账号持仓数量不为 0 的 U 本位永续合约。
+            每 2 秒向 Binance 复核，并在账户事件或成交后提前更新。连续两次完整返回零持仓后才会确认空仓。
           </p>
           <div id="positionSafetyBanner" class="position-safety-banner unknown" role="status" aria-live="polite">
             无法确认是否空仓：尚未获得 Binance 持仓快照
@@ -892,13 +988,12 @@
               <thead>
                 <tr>
                   <th>市场</th>
-                  <th>合约 / 资产</th>
+                  <th>合约</th>
                   <th>方向</th>
                   <th>持仓数量</th>
-                  <th>可用数量</th>
-                  <th>锁定 / 保证金</th>
+                  <th>保证金</th>
                   <th>开仓均价</th>
-                  <th>当前 / 标记价</th>
+                  <th>标记价</th>
                   <th>持仓价值 (USDT)</th>
                   <th>持仓盈亏 (USDT)</th>
                   <th>杠杆</th>
@@ -907,16 +1002,16 @@
                 </tr>
               </thead>
               <tbody id="currentPositionsBody">
-                <tr><td colspan="13">登录后自动加载当前持仓</td></tr>
+                <tr><td colspan="12">登录后自动加载当前持仓</td></tr>
               </tbody>
             </table>
           </div>
         </section>
 
         <section class="full">
-          <h2>普通订单记录</h2>
+          <h2>U 本位永续订单记录</h2>
           <p class="muted">
-            汇总当前账户最近 24 小时的现货与 U 本位普通订单；现货补查已知合约，U 本位直接查询全合约。
+            汇总当前账户最近 24 小时的 U 本位永续普通订单。
           </p>
           <div class="order-history-toolbar">
             <button id="refreshOrderHistoryButton">刷新订单记录</button>
@@ -946,7 +1041,7 @@
         </section>
 
         <section class="full">
-          <h2>交易回合</h2>
+          <h2>U 本位永续交易回合</h2>
           <p class="muted">
             只按 Binance 已确认的实际成交增量计算。多向成交 = 开多 + 平空，空向成交 = 开空 + 平多；
             两边手数相等时回合完成，超出的成交量自动进入该合约的下一个回合。多、空均价分别按对应方向的成交总价除以成交总手数动态计算。
@@ -993,23 +1088,23 @@
 
           <label for="positionEffect">仓位动作</label>
           <select id="positionEffect">
-            <option value="AUTO">自动（兼容现有行为）</option>
+            <option value="AUTO">自动判断</option>
             <option value="OPEN">开仓</option>
-            <option value="CLOSE">平仓（U 本位自动 reduceOnly）</option>
+            <option value="CLOSE">平仓（自动 reduceOnly）</option>
           </select>
           <p class="muted">
-            现货会忽略仓位动作；U 本位“平仓”会阻止委托扩大当前持仓。
+            U 本位“平仓”会阻止委托扩大当前持仓。
           </p>
 
           <label for="orderType">委托类型</label>
           <select id="orderType">
             <option value="LIMIT">LIMIT</option>
             <option value="MARKET">MARKET</option>
-            <option value="LIMIT_MAKER">LIMIT_MAKER</option>
-            <option value="STOP_LOSS">STOP_LOSS</option>
-            <option value="STOP_LOSS_LIMIT">STOP_LOSS_LIMIT</option>
+            <option value="STOP">STOP</option>
+            <option value="STOP_MARKET">STOP_MARKET</option>
             <option value="TAKE_PROFIT">TAKE_PROFIT</option>
-            <option value="TAKE_PROFIT_LIMIT">TAKE_PROFIT_LIMIT</option>
+            <option value="TAKE_PROFIT_MARKET">TAKE_PROFIT_MARKET</option>
+            <option value="TRAILING_STOP_MARKET">TRAILING_STOP_MARKET</option>
           </select>
 
           <label for="orderSizingMode">下单模式</label>
@@ -1029,11 +1124,11 @@
             当前按交易数量下单。快捷键始终使用配置中的手数。
           </p>
           <p class="warning">
-            所有新委托固定使用 EXPIRE_MAKER。现货跨子账号还必须具有相同且非 -1 的
-            tradeGroupId；U 本位接口仅在 IOC/GTC/GTD 下保证 STP 生效。
+            所有新委托固定使用 EXPIRE_MAKER 自成交保护。U 本位接口仅在
+            IOC/GTC/GTD 下保证 STP 生效。
           </p>
 
-          <label for="price">价格 price（LIMIT 必填）</label>
+          <label for="price">价格 price（LIMIT / STOP / TAKE_PROFIT 必填）</label>
           <div class="price-input-row">
             <input id="price" value="10000" />
             <label class="latest-price-option" for="latestTradePriceToggle">
@@ -1043,14 +1138,14 @@
             </label>
           </div>
 
-          <label for="stopPrice">触发价格 stopPrice（止盈止损）</label>
-          <input id="stopPrice" placeholder="可选" />
+          <label for="stopPrice">触发价格 stopPrice（条件单必填）</label>
+          <input id="stopPrice" placeholder="STOP / TAKE_PROFIT 类型必填" />
 
-          <label for="trailingDelta">追踪价差 trailingDelta（BIPS）</label>
-          <input id="trailingDelta" placeholder="追踪止盈止损可选" />
+          <label for="activationPrice">激活价格 activationPrice（跟踪止损可选）</label>
+          <input id="activationPrice" placeholder="TRAILING_STOP_MARKET 可选" />
 
-          <label for="icebergQty">冰山数量 icebergQty（需 GTC）</label>
-          <input id="icebergQty" placeholder="限价类订单可选" />
+          <label for="callbackRate">回调率 callbackRate（%）</label>
+          <input id="callbackRate" placeholder="TRAILING_STOP_MARKET 必填，0.1-10" />
 
           <div class="buttons">
             <button id="testOrderButton">仅测试参数</button>
@@ -1189,7 +1284,7 @@
         </section>
 
         <section class="full">
-          <h2>当前挂单（待成交订单）</h2>
+          <h2>U 本位永续当前挂单</h2>
           <p class="muted">通过 openOrders 查询真正处于 NEW 或 PARTIALLY_FILLED 状态的订单。</p>
           <div class="toolbar">
             <button id="refreshOpenOrdersButton">刷新当前挂单</button>
@@ -1200,7 +1295,7 @@
         </section>
 
         <section class="full">
-          <h2>单笔订单查询与修改</h2>
+          <h2>U 本位单笔订单查询与修改</h2>
           <div class="toolbar">
             <label for="queryOrderId">订单 ID</label><input id="queryOrderId" placeholder="orderId" />
             <label for="amendOrderQty">修改后数量</label><input id="amendOrderQty" placeholder="newQty" />
@@ -1214,9 +1309,9 @@
         </section>
 
         <section class="full">
-          <h2>账户成交历史</h2>
+          <h2>U 本位永续账户成交历史</h2>
           <p class="muted">
-            根据全局合约自动查询对应市场的账户成交明细；未成交的普通订单不会出现在这里。
+            查询全局合约的 U 本位永续账户成交明细；未成交的订单不会出现在这里。
           </p>
           <div class="trade-history-toolbar">
             <button id="refreshTradeHistoryButton">刷新成交历史</button>
@@ -1247,9 +1342,9 @@
         </section>
 
         <section class="full">
-          <h2>账户信息</h2>
+          <h2>U 本位永续账户信息</h2>
           <p class="muted">
-            根据全局合约自动查询对应市场的账户状态、交易权限和资产余额。
+            查询 U 本位永续账户状态、交易权限和保证金资产余额。
           </p>
           <div class="account-toolbar">
             <button id="refreshAccountButton">刷新账户信息</button>
@@ -1277,21 +1372,21 @@
             <dt>更新时间</dt>
             <dd id="accountUpdateTime">-</dd>
           </dl>
-          <h3>资产余额</h3>
+          <h3>U 本位保证金资产</h3>
           <div class="table-scroll">
             <table class="account-balance-table">
               <thead>
-                <tr><th>资产</th><th>可用余额</th><th>锁定余额</th></tr>
+                <tr><th>保证金资产</th><th>钱包余额</th><th>可用余额</th><th>未实现盈亏</th></tr>
               </thead>
               <tbody id="accountBalancesBody">
-                <tr><td colspan="3">点击“刷新账户信息”加载数据</td></tr>
+                <tr><td colspan="4">点击“刷新账户信息”加载数据</td></tr>
               </tbody>
             </table>
           </div>
         </section>
 
         <section class="full">
-          <h2>账户费率与下单限频</h2>
+          <h2>U 本位账户费率与下单限频</h2>
           <p class="muted">显示指定交易对手续费率，以及账户在各时间周期的未成交订单计数。</p>
           <div class="toolbar">
             <button id="refreshCommissionButton">刷新手续费率</button>
@@ -1302,45 +1397,19 @@
         </section>
 
         <section class="full">
-          <h2>组合订单（OCO / OTO / OTOCO）</h2>
-          <p class="muted">查询组合订单历史和当前组合挂单。“工作单价格”用于 OTO/OTOCO；上方/下方价格用于 OCO 部分。BUY OCO 还需填写上方触发价，SELL OCO 需填写下方触发价。</p>
-          <div class="compact-grid">
-            <label>方向<select id="ocoSide"><option value="SELL">SELL</option><option value="BUY">BUY</option></select></label>
-            <label>数量<input id="ocoQuantity" value="0.001" /></label>
-            <label>工作单价格（OTO/OTOCO）<input id="ocoWorkingPrice" placeholder="workingPrice" /></label>
-            <label>上方限价<input id="ocoAbovePrice" placeholder="abovePrice" /></label>
-            <label>上方触发价（BUY OCO）<input id="ocoAboveStopPrice" placeholder="aboveStopPrice" /></label>
-            <label>下方限价<input id="ocoBelowPrice" placeholder="belowPrice" /></label>
-            <label>下方触发价<input id="ocoBelowStopPrice" placeholder="belowStopPrice" /></label>
-          </div>
-          <div class="toolbar" style="margin-top: 12px">
-            <button id="placeOcoButton">创建 OCO</button>
-            <button id="placeOtoButton">创建 OTO</button>
-            <button id="placeOtocoButton">创建 OTOCO</button>
-            <button id="refreshAllOrderListsButton">刷新组合订单历史</button>
-            <button id="refreshOpenOrderListsButton">刷新当前组合挂单</button>
-            <label for="orderListId">组合订单 ID</label><input id="orderListId" placeholder="orderListId" />
-            <button id="queryOrderListButton">查询组合订单</button>
-            <button id="cancelOrderListButton" class="danger">撤销组合订单</button>
-            <span id="orderListsStatus">尚未加载</span>
-          </div>
-          <div class="table-scroll"><table><thead><tr><th>组合订单 ID</th><th>交易对</th><th>类型</th><th>列表状态</th><th>订单状态</th><th>子订单数</th><th>时间</th></tr></thead><tbody id="orderListsBody"><tr><td colspan="7">点击查询按钮加载数据</td></tr></tbody></table></div>
-        </section>
-
-        <section class="full">
-          <h2>实时账户事件</h2>
-          <p class="muted">通过 User Data Stream 实时接收 executionReport、outboundAccountPosition、balanceUpdate、listStatus 等事件。</p>
+          <h2>U 本位实时账户事件</h2>
+          <p class="muted">通过 U 本位 User Data Stream 实时接收订单、成交和账户更新事件。</p>
           <div class="toolbar">
             <button id="connectUserDataButton">连接账户事件</button>
             <button id="disconnectUserDataButton">断开账户事件</button>
             <button id="clearUserDataButton">清空事件</button>
             <span id="userDataStatus">未连接</span>
           </div>
-          <div class="table-scroll"><table><thead><tr><th>接收时间</th><th>事件类型</th><th>交易对 / 资产</th><th>状态</th><th>订单 ID</th><th>概要</th></tr></thead><tbody id="userDataBody"><tr><td colspan="6">连接后等待账户事件</td></tr></tbody></table></div>
+          <div class="table-scroll"><table><thead><tr><th>接收时间</th><th>事件类型</th><th>合约 / 保证金资产</th><th>状态</th><th>订单 ID</th><th>概要</th></tr></thead><tbody id="userDataBody"><tr><td colspan="6">连接后等待账户事件</td></tr></tbody></table></div>
         </section>
 
         <section>
-          <h2>十档深度连接</h2>
+          <h2>深度行情连接</h2>
           <p class="muted">使用页面最上方的“全局合约”。</p>
           <div class="buttons">
             <button id="connectMarketButton">连接深度行情</button>
@@ -1357,7 +1426,7 @@
         </section>
 
         <section class="full">
-          <h2>十档订单簿</h2>
+          <h2>订单簿</h2>
           <div class="depth-grid">
             <div>
               <h3>买盘 Bids</h3>
@@ -1402,7 +1471,7 @@
         <h2 id="shortcutDialogTitle">快捷键设置</h2>
         <p class="muted">当前生效的快捷键规则。新增、编辑或删除后会立即保存到本地 JSON 配置文件。</p>
         <div class="warning danger">
-          快捷键会直接提交或撤销委托。“一键平所有”会撤销现货与 U 本位挂单，分批市价卖出具有直接 USDT 交易对的现货资产，并提交 U 本位市价 reduceOnly 平仓单；遇到明确的限流拒绝会显示等待时间并自动续跑，无法直接交易、锁定或低于交易限制的资产会在结果中单独列出。
+          快捷键会直接提交或撤销 U 本位委托。“一键平所有”会撤销全部 U 本位挂单，并为每个持仓提交市价 reduceOnly 平仓单；遇到明确的限流拒绝会显示等待时间并自动续跑。
         </div>
         <div class="table-scroll">
           <table class="shortcut-table">
@@ -1475,6 +1544,7 @@
     <script src="./openOrderState.js"></script>
     <script src="./cancelAllOrderTargets.js"></script>
     <script src="./chartOrderSelection.js"></script>
+    <script src="./depthAggregation.js"></script>
     <script src="./renderer.js"></script>
   </body>
 </html>

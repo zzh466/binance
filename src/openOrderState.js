@@ -15,8 +15,9 @@
   ]);
 
   function normalizeOpenOrder(order = {}, receivedAt = Date.now()) {
+    if (order.marketType && order.marketType !== "futures") return null;
     const normalized = {
-      marketType: order.marketType || null,
+      marketType: "futures",
       symbol: String(order.symbol ?? order.s ?? "").toUpperCase(),
       orderId: order.orderId ?? order.i,
       clientOrderId:
@@ -40,7 +41,7 @@
   }
 
   function openOrderKey(order) {
-    return `${order.marketType || "auto"}:${order.symbol}:${order.orderId}`;
+    return `${order.symbol}:${order.orderId}`;
   }
 
   function isOpenOrder(order) {
@@ -54,12 +55,6 @@
 
   function isSameOrder(left, right) {
     if (!left || !right || left.symbol !== right.symbol) return false;
-    if (
-      left.marketType && right.marketType &&
-      left.marketType !== right.marketType
-    ) {
-      return false;
-    }
     const sameOrderId =
       left.orderId !== undefined && right.orderId !== undefined &&
       String(left.orderId) === String(right.orderId);
@@ -138,7 +133,7 @@
         const terminalOrder = matchingOrder
           ? {
             ...normalized,
-            marketType: normalized.marketType || matchingOrder.marketType,
+            marketType: "futures",
             clientOrderId:
               normalized.clientOrderId || matchingOrder.clientOrderId,
           }

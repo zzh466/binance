@@ -34,7 +34,7 @@ test("页面文件热刷新，后台交易代码触发 Electron 重启", () => {
   assert.equal(shouldRestartElectron("src\\preload.js"), false);
   assert.equal(shouldRestartElectron("src/main.js"), true);
   assert.equal(
-    shouldRestartElectron("src\\binance\\binanceSpotClient.js"),
+    shouldRestartElectron("src\\binance\\binanceUsdMClient.js"),
     true
   );
 });

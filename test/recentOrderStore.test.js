@@ -22,7 +22,7 @@ function createTemporaryStore(t, now) {
   return { store, filePath };
 }
 
-test("现货和 U 本位订单使用同一个最近 24 小时状态库并按市场隔离", (t) => {
+test("不同 U 本位合约订单使用同一个最近 24 小时状态库", (t) => {
   const now = new Date(2026, 8, 2, 12, 0, 0).getTime();
   const { store } = createTemporaryStore(t, now);
   const common = {
@@ -31,11 +31,11 @@ test("现货和 U 本位订单使用同一个最近 24 小时状态库并按市�
   };
 
   store.upsert({
-    symbol: "BTCUSDT",
+    symbol: "ETHUSDT",
     orderId: 7,
     status: "FILLED",
     updateTime: now,
-  }, { ...common, marketType: "spot", source: "user-data-stream" });
+  }, { ...common, marketType: "futures", source: "user-data-stream" });
   store.upsert({
     s: "BTCUSDT",
     i: 7,
@@ -52,7 +52,7 @@ test("现货和 U 本位订单使用同一个最近 24 小时状态库并按市�
     orders.map((order) => [order.marketType, order.status, order.terminal]).sort(),
     [
       ["futures", "CANCELED", true],
-      ["spot", "FILLED", true],
+      ["futures", "FILLED", true],
     ]
   );
 });
@@ -63,7 +63,7 @@ test("订单状态按时间合并且 ACK 不会覆盖已经收到的最终状态
   const context = {
     environment: "testnet",
     accountFingerprint: "account-2",
-    marketType: "spot",
+    marketType: "futures",
   };
 
   store.upsert({
@@ -92,7 +92,7 @@ test("订单后续状态刷新不会丢失最初的下单触发来源", (t) => {
   const context = {
     environment: "testnet",
     accountFingerprint: "account-4",
-    marketType: "spot",
+    marketType: "futures",
   };
 
   store.upsert({

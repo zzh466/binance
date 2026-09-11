@@ -48,7 +48,7 @@ test("已经结束的已知订单会在本地阻止重复撤单", () => {
       orderId: "8",
     }, [{
       symbol: "BTCUSDT",
-      marketType: "spot",
+      marketType: "futures",
       orderId: 8,
       status: "FILLED",
     }]),
@@ -72,6 +72,6 @@ test("订单 ID 在多个合约都有未成交订单时拒绝猜测", () => {
 test("本地没有记录的手工撤单仍沿用用户输入", () => {
   assert.deepEqual(
     resolveCancelOrderRequest({ symbol: "btcusdt", orderId: "10" }, []),
-    { symbol: "BTCUSDT", orderId: "10", marketType: undefined }
+    { symbol: "BTCUSDT", orderId: "10", marketType: "futures" }
   );
 });

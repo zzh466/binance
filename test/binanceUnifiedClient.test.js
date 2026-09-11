@@ -1,6 +1,6 @@
 const assert = require("node:assert/strict");
 const test = require("node:test");
-const { BinanceApiError } = require("../src/binance/binanceSpotClient");
+const { BinanceApiError } = require("../src/binance/binanceClientBase");
 const {
   BinanceUsdMClient,
   FUTURES_REST_BASE,
@@ -11,7 +11,6 @@ const {
 const {
   BinanceUnifiedClient,
   MARKET_FUTURES,
-  MARKET_SPOT,
 } = require("../src/binance/binanceUnifiedClient");
 
 function futuresSymbol(symbol = "SKHYUSDT") {
@@ -93,7 +92,7 @@ test("USDⓈ-M 全部订单查询允许省略 symbol", async () => {
   client.close();
 });
 
-test("永续下单通过 WebSocket 并映射 Spot 风格止损限价类型", async () => {
+test("永续原生 STOP 下单通过 WebSocket Algo Order 接口", async () => {
   const client = new BinanceUsdMClient({
     apiKey: "future-key",
     apiSecret: "future-secret",
@@ -131,7 +130,7 @@ test("永续下单通过 WebSocket 并映射 Spot 风格止损限价类型", asy
   const result = await client.placeOrder({
     symbol: "SKHYUSDT",
     side: "SELL",
-    type: "STOP_LOSS_LIMIT",
+    type: "STOP",
     quantity: "0.0319",
     price: "200.19",
     stopPrice: "199.99",
@@ -158,27 +157,21 @@ test("永续下单通过 WebSocket 并映射 Spot 风格止损限价类型", asy
   client.close();
 });
 
-test("统一客户端把现货和合约 LinkID 分别传给对应底层客户端", () => {
+test("纯 U 本位客户端把 Futures LinkID 传给底层客户端", () => {
   const client = new BinanceUnifiedClient({
-    spotBrokerLinkId: "P8DHAU8C",
     futuresBrokerLinkId: "tdk3UjFd",
   });
 
-  assert.equal(client.spot.brokerLinkId, "P8DHAU8C");
   assert.equal(client.futures.brokerLinkId, "tdk3UjFd");
+  assert.equal(client.spot, undefined);
   client.close();
 });
 
-test("统一客户端把现货和永续的延迟事件路由到同一出口", async () => {
+test("纯 U 本位客户端把 Futures 延迟事件路由到统一出口", async () => {
   const client = new BinanceUnifiedClient();
   const updates = [];
   client.on("latency-update", (payload) => updates.push(payload));
 
-  client.spot.emit("latency-update", {
-    operation: "GET /v3/time",
-    transport: "https-keepalive",
-    elapsedMs: 12.345,
-  });
   client.futures.emit("latency-update", {
     operation: "ping/pong 心跳",
     transport: "websocket-heartbeat",
@@ -187,12 +180,6 @@ test("统一客户端把现货和永续的延迟事件路由到同一出口", as
   });
 
   assert.deepEqual(updates, [
-    {
-      marketType: MARKET_SPOT,
-      operation: "GET /v3/time",
-      transport: "https-keepalive",
-      elapsedMs: 12.345,
-    },
     {
       marketType: MARKET_FUTURES,
       operation: "ping/pong 心跳",
@@ -204,31 +191,13 @@ test("统一客户端把现货和永续的延迟事件路由到同一出口", as
   client.close();
 });
 
-test("最近 24 小时全账户同步汇总现货已知合约和 U 本位全合约订单", async () => {
+test("最近 24 小时全账户同步查询 U 本位全合约订单", async () => {
   const client = new BinanceUnifiedClient({
-    spotCredentials: { apiKey: "spot-key", apiSecret: "spot-secret" },
     futuresCredentials: { apiKey: "futures-key", apiSecret: "futures-secret" },
   });
   const startTime = 1_000;
   const endTime = startTime + 24 * 60 * 60 * 1000;
-  const queriedSpotSymbols = [];
   let futuresQuery;
-  client.spot.openOrders = async () => ([{
-    symbol: "BTCUSDT",
-    orderId: 1,
-    status: "NEW",
-  }]);
-  client.spot.allOrders = async (options) => {
-    queriedSpotSymbols.push(options.symbol);
-    assert.equal(options.startTime, startTime);
-    assert.equal(options.endTime, endTime);
-    assert.equal(options.limit, 1_000);
-    return [{
-      symbol: options.symbol,
-      orderId: options.symbol === "BTCUSDT" ? 1 : 2,
-      status: options.symbol === "BTCUSDT" ? "NEW" : "FILLED",
-    }];
-  };
   client.futures.allOrders = async (options) => {
     futuresQuery = options;
     return [{ symbol: "SOLUSDT", orderId: 3, status: "CANCELED" }];
@@ -239,22 +208,16 @@ test("最近 24 小时全账户同步汇总现货已知合约和 U 本位全合�
   const result = await client.recentAccountOrders({
     startTime,
     endTime,
-    knownSpotSymbols: ["ETHUSDT"],
   });
 
-  assert.deepEqual(queriedSpotSymbols.sort(), ["BTCUSDT", "ETHUSDT"]);
   assert.equal(futuresQuery.symbol, undefined);
   assert.equal(futuresQuery.startTime, startTime);
-  assert.equal(result.orders.length, 3);
+  assert.equal(result.orders.length, 1);
   assert.deepEqual(
     result.orders.map(({ marketType, symbol }) => [marketType, symbol]).sort(),
-    [
-      [MARKET_FUTURES, "SOLUSDT"],
-      [MARKET_SPOT, "BTCUSDT"],
-      [MARKET_SPOT, "ETHUSDT"],
-    ]
+    [[MARKET_FUTURES, "SOLUSDT"]]
   );
-  assert.equal(result.markets.spot.orderCount, 2);
+  assert.equal(result.markets.spot, undefined);
   assert.equal(result.markets.futures.orderCount, 1);
   assert.deepEqual(result.warnings, []);
   client.close();
@@ -297,16 +260,11 @@ test("U 本位测试服务要求 symbol 时按已知合约自动回退", async (
   client.close();
 });
 
-test("未指定合约时同时连接现货和 U 本位账户订单事件", async () => {
+test("未指定合约时只连接 U 本位账户订单事件", async () => {
   const client = new BinanceUnifiedClient({
-    spotCredentials: { apiKey: "spot-key", apiSecret: "spot-secret" },
     futuresCredentials: { apiKey: "futures-key", apiSecret: "futures-secret" },
   });
   const connectedMarkets = [];
-  client.spot.connectUserData = async () => {
-    connectedMarkets.push(MARKET_SPOT);
-    return { subscriptionId: "spot-subscription" };
-  };
   client.futures.connectUserData = async () => {
     connectedMarkets.push(MARKET_FUTURES);
     return { subscriptionId: "futures-subscription" };
@@ -314,10 +272,9 @@ test("未指定合约时同时连接现货和 U 本位账户订单事件", async
 
   const result = await client.connectUserData();
 
-  assert.deepEqual(connectedMarkets.sort(), [MARKET_FUTURES, MARKET_SPOT]);
-  assert.equal(result.connected.spot.marketType, MARKET_SPOT);
-  assert.equal(result.connected.futures.marketType, MARKET_FUTURES);
-  assert.deepEqual(result.failedMarketTypes, []);
+  assert.deepEqual(connectedMarkets, [MARKET_FUTURES]);
+  assert.equal(result.marketType, MARKET_FUTURES);
+  assert.equal(result.subscriptionId, "futures-subscription");
   client.close();
 });
 
@@ -352,28 +309,12 @@ test("永续 exchangeInfo 过期后立即复用旧缓存并刷新全市场快照
   client.close();
 });
 
-test("统一市场路由过期后先复用结果，不阻塞报单链路", async () => {
+test("纯 U 本位客户端拒绝现货市场类型", async () => {
   const client = new BinanceUnifiedClient();
-  const cached = {
-    symbol: "BTCUSDT",
-    marketType: MARKET_SPOT,
-    client: client.spot,
-    exchangeInfo: { symbol: { symbol: "BTCUSDT" } },
-    resolvedAt: Date.now() - 600_000,
-  };
-  client.marketResolutionCache.set("auto:BTCUSDT", cached);
-  let resolveRefresh;
-  client.spot.exchangeInfo = async () => new Promise((resolve) => {
-    resolveRefresh = resolve;
-  });
-
-  const result = await client.resolveMarket("BTCUSDT");
-
-  assert.equal(result, cached);
-  const refreshPromise = client.marketResolutionRefreshPromises.get("auto:BTCUSDT");
-  resolveRefresh({ symbol: { symbol: "BTCUSDT" } });
-  await refreshPromise;
-  assert.ok(client.marketResolutionCache.get("auto:BTCUSDT").resolvedAt > cached.resolvedAt);
+  await assert.rejects(
+    client.resolveMarket("BTCUSDT", { marketType: "spot" }),
+    /仅支持 U 本位永续/
+  );
   client.close();
 });
 
@@ -601,20 +542,17 @@ test("最近订单查询达到上限时按时间二分补齐而不是截断", as
 
 test("STP 安全状态会识别 tradeGroupId=-1 与期望交易组不匹配", async () => {
   const client = new BinanceUnifiedClient({
-    spotCredentials: { apiKey: "spot", apiSecret: "secret" },
     futuresCredentials: { apiKey: "future", apiSecret: "secret" },
-    expectedSpotTradeGroupId: "8",
     expectedFuturesTradeGroupId: "9",
   });
-  client.spot.accountStatus = async () => ({ tradeGroupId: -1 });
   client.futures.accountStatus = async () => ({ tradeGroupId: 7 });
 
   const result = await client.tradingSafetyStatus();
 
   assert.equal(result.crossAccountReady, false);
-  assert.equal(result.markets.spot.crossAccountProtected, false);
+  assert.equal(result.markets.spot, undefined);
   assert.equal(result.markets.futures.matchesExpected, false);
-  assert.equal(result.warnings.length, 2);
+  assert.equal(result.warnings.length, 1);
   client.close();
 });
 
@@ -633,17 +571,18 @@ test("USDⓈ-M MARKET 与 GTX 会明确标记 STP 不在官方保证范围", asy
     type: "MARKET",
     quantity: "0.1",
   }, { testOnly: true });
-  const limitMaker = await client.placeOrder({
+  const postOnly = await client.placeOrder({
     symbol: "SKHYUSDT",
     side: "SELL",
-    type: "LIMIT_MAKER",
+    type: "LIMIT",
+    timeInForce: "GTX",
     quantity: "0.1",
     price: "200",
   }, { testOnly: true });
 
   assert.equal(market.selfTradePrevention.mode, "EXPIRE_MAKER");
   assert.equal(market.selfTradePrevention.apiEffective, false);
-  assert.equal(limitMaker.selfTradePrevention.apiEffective, false);
+  assert.equal(postOnly.selfTradePrevention.apiEffective, false);
   client.close();
 });
 
@@ -900,11 +839,8 @@ test("真实下单已写入 WebSocket 后响应丢失时不会用 HTTP 重复报
   client.close();
 });
 
-test("统一客户端在现货返回 Invalid symbol 后自动路由到 USDⓈ-M", async () => {
+test("纯 U 本位客户端直接把订单路由到 USDⓈ-M", async () => {
   const client = new BinanceUnifiedClient({ testnet: false });
-  client.spot.exchangeInfo = async () => {
-    throw new BinanceApiError("Invalid symbol.", { code: -1121, status: 400 });
-  };
   client.futures.exchangeInfo = async () => ({
     marketType: MARKET_FUTURES,
     symbol: futuresSymbol(),
@@ -921,28 +857,24 @@ test("统一客户端在现货返回 Invalid symbol 后自动路由到 USDⓈ-M"
   client.close();
 });
 
-test("同名合约同时存在时默认保留现货路由", async () => {
+test("显式请求现货市场会被拒绝", async () => {
   const client = new BinanceUnifiedClient({ testnet: false });
-  client.spot.exchangeInfo = async () => ({
-    symbol: { symbol: "BTCUSDT", status: "TRADING" },
-  });
-  client.futures.exchangeInfo = async () => {
-    throw new Error("同名合约不应继续查询 Futures");
-  };
-
-  const result = await client.resolveMarket("BTCUSDT");
-  assert.equal(result.marketType, MARKET_SPOT);
+  await assert.rejects(
+    client.resolveMarket("BTCUSDT", { marketType: "spot" }),
+    /仅支持 U 本位永续/
+  );
+  await assert.rejects(
+    client.placeOrder({ symbol: "BTCUSDT", marketType: "spot" }),
+    /仅支持 U 本位永续/
+  );
   client.close();
 });
 
-test("已查询订单携带的内部市场类型可精确路由撤单", async () => {
+test("已查询 U 本位订单可以直接路由撤单", async () => {
   const client = new BinanceUnifiedClient({ testnet: false });
   client.futures.exchangeInfo = async () => ({
     symbol: futuresSymbol("BTCUSDT"),
   });
-  client.spot.cancelAllOpenOrders = async () => {
-    throw new Error("不应撤销现货订单");
-  };
   client.futures.cancelAllOpenOrders = async () => ([{
     symbol: "BTCUSDT",
     orderId: 3,
@@ -1086,153 +1018,9 @@ test("一键平所有有委托失败或仍有持仓时不会误报已全部平�
   client.close();
 });
 
-test("一键平所有会先撤现货挂单，再把全部非 USDT 可用余额市价卖出", async () => {
-  const client = new BinanceUnifiedClient({
-    testnet: false,
-    spotCredentials: {
-      apiKey: "spot-key",
-      apiSecret: "spot-secret",
-    },
-  });
-  const initialAccount = {
-    balances: [
-      { asset: "USDT", free: "100", locked: "0" },
-      { asset: "ETH", free: "2", locked: "1" },
-    ],
-  };
-  const unlockedAccount = {
-    balances: [
-      { asset: "USDT", free: "100", locked: "0" },
-      { asset: "ETH", free: "3", locked: "0" },
-    ],
-  };
-  const flatAccount = {
-    balances: [{ asset: "USDT", free: "10100", locked: "0" }],
-  };
-  client.spot.exchangeInfoCatalog = async () => [{
-    symbol: "ETHUSDT",
-    status: "TRADING",
-    baseAsset: "ETH",
-    quoteAsset: "USDT",
-  }];
-  const accounts = [initialAccount, unlockedAccount, flatAccount, flatAccount];
-  client.spot.accountStatus = async () => accounts.shift();
-  let openOrderQueryCount = 0;
-  client.spot.openOrders = async () => {
-    openOrderQueryCount += 1;
-    return openOrderQueryCount === 1
-      ? [{ symbol: "ETHUSDT", orderId: 10, status: "NEW" }]
-      : [];
-  };
-  const canceledSymbols = [];
-  client.spot.cancelAllOpenOrders = async ({ symbol }) => {
-    canceledSymbols.push(symbol);
-    return [{ symbol, orderId: 10, status: "CANCELED" }];
-  };
-  const submitted = [];
-  client.spot.placeOrder = async (order) => {
-    submitted.push(order);
-    return { symbol: order.symbol, orderId: 11, status: "ACKNOWLEDGED" };
-  };
-
-  const result = await client.closeAllSpotPositions({
-    verificationDelays: [0, 0],
-  });
-
-  assert.deepEqual(canceledSymbols, ["ETHUSDT"]);
-  assert.deepEqual(submitted, [{
-    symbol: "ETHUSDT",
-    side: "SELL",
-    type: "MARKET",
-    quantity: "3",
-    newOrderRespType: "ACK",
-  }]);
-  assert.equal(result.verifiedFlat, true);
-  assert.equal(result.assetFlatConfirmations, 2);
-  assert.equal(result.remainingAssets.length, 0);
-  assert.equal(result.remainingOpenOrders.length, 0);
-  assert.equal(result.orders.length, 2);
-  assert.equal(result.orders.every(({ marketType }) => marketType === MARKET_SPOT), true);
-  client.close();
-});
-
-test("一键平所有遇到明确的 429 拒绝会等待并自动续跑该资产", async () => {
-  const client = new BinanceUnifiedClient({
-    testnet: false,
-    spotCredentials: {
-      apiKey: "spot-key",
-      apiSecret: "spot-secret",
-    },
-  });
-  const openAccount = {
-    balances: [
-      { asset: "USDT", free: "100", locked: "0" },
-      { asset: "ETH", free: "1", locked: "0" },
-    ],
-  };
-  const flatAccount = {
-    balances: [{ asset: "USDT", free: "1100", locked: "0" }],
-  };
-  const accounts = [openAccount, openAccount, flatAccount, flatAccount];
-  client.spot.accountStatus = async () => accounts.shift();
-  client.spot.openOrders = async () => [];
-  client.spot.exchangeInfoCatalog = async () => [{
-    symbol: "ETHUSDT",
-    status: "TRADING",
-    baseAsset: "ETH",
-    quoteAsset: "USDT",
-  }];
-  let attempts = 0;
-  client.spot.placeOrder = async (order) => {
-    attempts += 1;
-    if (attempts === 1) {
-      throw new BinanceApiError("Too many requests", {
-        status: 429,
-        code: -1003,
-        data: { banUntil: Date.now() + 1 },
-      });
-    }
-    return { symbol: order.symbol, orderId: 19, status: "ACKNOWLEDGED" };
-  };
-  const waits = [];
-
-  const result = await client.closeAllSpotPositions({
-    verificationDelays: [0, 0],
-    waitFn: async (milliseconds) => waits.push(milliseconds),
-  });
-
-  assert.equal(result.verifiedFlat, true);
-  assert.equal(attempts, 2);
-  assert.equal(result.rateLimitWaitCount, 1);
-  assert.equal(waits.some((milliseconds) => milliseconds >= 1_000), true);
-  client.close();
-});
-
-test("一键平所有会区分无 USDT 交易对、锁定余额和可卖出现货", () => {
-  const client = new BinanceUnifiedClient({ testnet: false });
-  const classified = client.classifySpotAssetsForLiquidation([
-    { asset: "ETH", symbol: "ETHUSDT", free: "2", locked: "0", total: "2" },
-    { asset: "AED", symbol: "AEDUSDT", free: "10", locked: "0", total: "10" },
-    { asset: "BNB", symbol: "BNBUSDT", free: "0", locked: "1", total: "1" },
-  ], [{
-    symbol: "ETHUSDT",
-    status: "TRADING",
-    baseAsset: "ETH",
-    quoteAsset: "USDT",
-  }]);
-
-  assert.deepEqual(classified.sellableAssets.map(({ asset }) => asset), ["ETH"]);
-  assert.deepEqual(classified.nonTradableAssets.map(({ asset }) => asset), ["AED"]);
-  assert.deepEqual(classified.lockedAssets.map(({ asset }) => asset), ["BNB"]);
-  client.close();
-});
-
-test("一键平所有会同时执行现货和 U 本位，任一市场失败都不会报全部成功", async () => {
+test("一键平所有只执行 U 本位清仓并透传复核结果", async () => {
   const client = new BinanceUnifiedClient({ testnet: false });
   let futuresCalled = false;
-  client.closeAllSpotPositions = async () => {
-    throw new BinanceApiError("现货查询失败", { code: -1000 });
-  };
   client.closeAllFuturesPositions = async () => {
     futuresCalled = true;
     return {
@@ -1240,16 +1028,18 @@ test("一键平所有会同时执行现货和 U 本位，任一市场失败都�
       verifiedFlat: true,
       remainingPositions: [],
       remainingOpenOrders: [],
-      orders: [{ symbol: "BTCUSDT", orderId: 12, marketType: MARKET_FUTURES }],
+      orders: [{
+        symbol: "BTCUSDT",
+        orderId: 12,
+        marketType: MARKET_FUTURES,
+      }],
     };
   };
 
   const result = await client.closeAllPositions();
 
   assert.equal(futuresCalled, true);
-  assert.equal(result.verifiedFlat, false);
-  assert.equal(result.markets.spot.verifiedFlat, false);
-  assert.equal(result.markets.spot.error.code, -1000);
+  assert.equal(result.verifiedFlat, true);
   assert.equal(result.markets.futures.verifiedFlat, true);
   assert.equal(result.orders.length, 1);
   client.close();
@@ -1274,6 +1064,11 @@ test("永续 ORDER_TRADE_UPDATE 被转换为现有界面可消费的 executionRe
       l: "0",
       z: "0",
       ap: "199.5",
+      rp: "1.25",
+      ma: "USDT",
+      n: "0.05",
+      N: "USDT",
+      t: 99,
     },
   });
 
@@ -1282,10 +1077,14 @@ test("永续 ORDER_TRADE_UPDATE 被转换为现有界面可消费的 executionRe
   assert.equal(result.i, 9);
   assert.equal(result.X, "NEW");
   assert.equal(result.ap, "199.5");
+  assert.equal(result.rp, "1.25");
+  assert.equal(result.ma, "USDT");
+  assert.equal(result.n, "0.05");
+  assert.equal(result.t, 99);
   client.close();
 });
 
-test("永续十档部分深度事件直接转换为页面行情", () => {
+test("永续默认使用二十档部分深度并转换为页面行情", () => {
   const client = new BinanceUsdMClient();
   let update;
   client.once("depth-update", (payload) => {
@@ -1302,10 +1101,79 @@ test("永续十档部分深度事件直接转换为页面行情", () => {
     a: [["50001", "3"]],
   });
 
-  assert.equal(client.getDepthStreamName("BTCUSDT"), "btcusdt@depth10@100ms");
+  assert.equal(client.getDepthStreamName("BTCUSDT"), "btcusdt@depth20@100ms");
+  assert.equal(update.streamLevels, 20);
+  assert.equal(update.displayLevels, 20);
   assert.equal(update.firstUpdateId, 105);
   assert.equal(update.finalUpdateId, 110);
   assert.deepEqual(update.bids[0], { price: "50000", quantity: "2" });
   assert.deepEqual(update.asks[0], { price: "50001", quantity: "3" });
+  client.close();
+});
+
+test("永续部分深度只允许在五、十、二十档之间切换", () => {
+  const client = new BinanceUsdMClient();
+  const levels = Array.from({ length: 20 }, (_, index) => [
+    String(50_000 - index),
+    String(index + 1),
+  ]);
+
+  for (const depthLevels of [5, 10, 20]) {
+    let update;
+    client.once("depth-update", (payload) => {
+      update = payload;
+    });
+    client.setDepthLevels(String(depthLevels));
+    client.emitPartialDepthUpdate({
+      e: "depthUpdate",
+      s: "BTCUSDT",
+      U: 1,
+      u: 2,
+      b: levels,
+      a: levels,
+    });
+
+    assert.equal(
+      client.getDepthStreamName("BTCUSDT"),
+      `btcusdt@depth${depthLevels}@100ms`
+    );
+    assert.equal(update.bids.length, depthLevels);
+    assert.equal(update.asks.length, depthLevels);
+    assert.equal(update.displayLevels, depthLevels);
+  }
+
+  assert.throws(
+    () => client.setDepthLevels(15),
+    /只支持 5、10 或 20 档/
+  );
+  assert.equal(client.depthStreamLevels, 20);
+  client.close();
+});
+
+test("运行时切换行情档位会按当前 U 本位合约重连", async () => {
+  const client = new BinanceUnifiedClient();
+  client.activeSymbol = "BTCUSDT";
+  const connections = [];
+  client.futures.connectDepth = async (symbol) => {
+    connections.push({ symbol, stream: client.futures.getDepthStreamName(symbol) });
+    return {
+      symbol,
+      stream: client.futures.getDepthStreamName(symbol),
+      depthMode: client.depthMode,
+      streamLevels: client.depthStreamLevels,
+      displayLevels: client.depthDisplayLevels,
+    };
+  };
+
+  const result = await client.setDepthLevels(5);
+
+  assert.deepEqual(connections, [{
+    symbol: "BTCUSDT",
+    stream: "btcusdt@depth5@100ms",
+  }]);
+  assert.equal(result.streamLevels, 5);
+  assert.equal(result.displayLevels, 5);
+  assert.equal(result.reconnected, true);
+  assert.equal(result.marketType, MARKET_FUTURES);
   client.close();
 });

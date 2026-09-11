@@ -326,8 +326,8 @@ test("Algo 更新和触发后的普通订单使用 actualOrderId 去重", (t) =>
   assert.equal(store.list()[0].shortQty, "5");
 });
 
-test("现货卖出归类为平多，U 本位 reduceOnly 买入归类为平空", () => {
-  assert.equal(resolveExecutionAction({ side: "SELL" }, "spot"), "CLOSE_LONG");
+test("U 本位普通卖出归类开空，reduceOnly 买入归类平空", () => {
+  assert.equal(resolveExecutionAction({ side: "SELL" }, "futures"), "OPEN_SHORT");
   assert.equal(
     resolveExecutionAction({ side: "BUY", R: true }, "futures"),
     "CLOSE_SHORT"

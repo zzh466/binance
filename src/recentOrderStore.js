@@ -34,7 +34,7 @@ function normalizeRecentOrder(order, context = {}, now = Date.now()) {
   if (!order || typeof order !== "object") return null;
 
   const marketType = String(
-    firstPresent(order.marketType, context.marketType, "")
+    firstPresent(order.marketType, context.marketType, "futures")
   ).toLowerCase();
   const symbol = String(firstPresent(order.symbol, order.s, "")).toUpperCase();
   const orderId = firstPresent(order.orderId, order.i);
@@ -44,7 +44,11 @@ function normalizeRecentOrder(order, context = {}, now = Date.now()) {
     order.newClientOrderId,
     ""
   ));
-  if (!marketType || !symbol || (orderId === undefined && !clientOrderId)) {
+  if (
+    marketType !== "futures" ||
+    !symbol ||
+    (orderId === undefined && !clientOrderId)
+  ) {
     return null;
   }
 
@@ -214,7 +218,9 @@ class RecentOrderStore {
       const payload = JSON.parse(fs.readFileSync(this.filePath, "utf8"));
       const orders = Array.isArray(payload?.orders) ? payload.orders : [];
       for (const order of orders) {
-        if (order?.key) this.orders.set(order.key, order);
+        if (order?.key && order.marketType === "futures") {
+          this.orders.set(order.key, order);
+        }
       }
       if (this.prune()) this.scheduleSave();
     } catch {

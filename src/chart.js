@@ -67,6 +67,7 @@ class Chart {
         this.decimal = decimal;
         this.placeOrder=[];
         this.traded ={};
+        this.depthRenderId = 0;
         this.init();
     }
 
@@ -120,7 +121,18 @@ class Chart {
         this.UpperLimitindex = undefined;
         this.placeOrder = [];
         this.traded = {};
+        this.depthRenderId = 0;
         this.init();
+    }
+    setStep(step){
+        const normalizedStep = Number(step);
+        if(!Number.isFinite(normalizedStep) || normalizedStep <= 0){
+            throw new TypeError('行情价格步长必须是大于 0 的数字');
+        }
+        this.step = normalizedStep;
+        this.decimal = (String(step).split('.')[1] || '').length;
+        this.reset();
+        return this.step;
     }
     setColor(type){
         if(type){
@@ -292,6 +304,22 @@ class Chart {
         ctx.fillRect(_x, y, buyIndex *barWidth + barWidth,this.height);
         ctx.fillStyle = ASKBACKGROUND;
         ctx.fillRect(_x + askIndex *barWidth, y, this.width- _x - askIndex *barWidth - 30 , this.height);
+        if(this.buyIndex === this.askIndex){
+            const sharedIndex = this.buyIndex - start;
+            if(sharedIndex >= 0 && sharedIndex <= this.count){
+                const sharedX = _x + sharedIndex * barWidth;
+                const buyWidth = Math.floor(barWidth / 2);
+                ctx.fillStyle = BUYBACKGROUND;
+                ctx.fillRect(sharedX, y, buyWidth, this.height);
+                ctx.fillStyle = ASKBACKGROUND;
+                ctx.fillRect(
+                    sharedX + buyWidth,
+                    y,
+                    barWidth - buyWidth,
+                    this.height
+                );
+            }
+        }
         for(let i = start; (i-start) <= this.count; i ++ ){
             if(!this.data[i]){
                 console.log(i, JSON.parse(JSON.stringify(this.data)))
@@ -361,7 +389,66 @@ class Chart {
                 console.log(i, JSON.parse(JSON.stringify(this.data)))
                 continue;
             }
-            const { volum, type, isone} = this.data[i];
+            const depthItem = this.data[i];
+            const overlappingBuyVolume =
+                depthItem.buyDepthRenderId === this.depthRenderId
+                    ? depthItem.buyDepthVolume
+                    : null;
+            const overlappingAskVolume =
+                depthItem.askDepthRenderId === this.depthRenderId
+                    ? depthItem.askDepthVolume
+                    : null;
+            if(
+                Number(overlappingBuyVolume) > 0 &&
+                Number(overlappingAskVolume) > 0
+            ){
+                const x = _x + (i-this.start) * barWidth;
+                const availableWidth = Math.max(2, barWidth - 1);
+                const buyWidth = Math.floor(availableWidth / 2);
+                const askWidth = availableWidth - buyWidth;
+                ctx.fillStyle = i === buyIndex
+                    ? VALUECOLOR['buy1']
+                    : VALUECOLOR['buy'];
+                ctx.fillRect(
+                    x,
+                    y,
+                    buyWidth,
+                    Chart.getHeight(this.range, overlappingBuyVolume, this.volumeScaleHeight)
+                );
+                ctx.fillStyle = i === askIndex
+                    ? VALUECOLOR['ask1']
+                    : VALUECOLOR['ask'];
+                ctx.fillRect(
+                    x + buyWidth,
+                    y,
+                    askWidth,
+                    Chart.getHeight(this.range, overlappingAskVolume, this.volumeScaleHeight)
+                );
+                if(i === buyIndex){
+                    buyX = x + buyWidth - this.volumeXOffset;
+                    buY = this.volumeYOffset > 0
+                        ? y + this.volumeYOffset
+                        : y;
+                    buyV = overlappingBuyVolume;
+                }
+                if(i === askIndex){
+                    askX = x + buyWidth + this.volumeXOffset;
+                    askY = this.volumeYOffset < 0
+                        ? y - this.volumeYOffset
+                        : y;
+                    askV = overlappingAskVolume;
+                }
+                continue;
+            }
+            const hasCurrentBuyVolume = Number(overlappingBuyVolume) > 0;
+            const hasCurrentAskVolume = Number(overlappingAskVolume) > 0;
+            if(!hasCurrentBuyVolume && !hasCurrentAskVolume){
+                continue;
+            }
+            const volum = hasCurrentBuyVolume
+                ? overlappingBuyVolume
+                : overlappingAskVolume;
+            const type = hasCurrentBuyVolume ? 'buy' : 'ask';
             if(i> buyIndex && i<askIndex){
                 continue
             }
@@ -568,6 +655,15 @@ class Chart {
             }
             return a;
         },[])
+        const priceGroups = Array.from(
+            pricearray.reduce((groups, item) => {
+                const existing = groups.get(item.price) || [];
+                existing.push(item);
+                groups.set(item.price, existing);
+                return groups;
+            }, new Map()).entries(),
+            ([price, orders]) => ({price, orders})
+        );
         const ctx =this.ctx;
         ctx.save();
 
@@ -577,23 +673,39 @@ class Chart {
         let _volume = [0, 0];
         let visibleCount = 0;
 
-        pricearray.forEach(({price, volume, side}) => {
-            const index = this.getindex(price, true);
-            const color = side === 'BUY' ? VALUECOLOR.orderBuy : VALUECOLOR.orderSell;
+        pricearray.forEach(({volume, side}) => {
             const direction = side === 'BUY' ? 0 : 1;
             _volume[direction] = _volume[direction] + volume;
+        });
+        priceGroups.forEach(({price, orders}) => {
+            const index = this.getindex(price, true);
             if(index < this.start || index > this.start + this.count)return;
             const  x = _x + (index-this.start) * barWidth;
-            const height = Math.max(4, Chart.getHeight(range, volume, volumeScaleHeight));
-
-            ctx.fillStyle = color
-            ctx.fillRect(x,y,barWidth -1,height);
+            const availableWidth = Math.max(2, barWidth - 1);
+            const drawWidth = orders.length > 1
+                ? Math.floor(availableWidth / orders.length)
+                : availableWidth;
+            let offsetX = 0;
+            orders.forEach(({volume, side}, orderIndex) => {
+                const width = orderIndex === orders.length - 1
+                    ? availableWidth - offsetX
+                    : drawWidth;
+                const height = Math.max(
+                    4,
+                    Chart.getHeight(range, volume, volumeScaleHeight)
+                );
+                ctx.fillStyle = side === 'BUY'
+                    ? VALUECOLOR.orderBuy
+                    : VALUECOLOR.orderSell;
+                ctx.fillRect(x + offsetX, y, width, height);
+                offsetX += width;
+            });
             visibleCount += 1;
 
         })
         this.holdVolume = _volume;
         this.visiblePlaceOrderCount = visibleCount;
-        this.totalPlaceOrderCount = pricearray.length;
+        this.totalPlaceOrderCount = priceGroups.length;
         // console.log(this.placeOrder, pricearray)
         ctx.restore()
     }
@@ -729,6 +841,8 @@ class Chart {
             20,
             Math.max(1, Math.floor(Number(arg.DepthLevels) || 5))
         );
+        this.depthRenderId += 1;
+        const depthRenderId = this.depthRenderId;
         const deepestBid = arg[`BidPrice${depthLevelCount}`];
         const deepestAsk = arg[`AskPrice${depthLevelCount}`];
         if(deepestBid && deepestBid <= Number.MAX_SAFE_INTEGER){
@@ -749,6 +863,8 @@ class Chart {
                 if(buyData){
                     buyData.volum = arg[`BidVolume${i}`];
                     buyData.type = 'buy';
+                    buyData.buyDepthVolume = arg[`BidVolume${i}`];
+                    buyData.buyDepthRenderId = depthRenderId;
                 }
             }
 
@@ -761,6 +877,8 @@ class Chart {
                 if(askData){
                     askData.volum = arg[`AskVolume${i}`];
                     askData.type = 'ask';
+                    askData.askDepthVolume = arg[`AskVolume${i}`];
+                    askData.askDepthRenderId = depthRenderId;
                 }
             }
 

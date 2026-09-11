@@ -45,10 +45,14 @@ function throwAmbiguousOrder(request) {
 }
 
 function resolveCancelOrderRequest(request = {}, knownOrders = []) {
+  const requestedMarketType = normalizeMarketType(request.marketType);
+  if (requestedMarketType && requestedMarketType !== "futures") {
+    throw new TypeError("当前客户端仅支持撤销 U 本位永续订单。");
+  }
   const normalizedRequest = {
     ...request,
     symbol: normalizeSymbol(request.symbol),
-    marketType: normalizeMarketType(request.marketType) || undefined,
+    marketType: "futures",
   };
   if (!describeOrderIdentity(normalizedRequest)) return normalizedRequest;
 
@@ -101,7 +105,7 @@ function resolveCancelOrderRequest(request = {}, knownOrders = []) {
   return {
     ...normalizedRequest,
     symbol: normalizeSymbol(selected.symbol),
-    marketType: normalizeMarketType(selected.marketType) || undefined,
+    marketType: "futures",
     algoOrder: selected.algoOrder === true,
   };
 }

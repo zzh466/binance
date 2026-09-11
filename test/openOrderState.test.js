@@ -20,10 +20,10 @@ function order(overrides = {}) {
   };
 }
 
-test("未成交订单 key 使用市场类型、交易对和订单 ID", () => {
+test("未成交订单 key 使用交易对和订单 ID", () => {
   assert.equal(
     openOrderKey(order()),
-    "futures:BTCUSDT:987654"
+    "BTCUSDT:987654"
   );
 });
 
@@ -46,14 +46,16 @@ test("新建和部分成交订单写入 Map，最终状态删除同一 key", () 
   assert.equal(orders.has(created.key), false);
 });
 
-test("相同订单 ID 在现货和 U 本位使用不同 key", () => {
+test("现货订单不会进入 U 本位挂单对象", () => {
   const orders = new Map();
-  updateOpenOrderMap(orders, order({ marketType: "spot" }), 100);
+  const ignored = updateOpenOrderMap(
+    orders,
+    order({ marketType: "spot" }),
+    100
+  );
   updateOpenOrderMap(orders, order({ marketType: "futures" }), 100);
-  assert.deepEqual([...orders.keys()].sort(), [
-    "futures:BTCUSDT:987654",
-    "spot:BTCUSDT:987654",
-  ]);
+  assert.equal(ignored.updated, false);
+  assert.deepEqual([...orders.keys()], ["BTCUSDT:987654"]);
 });
 
 test("较旧的账户事件不会覆盖已经收到的新状态", () => {
@@ -63,7 +65,7 @@ test("较旧的账户事件不会覆盖已经收到的新状态", () => {
   assert.equal(stale.updated, false);
   assert.equal(stale.reason, "stale-update");
   assert.equal(
-    orders.get("futures:BTCUSDT:987654").status,
+    orders.get("BTCUSDT:987654").status,
     "PARTIALLY_FILLED"
   );
 });

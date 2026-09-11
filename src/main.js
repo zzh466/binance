@@ -47,12 +47,15 @@ const {
 const {
   BinanceAccountMetricsService,
 } = require("./binanceAccountMetricsService");
-const { addDecimal } = require("./binance/decimalMath");
 const {
   registerWindowLoadFallbacks,
   revealBrowserWindow,
 } = require("./windowLifecycle");
-const { buildPositionSnapshot } = require("./positionSafety");
+const {
+  buildPositionSnapshot,
+  invalidatePositionSnapshot,
+  mergePositionSnapshots,
+} = require("./positionSafety");
 const { resolveCancelOrderRequest } = require("./cancelOrderResolver");
 const { resolveDefaultTestnet } = require("./environmentSelection");
 
@@ -95,12 +98,20 @@ let authenticatedManagerUserInfo = null;
 let authenticatedManagerLoginResponse = null;
 let pendingManagerLogin = null;
 let latestBinanceAccountMetrics = null;
+let latestBinancePositionSnapshot = null;
+let positionInvalidationVersion = 0;
+let criticalPositionRefreshTimer = null;
+let criticalPositionRefreshPromise = null;
+let criticalPositionRefreshClient = null;
+let criticalPositionRefreshRequestedVersion = 0;
 let accountMetricsRefreshPromise = null;
 let accountMetricsRefreshClient = null;
 let accountMetricsRefreshMode = null;
 let accountMetricsRefreshTimer = null;
 let accountMetricsInterval = null;
 let accountMetricsScheduledReconcileHistory = false;
+let incomeReconciliationPromise = null;
+let incomeReconciliationClient = null;
 let lastAccountMetricsHistoryRefreshAt = 0;
 let managerTradingInfoSyncPromise = null;
 let managerTradingInfoSyncTimer = null;
@@ -122,9 +133,7 @@ const recentOrderStore = new RecentOrderStore(recentOrderStorePath);
 const tradingRoundStore = new TradingRoundStore(
   path.join(app.getPath("userData"), "trading-rounds.json")
 );
-const accountMetricsService = new BinanceAccountMetricsService({
-  storePath: path.join(app.getPath("userData"), "spot-pnl-ledger.json"),
-});
+const accountMetricsService = new BinanceAccountMetricsService();
 const rateLimitCoordinator = new SharedRateLimitCoordinator(
   path.join(app.getPath("appData"), "Binance统一交易台", "rate-limits"),
   { instanceId: instanceId || `pid-${process.pid}` }
@@ -132,10 +141,10 @@ const rateLimitCoordinator = new SharedRateLimitCoordinator(
 const unknownOrderReconciliationTimers = new Set();
 const ACCOUNT_METRICS_REFRESH_MS = 2_000;
 // 成交事件由 WebSocket 增量维护；完整 24 小时历史只用于定期对账。
-// 现货交易对较多时逐个查询历史的权重很高，不能每 30 秒执行一次。
 const ACCOUNT_METRICS_HISTORY_REFRESH_MS = 5 * 60_000;
 const MANAGER_TRADING_INFO_SYNC_MS = 2_000;
 const MAX_ROUND_PRICE_BACKFILL_ORDERS_PER_RUN = 200;
+const FUTURES_MARKET_TYPE = "futures";
 const CONFIRMED_OPEN_ORDER_STATUSES = new Set([
   "NEW",
   "PARTIALLY_FILLED",
@@ -154,14 +163,13 @@ function fingerprintApiKey(apiKey) {
 
 function getOrderStoreContext(
   targetClient,
-  marketType,
   { defaultStatus, submissionSource, source } = {}
 ) {
-  const marketClient = targetClient.getClient(marketType);
+  const marketClient = targetClient.getClient();
   return {
     environment: targetClient.testnet ? "testnet" : "production",
     accountFingerprint: fingerprintApiKey(marketClient.apiKey),
-    marketType,
+    marketType: FUTURES_MARKET_TYPE,
     defaultStatus,
     submissionSource,
     source,
@@ -183,7 +191,6 @@ function collectOrderCandidates(payload, target = []) {
 
   for (const field of [
     "orders",
-    "orderReports",
     "cancelResult",
     "newOrderResult",
   ]) {
@@ -196,7 +203,6 @@ function trackOrderPayload(
   payload,
   {
     targetClient = client,
-    marketType,
     defaultStatus,
     submissionSource,
     source,
@@ -204,13 +210,9 @@ function trackOrderPayload(
 ) {
   const saved = [];
   const affectedRoundIds = new Set();
-  const rootMarketType = payload?.marketType || marketType;
   for (const order of collectOrderCandidates(payload)) {
-    const resolvedMarketType = order.marketType || rootMarketType;
-    if (!resolvedMarketType) continue;
     const storeContext = getOrderStoreContext(
       targetClient,
-      resolvedMarketType,
       { defaultStatus, submissionSource, source }
     );
     const result = recentOrderStore.upsert(
@@ -246,10 +248,11 @@ function trackOrderPayload(
       ...latestBinanceAccountMetrics,
       orderVolume: countConfirmedOpenOrders(targetClient),
     };
-    sendToRenderer(
-      "binance:positions-update",
-      buildCurrentPositionsPayload(latestBinanceAccountMetrics)
-    );
+    publishPositionMetrics(latestBinanceAccountMetrics, {
+      targetClient,
+      positionEvidenceVersion:
+        latestBinancePositionSnapshot?.positionEvidenceVersion || 0,
+    });
   }
   return saved;
 }
@@ -299,11 +302,9 @@ function scheduleUnknownOrderReconciliation(orderAttempt, targetClient = client)
         const order = await targetClient.queryOrder({
           symbol,
           origClientOrderId,
-          marketType: orderAttempt.marketType,
         });
         trackOrderPayload(order, {
           targetClient,
-          marketType: orderAttempt.marketType,
           source: "unknown-order-reconciliation",
         });
         sendToRenderer("binance:recent-orders-synced", {
@@ -421,49 +422,35 @@ async function configureFuturesDeadMan(payload = {}, targetClient = client) {
 }
 
 function listRecentOrders(payload = {}, targetClient = client) {
-  const marketTypes = payload.marketType
-    ? [payload.marketType]
-    : ["spot", "futures"];
-  return marketTypes.flatMap((marketType) => {
-    const accountFingerprint = fingerprintApiKey(
-      targetClient.getClient(marketType).apiKey
-    );
-    if (!accountFingerprint) return [];
-    return recentOrderStore.list({
-      environment: targetClient.testnet ? "testnet" : "production",
-      accountFingerprints: [accountFingerprint],
-      marketType,
-      symbol: payload.symbol,
-    });
+  const accountFingerprint = fingerprintApiKey(targetClient.getClient().apiKey);
+  if (!accountFingerprint) return [];
+  return recentOrderStore.list({
+    environment: targetClient.testnet ? "testnet" : "production",
+    accountFingerprints: [accountFingerprint],
+    marketType: FUTURES_MARKET_TYPE,
+    symbol: payload.symbol,
   }).sort((left, right) => Number(right.updatedAt) - Number(left.updatedAt));
 }
 
 function listTradingRounds(payload = {}, targetClient = client) {
-  const marketTypes = payload.marketType
-    ? [payload.marketType]
-    : ["spot", "futures"];
-  return marketTypes.flatMap((marketType) => {
-    const accountFingerprint = fingerprintApiKey(
-      targetClient.getClient(marketType).apiKey
-    );
-    if (!accountFingerprint) return [];
-    return tradingRoundStore.list({
-      environment: targetClient.testnet ? "testnet" : "production",
-      accountFingerprints: [accountFingerprint],
-      marketType,
-      symbol: payload.symbol,
-    });
+  const accountFingerprint = fingerprintApiKey(targetClient.getClient().apiKey);
+  if (!accountFingerprint) return [];
+  return tradingRoundStore.list({
+    environment: targetClient.testnet ? "testnet" : "production",
+    accountFingerprints: [accountFingerprint],
+    marketType: FUTURES_MARKET_TYPE,
+    symbol: payload.symbol,
   }).sort(compareRoundsNewestFirst);
 }
 
-function listKnownOrderSymbols(marketType, targetClient = client) {
-  const marketClient = targetClient.getClient(marketType);
+function listKnownOrderSymbols(targetClient = client) {
+  const marketClient = targetClient.getClient();
   const accountFingerprint = fingerprintApiKey(marketClient.apiKey);
   if (!accountFingerprint) return [];
   return [...new Set(recentOrderStore.list({
     environment: targetClient.testnet ? "testnet" : "production",
     accountFingerprints: [accountFingerprint],
-    marketType,
+    marketType: FUTURES_MARKET_TYPE,
   }).map((order) => order.symbol).filter(Boolean))];
 }
 
@@ -490,32 +477,35 @@ async function backfillTradingRoundPrices(
 
   const backfillPromise = (async () => {
     const environment = targetClient.testnet ? "testnet" : "production";
-    const contexts = new Map();
     const affectedRoundIds = new Set();
-    for (const marketType of ["spot", "futures"]) {
-      const accountFingerprint = fingerprintApiKey(
-        targetClient.getClient(marketType).apiKey
-      );
-      if (!accountFingerprint) continue;
-      const context = { environment, accountFingerprint, marketType };
-      contexts.set(marketType, context);
-      const knownResult = tradingRoundStore.backfillExecutionPricing(
-        knownOrders.filter((order) => order.marketType === marketType),
-        context
-      );
-      for (const roundId of knownResult.affectedRoundIds) {
-        affectedRoundIds.add(roundId);
-      }
+    const accountFingerprint = fingerprintApiKey(targetClient.getClient().apiKey);
+    if (!accountFingerprint) {
+      return {
+        affectedRoundIds: [],
+        queriedOrderCount: 0,
+        fetchedOrderCount: 0,
+        failedCount: 0,
+        remainingReferenceCount: 0,
+      };
+    }
+    const context = {
+      environment,
+      accountFingerprint,
+      marketType: FUTURES_MARKET_TYPE,
+    };
+    const knownResult = tradingRoundStore.backfillExecutionPricing(
+      knownOrders,
+      context
+    );
+    for (const roundId of knownResult.affectedRoundIds) {
+      affectedRoundIds.add(roundId);
     }
 
-    const references = [];
-    for (const [marketType, context] of contexts) {
-      references.push(...tradingRoundStore.listMissingPricingOrderReferences({
-        environment,
-        accountFingerprints: [context.accountFingerprint],
-        marketType,
-      }));
-    }
+    const references = tradingRoundStore.listMissingPricingOrderReferences({
+      environment,
+      accountFingerprints: [accountFingerprint],
+      marketType: FUTURES_MARKET_TYPE,
+    });
     const selectedReferences = references.slice(
       0,
       MAX_ROUND_PRICE_BACKFILL_ORDERS_PER_RUN
@@ -529,11 +519,10 @@ async function backfillTradingRoundPrices(
           symbol: reference.symbol,
           orderId: reference.orderId,
           origClientOrderId: reference.origClientOrderId,
-          marketType: reference.marketType,
         });
         const normalizedOrder = {
           ...order,
-          marketType: reference.marketType,
+          marketType: FUTURES_MARKET_TYPE,
         };
         if (reference.roundIds.length <= 1) return [normalizedOrder];
         try {
@@ -541,7 +530,6 @@ async function backfillTradingRoundPrices(
             symbol: reference.symbol,
             orderId: normalizedOrder.actualOrderId || normalizedOrder.orderId,
             limit: 1_000,
-            marketType: reference.marketType,
           });
           if (!Array.isArray(trades) || !trades.length) {
             return [normalizedOrder];
@@ -549,7 +537,7 @@ async function backfillTradingRoundPrices(
           return trades.map((trade) => ({
             ...normalizedOrder,
             ...trade,
-            marketType: reference.marketType,
+            marketType: FUTURES_MARKET_TYPE,
             orderId: trade.orderId ?? normalizedOrder.orderId,
             actualOrderId:
               normalizedOrder.actualOrderId ?? trade.actualOrderId,
@@ -572,14 +560,12 @@ async function backfillTradingRoundPrices(
       }
     }
 
-    for (const [marketType, context] of contexts) {
-      const fetchedResult = tradingRoundStore.backfillExecutionPricing(
-        fetchedOrders.filter((order) => order.marketType === marketType),
-        context
-      );
-      for (const roundId of fetchedResult.affectedRoundIds) {
-        affectedRoundIds.add(roundId);
-      }
+    const fetchedResult = tradingRoundStore.backfillExecutionPricing(
+      fetchedOrders,
+      context
+    );
+    for (const roundId of fetchedResult.affectedRoundIds) {
+      affectedRoundIds.add(roundId);
     }
     if (affectedRoundIds.size && targetClient === client) {
       sendToRenderer("binance:trading-rounds-update", {
@@ -615,32 +601,15 @@ async function backfillTradingRoundPrices(
 async function syncRecentAccountOrders(payload = {}, targetClient = client) {
   const endTime = Date.now();
   const startTime = recent24HourCutoff(endTime);
-  const knownSpotSymbols = listKnownOrderSymbols("spot", targetClient);
-  const knownFuturesSymbols = listKnownOrderSymbols("futures", targetClient);
-  if (payload.marketType === "spot" && payload.symbol) {
-    knownSpotSymbols.push(payload.symbol);
-  }
-  if (payload.marketType === "futures" && payload.symbol) {
+  const knownFuturesSymbols = listKnownOrderSymbols(targetClient);
+  if (payload.symbol) {
     knownFuturesSymbols.push(payload.symbol);
-  }
-  if (!payload.marketType && payload.symbol) {
-    try {
-      const resolution = await targetClient.resolveMarket(payload.symbol);
-      if (resolution.marketType === "spot") {
-        knownSpotSymbols.push(resolution.symbol);
-      } else if (resolution.marketType === "futures") {
-        knownFuturesSymbols.push(resolution.symbol);
-      }
-    } catch {
-      // 当前输入框的合约无效时，仍继续同步账户中已经发现的其他合约。
-    }
   }
 
   const result = await targetClient.recentAccountOrders({
     startTime,
     endTime,
     limit: 1_000,
-    knownSpotSymbols,
     knownFuturesSymbols,
   });
   const chronologicalOrders = [...result.orders].sort((left, right) => {
@@ -667,7 +636,7 @@ async function syncRecentAccountOrders(payload = {}, targetClient = client) {
   };
 }
 
-function getEnvironmentCredentials(testnet) {
+function getFuturesCredentials(testnet) {
   if (runtimeAccountCredentials) {
     return {
       ...runtimeAccountCredentials,
@@ -676,66 +645,22 @@ function getEnvironmentCredentials(testnet) {
   }
 
   const prefix = testnet ? "BINANCE_TESTNET" : "BINANCE_PRODUCTION";
-  const apiKey = process.env[`${prefix}_API_KEY`] || "";
-  const apiSecret = process.env[`${prefix}_API_SECRET`] || "";
-
-  if (apiKey && apiSecret) {
-    return { apiKey, apiSecret, source: prefix };
-  }
-
-  // 兼容原有配置：通用 Key 只用于 .env 中指定的默认环境，防止把
-  // Testnet Key 误发到正式环境（或反之）。
-  if (testnet === defaultTestnet) {
-    return {
-      apiKey: process.env.BINANCE_API_KEY || "",
-      apiSecret: process.env.BINANCE_API_SECRET || "",
-      source: "BINANCE_API",
-    };
-  }
-
-  return { apiKey: "", apiSecret: "", source: prefix };
-}
-
-function getFuturesCredentials(testnet) {
-  if (runtimeAccountCredentials) {
-    return {
-      ...runtimeAccountCredentials,
-      source: "MANAGER_ACCOUNT（Spot 与 USDⓈ-M 共用）",
-    };
-  }
-
-  const prefix = testnet ? "BINANCE_TESTNET" : "BINANCE_PRODUCTION";
-  const apiKey = process.env[`${prefix}_FUTURES_API_KEY`] || "";
-  const apiSecret = process.env[`${prefix}_FUTURES_API_SECRET`] || "";
-  if (apiKey && apiSecret) {
-    return { apiKey, apiSecret, source: `${prefix}_FUTURES` };
-  }
-
-  const shared = getEnvironmentCredentials(testnet);
   return {
-    ...shared,
-    source: shared.apiKey && shared.apiSecret
-      ? `${shared.source}（与现货共用）`
-      : `${prefix}_FUTURES`,
+    apiKey: process.env[`${prefix}_FUTURES_API_KEY`] || "",
+    apiSecret: process.env[`${prefix}_FUTURES_API_SECRET`] || "",
+    source: `${prefix}_FUTURES`,
   };
 }
 
 function createBinanceClient(testnet) {
-  const spotCredentials = getEnvironmentCredentials(testnet);
   const futuresCredentials = getFuturesCredentials(testnet);
   return new BinanceUnifiedClient({
-    spotCredentials,
     futuresCredentials,
     testnet,
     depthSpeed: process.env.BINANCE_DEPTH_SPEED || "100ms",
-    spotBrokerLinkId:
-      runtimeBrokerLinkIds?.BINANCE_SPOT_LINK_ID ||
-      process.env.BINANCE_SPOT_LINK_ID || "",
     futuresBrokerLinkId:
       runtimeBrokerLinkIds?.BINANCE_FUTURES_LINK_ID ||
       process.env.BINANCE_FUTURES_LINK_ID || "",
-    expectedSpotTradeGroupId:
-      process.env.BINANCE_SPOT_EXPECTED_TRADE_GROUP_ID || "",
     expectedFuturesTradeGroupId:
       process.env.BINANCE_FUTURES_EXPECTED_TRADE_GROUP_ID || "",
     rateLimitCoordinator,
@@ -813,7 +738,7 @@ function createWindow() {
     }
     sendAccountOverviewToRenderer();
     const activeClient = client;
-    if (hasAnyTradingCredentials(activeClient)) {
+    if (hasTradingCredentials(activeClient)) {
       connectUserDataInBackground(activeClient);
     }
   });
@@ -938,19 +863,13 @@ function getUserDataEventStatus(event = {}) {
   if (event.e === "executionReport") {
     return event.X || event.x || "订单状态已更新";
   }
-  if (event.e === "listStatus") {
-    return event.L || event.l || "组合订单状态已更新";
-  }
-  if (event.e === "outboundAccountPosition") {
-    return "账户余额已更新";
-  }
-  if (event.e === "balanceUpdate") {
-    return "余额已变动";
+  if (event.e === "ACCOUNT_UPDATE") {
+    return "U 本位账户已更新";
   }
   if (event.e === "eventStreamTerminated") {
     return "账户事件流已终止";
   }
-  return event.X || event.x || event.L || event.l || "已收到";
+  return event.X || event.x || "已收到";
 }
 
 function showUserDataNotification(payload = {}) {
@@ -991,9 +910,9 @@ function connectUserDataInBackground(targetClient = client) {
   });
 }
 
-function hasAnyTradingCredentials(targetClient = client) {
-  return [targetClient.spot, targetClient.futures].some(
-    (marketClient) => marketClient.apiKey && marketClient.apiSecret
+function hasTradingCredentials(targetClient = client) {
+  return Boolean(
+    targetClient?.futures?.apiKey && targetClient?.futures?.apiSecret
   );
 }
 
@@ -1004,11 +923,22 @@ function sendToRenderer(channel, payload) {
 }
 
 function getAccountMetricsContext(targetClient = client) {
-  const spotApiKey = targetClient?.spot?.apiKey;
   const futuresApiKey = targetClient?.futures?.apiKey;
   return {
     environment: targetClient?.testnet ? "testnet" : "production",
-    accountFingerprint: fingerprintApiKey(spotApiKey || futuresApiKey),
+    accountFingerprint: fingerprintApiKey(futuresApiKey),
+  };
+}
+
+function getPositionScope(targetClient = client) {
+  return {
+    ...getAccountMetricsContext(targetClient),
+    accountName: targetClient === client
+      ? authenticatedManagerSession?.futureUserName || ""
+      : "",
+    futureAccountId: targetClient === client
+      ? String(authenticatedManagerSession?.futureAccountId ?? "")
+      : "",
   };
 }
 
@@ -1021,8 +951,6 @@ function getDisplayedManagerUserInfo() {
       complete: metrics.complete !== false,
       environment: metrics.environment,
       updatedAt: metrics.updatedAt,
-      spotTradeCount: metrics.spot?.tradeHistory?.tradeCount || 0,
-      spotCommission: metrics.spot?.commission24h,
       warnings: metrics.warnings,
     } : null,
     accounts: (authenticatedManagerUserInfo.accounts || []).map((account) => {
@@ -1064,20 +992,171 @@ function sendAccountOverviewToRenderer() {
   sendAccountDataToRenderer();
 }
 
-function buildCurrentPositionsPayload(metrics = latestBinanceAccountMetrics) {
-  return buildPositionSnapshot(metrics, {
-    environment: client.testnet ? "testnet" : "production",
-    accountName: authenticatedManagerSession?.futureUserName || "",
+function buildCurrentPositionsPayload(
+  metrics = latestBinanceAccountMetrics,
+  {
+    targetClient = client,
+    positionEvidenceVersion = 0,
+  } = {}
+) {
+  const next = buildPositionSnapshot(metrics, {
+    ...getPositionScope(targetClient),
+    positionEvidenceVersion,
   });
+  return targetClient === client
+    ? mergePositionSnapshots(latestBinancePositionSnapshot, next)
+    : next;
+}
+
+function publishPositionMetrics(
+  metrics,
+  {
+    targetClient = client,
+    positionEvidenceVersion = 0,
+  } = {}
+) {
+  const next = buildPositionSnapshot(metrics, {
+    ...getPositionScope(targetClient),
+    positionEvidenceVersion,
+  });
+  if (targetClient !== client) return next;
+  latestBinancePositionSnapshot = mergePositionSnapshots(
+    latestBinancePositionSnapshot,
+    next
+  );
+  sendToRenderer("binance:positions-update", latestBinancePositionSnapshot);
+  return latestBinancePositionSnapshot;
+}
+
+function applyPositionMetricsToAccountMetrics(targetClient, metrics) {
+  if (!latestBinanceAccountMetrics || targetClient !== client || !metrics) {
+    return;
+  }
+  const positions = Array.isArray(metrics.positions) ? metrics.positions : [];
+  const positionSource =
+    metrics.positionSources?.futures || metrics.positionSource || null;
+  latestBinanceAccountMetrics = {
+    ...latestBinanceAccountMetrics,
+    positions,
+    positionsComplete: metrics.positionsComplete === true,
+    positionsUpdatedAt: metrics.positionsUpdatedAt || null,
+    positionSources: { futures: positionSource },
+    openVolume: positions.length,
+    futures: {
+      ...latestBinanceAccountMetrics.futures,
+      positions,
+      openPositionCount: positions.length,
+      positionsUpdatedAt: metrics.positionsUpdatedAt || null,
+    },
+  };
+}
+
+function invalidateCurrentPositionSnapshot(
+  reason = "成交后正在复核 U 本位持仓",
+  targetClient = client
+) {
+  if (targetClient !== client) return null;
+  positionInvalidationVersion += 1;
+  const base = latestBinancePositionSnapshot || buildPositionSnapshot(
+    latestBinanceAccountMetrics,
+    getPositionScope(targetClient)
+  );
+  latestBinancePositionSnapshot = invalidatePositionSnapshot(base, {
+    ...getPositionScope(targetClient),
+    invalidationVersion: positionInvalidationVersion,
+    reason,
+  });
+  sendToRenderer("binance:positions-update", latestBinancePositionSnapshot);
+  return latestBinancePositionSnapshot;
+}
+
+function stopCriticalPositionRefresh() {
+  clearTimeout(criticalPositionRefreshTimer);
+  criticalPositionRefreshTimer = null;
+  criticalPositionRefreshRequestedVersion = 0;
+}
+
+async function refreshCriticalPositions(targetClient = client) {
+  if (!targetClient || !authenticatedManagerSession) return null;
+  if (criticalPositionRefreshPromise) {
+    if (criticalPositionRefreshClient === targetClient) {
+      return criticalPositionRefreshPromise;
+    }
+    // 环境或账号已经切换时直接启动新范围的查询。旧 Promise 的回调均有
+    // targetClient 校验，等待它只会把旧网络超时传导到新账户首屏。
+  }
+  const context = getAccountMetricsContext(targetClient);
+  if (!context.accountFingerprint) return null;
+  const evidenceVersion = positionInvalidationVersion;
+  const refreshPromise = accountMetricsService.refreshPositions({
+    client: targetClient,
+    ...context,
+  }).then((metrics) => {
+    if (targetClient !== client) return metrics;
+    applyPositionMetricsToAccountMetrics(targetClient, metrics);
+    publishPositionMetrics(metrics, {
+      targetClient,
+      positionEvidenceVersion: evidenceVersion,
+    });
+    sendAccountDataToRenderer();
+    return metrics;
+  }).catch((error) => {
+    if (targetClient === client) sendPositionRefreshFailure(error);
+    throw error;
+  }).finally(() => {
+    if (criticalPositionRefreshPromise !== refreshPromise) return;
+    criticalPositionRefreshPromise = null;
+    criticalPositionRefreshClient = null;
+    if (
+      targetClient === client &&
+      criticalPositionRefreshRequestedVersion > evidenceVersion
+    ) {
+      scheduleCriticalPositionRefresh(0, targetClient);
+    }
+  });
+  criticalPositionRefreshPromise = refreshPromise;
+  criticalPositionRefreshClient = targetClient;
+  return refreshPromise;
+}
+
+function scheduleCriticalPositionRefresh(
+  delayMs = 0,
+  targetClient = client
+) {
+  if (!targetClient || targetClient !== client) return;
+  criticalPositionRefreshRequestedVersion = Math.max(
+    criticalPositionRefreshRequestedVersion,
+    positionInvalidationVersion
+  );
+  clearTimeout(criticalPositionRefreshTimer);
+  criticalPositionRefreshTimer = setTimeout(() => {
+    criticalPositionRefreshTimer = null;
+    refreshCriticalPositions(targetClient).catch((error) => {
+      if (targetClient !== client) return;
+      sendToRenderer("manager:account-metrics-status", {
+        status: "error",
+        operation: "positionRisk",
+        error: serializeError(error),
+        time: Date.now(),
+      });
+    });
+  }, Math.max(0, Number(delayMs) || 0));
+  criticalPositionRefreshTimer.unref?.();
 }
 
 function sendPositionRefreshFailure(error) {
-  sendToRenderer("binance:positions-update", {
+  const failed = {
     ...buildCurrentPositionsPayload(),
     complete: false,
     attemptedAt: Date.now(),
     error: serializeError(error),
-  });
+    positionConfirmationRequired: true,
+  };
+  latestBinancePositionSnapshot = mergePositionSnapshots(
+    latestBinancePositionSnapshot,
+    failed
+  );
+  sendToRenderer("binance:positions-update", latestBinancePositionSnapshot);
 }
 
 async function refreshBinanceAccountMetrics(
@@ -1085,51 +1164,50 @@ async function refreshBinanceAccountMetrics(
   { reconcileHistory = true } = {}
 ) {
   if (!targetClient || !authenticatedManagerSession) return null;
-  if (accountMetricsRefreshPromise) {
-    if (
-      accountMetricsRefreshClient === targetClient &&
-      (!reconcileHistory || accountMetricsRefreshMode === "full")
-    ) {
-      return accountMetricsRefreshPromise;
-    }
-    try {
-      await accountMetricsRefreshPromise;
-    } catch {
-      // 环境切换时旧客户端的刷新结果不应阻止新客户端立即刷新。
-    }
-    return refreshBinanceAccountMetrics(targetClient, { reconcileHistory });
-  }
-
   const context = getAccountMetricsContext(targetClient);
   if (!context.accountFingerprint) return null;
-  const knownSpotSymbols = listKnownOrderSymbols("spot", targetClient);
-  if (
-    targetClient.activeMarketType === "spot" &&
-    targetClient.activeSymbol
-  ) {
-    knownSpotSymbols.push(targetClient.activeSymbol);
+  if (reconcileHistory) {
+    reconcileBinanceIncome(targetClient).catch((error) => {
+      if (targetClient !== client) return;
+      sendToRenderer("manager:account-metrics-status", {
+        status: "error",
+        operation: "income-history",
+        error: serializeError(error),
+        time: Date.now(),
+      });
+    });
   }
+  if (accountMetricsRefreshPromise) {
+    if (accountMetricsRefreshClient === targetClient) {
+      return accountMetricsRefreshPromise;
+    }
+    // 新客户端不等待旧客户端的网络请求；下面用 Promise 身份和客户端
+    // 身份同时隔离结果，避免跨环境串写。
+  }
+
+  const positionEvidenceVersion = positionInvalidationVersion;
 
   const refreshPromise = accountMetricsService.refresh({
     client: targetClient,
     ...context,
-    knownSpotSymbols: [...new Set(knownSpotSymbols)],
-    reconcileHistory,
+    // 收益历史可能有多页，独立对账并在完成后单独发布，不能阻塞
+    // 账户资金和持仓的快速刷新。
+    reconcileHistory: false,
     openOrderCount: countConfirmedOpenOrders(targetClient),
   }).then((metrics) => {
     if (targetClient !== client) return metrics;
-    if (metrics.historyReconciled) {
-      lastAccountMetricsHistoryRefreshAt = Date.now();
-    }
     latestBinanceAccountMetrics = metrics;
     sendAccountDataToRenderer();
-    sendToRenderer("binance:positions-update", buildCurrentPositionsPayload(metrics));
+    publishPositionMetrics(metrics, {
+      targetClient,
+      positionEvidenceVersion,
+    });
     sendToRenderer("manager:account-metrics-status", {
       status: "updated",
       updatedAt: metrics.updatedAt,
       currency: metrics.currency,
       warnings: metrics.warnings,
-      reconcileHistory: metrics.historyReconciled,
+      reconcileHistory: false,
     });
     return metrics;
   }).finally(() => {
@@ -1141,8 +1219,48 @@ async function refreshBinanceAccountMetrics(
   });
   accountMetricsRefreshPromise = refreshPromise;
   accountMetricsRefreshClient = targetClient;
-  accountMetricsRefreshMode = reconcileHistory ? "full" : "light";
+  accountMetricsRefreshMode = "light";
   return refreshPromise;
+}
+
+async function reconcileBinanceIncome(targetClient = client) {
+  if (!targetClient || !authenticatedManagerSession) return null;
+  if (incomeReconciliationPromise) {
+    if (incomeReconciliationClient === targetClient) {
+      return incomeReconciliationPromise;
+    }
+    // 收益历史可能分页或超时，切换后的账户必须立即开始自己的对账，
+    // 不能被旧环境的请求阻塞。
+  }
+  const context = getAccountMetricsContext(targetClient);
+  if (!context.accountFingerprint) return null;
+  const reconciliationPromise = accountMetricsService.refreshIncome({
+    client: targetClient,
+    ...context,
+    reconcileHistory: true,
+  }).then((snapshot) => {
+    if (targetClient !== client) return snapshot;
+    if (snapshot.historyReconciled) {
+      lastAccountMetricsHistoryRefreshAt = Date.now();
+    }
+    applyFuturesIncomeMetrics(targetClient, snapshot);
+    sendToRenderer("manager:account-metrics-status", {
+      status: "updated",
+      operation: "income-history",
+      updatedAt: snapshot.updatedAt,
+      warnings: snapshot.warnings,
+      reconcileHistory: snapshot.historyReconciled,
+    });
+    return snapshot;
+  }).finally(() => {
+    if (incomeReconciliationPromise === reconciliationPromise) {
+      incomeReconciliationPromise = null;
+      incomeReconciliationClient = null;
+    }
+  });
+  incomeReconciliationPromise = reconciliationPromise;
+  incomeReconciliationClient = targetClient;
+  return reconciliationPromise;
 }
 
 function scheduleAccountMetricsRefresh(
@@ -1273,47 +1391,99 @@ function startManagerTradingInfoSync() {
   managerTradingInfoSyncInterval.unref?.();
 }
 
-function ingestSpotExecutionMetrics(targetClient, event) {
-  const context = getAccountMetricsContext(targetClient);
-  const snapshot = accountMetricsService.ingestSpotExecution({
-    ...context,
-    event,
-  });
+function applyFuturesIncomeMetrics(targetClient, snapshot) {
   if (!snapshot || !latestBinanceAccountMetrics || targetClient !== client) {
     return;
   }
+  const incomeComplete = snapshot.incomeComplete === true ||
+    (snapshot.incomeComplete === undefined && snapshot.complete === true);
+  const incomeOperations = new Set([
+    "income history",
+    "income metrics",
+    "executionReport income",
+    "ACCOUNT_UPDATE funding",
+  ]);
+  const incomeWarnings = Array.isArray(snapshot.warnings)
+    ? snapshot.warnings.map((warning) => ({ ...warning }))
+    : [];
+  if (snapshot.error) incomeWarnings.push({ ...snapshot.error });
+  if (Array.isArray(snapshot.unsupportedAssets) && snapshot.unsupportedAssets.length) {
+    incomeWarnings.push({
+      marketType: FUTURES_MARKET_TYPE,
+      operation: "income metrics",
+      name: "UnsupportedIncomeAssetWarning",
+      message: `以下收益资产尚未折算为 USDT：${snapshot.unsupportedAssets.join(", ")}`,
+    });
+  }
+  const retainedWarnings = (latestBinanceAccountMetrics.warnings || [])
+    .filter((warning) => !incomeOperations.has(warning?.operation));
+  const warnings = [...retainedWarnings, ...incomeWarnings]
+    .filter((warning, index, rows) => rows.findIndex((candidate) =>
+      candidate?.operation === warning?.operation &&
+      candidate?.name === warning?.name &&
+      candidate?.message === warning?.message
+    ) === index);
+  const accountComplete = latestBinanceAccountMetrics.accountComplete === true;
+  const positionsComplete = latestBinanceAccountMetrics.positionsComplete === true;
   latestBinanceAccountMetrics = {
     ...latestBinanceAccountMetrics,
-    closeProfit: addDecimal(
-      snapshot.realizedPnl24h,
-      latestBinanceAccountMetrics.futures?.realizedPnl24h || "0"
-    ),
-    commission: addDecimal(
-      snapshot.commission24h,
-      latestBinanceAccountMetrics.futures?.commission24h || "0"
-    ),
-    realProfit: addDecimal(
-      snapshot.realizedPnl24h,
-      latestBinanceAccountMetrics.futures?.actualPnl24h || "0"
-    ),
-    positionProfit: addDecimal(
-      snapshot.unrealizedProfit,
-      latestBinanceAccountMetrics.futures?.unrealizedProfit || "0"
-    ),
-    openVolume: snapshot.openPositionCount +
-      Number(latestBinanceAccountMetrics.futures?.openPositionCount || 0),
-    orderVolume: countConfirmedOpenOrders(targetClient),
-    spot: {
-      ...latestBinanceAccountMetrics.spot,
+    closeProfit: snapshot.realizedPnl24h,
+    commission: snapshot.commission24h,
+    realProfit: snapshot.actualPnl24h,
+    incomeComplete,
+    complete: accountComplete && positionsComplete && incomeComplete,
+    warnings,
+    futures: {
+      ...latestBinanceAccountMetrics.futures,
       realizedPnl24h: snapshot.realizedPnl24h,
       commission24h: snapshot.commission24h,
-      unrealizedProfit: snapshot.unrealizedProfit,
-      openPositionCount: snapshot.openPositionCount,
-      ledger: snapshot.ledger,
+      fundingFee24h: snapshot.fundingFee24h,
+      actualPnl24h: snapshot.actualPnl24h,
+      realizedIncomeCount: snapshot.count,
+      realizedIncomeUpdatedAt: snapshot.updatedAt,
+      incomeComplete,
     },
     updatedAt: Date.now(),
   };
   sendAccountDataToRenderer();
+}
+
+function ingestFuturesExecutionMetrics(targetClient, event) {
+  const snapshot = accountMetricsService.ingestFuturesExecution({
+    ...getAccountMetricsContext(targetClient),
+    event,
+  });
+  applyFuturesIncomeMetrics(targetClient, snapshot);
+  return snapshot;
+}
+
+function ingestFuturesAccountUpdateMetrics(targetClient, event) {
+  const snapshot = accountMetricsService.ingestFuturesAccountUpdate({
+    ...getAccountMetricsContext(targetClient),
+    event,
+  });
+  if (!snapshot) return null;
+  if (snapshot.incomeUpdated) {
+    applyFuturesIncomeMetrics(targetClient, snapshot);
+  }
+  if (snapshot.positionsUpdated || snapshot.positionError) {
+    const positionMetrics = {
+      ...snapshot,
+      environment: getAccountMetricsContext(targetClient).environment,
+      accountFingerprint:
+        getAccountMetricsContext(targetClient).accountFingerprint,
+      positionSources: { futures: snapshot.positionSource },
+      warnings: snapshot.positionError ? [snapshot.positionError] : [],
+      orderVolume: countConfirmedOpenOrders(targetClient),
+    };
+    applyPositionMetricsToAccountMetrics(targetClient, positionMetrics);
+    publishPositionMetrics(positionMetrics, {
+      targetClient,
+      positionEvidenceVersion: positionInvalidationVersion,
+    });
+    sendAccountDataToRenderer();
+  }
+  return snapshot;
 }
 
 function serializeError(error) {
@@ -1381,16 +1551,6 @@ function getClientStatus() {
     activeMarketType: client.activeMarketType,
     activeSymbol: client.activeSymbol,
     markets: {
-      spot: {
-        restBase: client.spot.restBase,
-        wsBase: client.spot.wsBase,
-        wsApiBase: client.spot.wsApiBase,
-        tradingWebSocket: client.spot.getTradingWebSocketStatus(),
-        hasApiKey: Boolean(client.spot.apiKey),
-        hasApiSecret: Boolean(client.spot.apiSecret),
-        credentialsSource: client.spot.credentialsSource,
-        serverTimeOffsetMs: client.spot.serverTimeOffsetMs,
-      },
       futures: {
         restBase: client.futures.restBase,
         wsBase: client.futures.wsBase,
@@ -1413,6 +1573,7 @@ async function switchClientEnvironment(testnet) {
 
   const previousClient = client;
   stopAccountMetricsRefresh();
+  stopCriticalPositionRefresh();
   stopManagerTradingInfoSync();
   clearFuturesDeadManTimer();
   const nextClient = createBinanceClient(testnet);
@@ -1420,7 +1581,10 @@ async function switchClientEnvironment(testnet) {
   client = nextClient;
   latestBinanceLatency = null;
   latestBinanceAccountMetrics = null;
+  latestBinancePositionSnapshot = null;
+  positionInvalidationVersion += 1;
   sendToRenderer("binance:latency-update", null);
+  publishPositionMetrics(null, { targetClient: nextClient });
   sendAccountOverviewToRenderer();
   previousClient.close();
 
@@ -1430,7 +1594,7 @@ async function switchClientEnvironment(testnet) {
   } catch (error) {
     initializationWarning = serializeError(error);
   }
-  if (hasAnyTradingCredentials(nextClient)) {
+  if (hasTradingCredentials(nextClient)) {
     connectUserDataInBackground(nextClient);
   }
   startAccountMetricsRefresh();
@@ -1571,7 +1735,13 @@ function registerIpcHandlers() {
   });
 
   ipcMain.handle("binance:connect-depth", async (_event, payload) => {
-    return safeCall(async () => client.connectDepth(payload?.symbol));
+    return safeCall(async () => client.connectDepth(payload?.symbol, {
+      depthLevels: payload?.depthLevels,
+    }));
+  });
+
+  ipcMain.handle("binance:set-depth-levels", async (_event, payload) => {
+    return safeCall(async () => client.setDepthLevels(payload?.depthLevels));
   });
 
   ipcMain.handle("binance:disconnect-market", async () => {
@@ -1662,29 +1832,14 @@ function registerIpcHandlers() {
         }
       }
       if (!result.verifiedFlat) {
-        const remainingSpotAssetCount = result.remainingSpotAssets?.length || 0;
         const remainingPositionCount = result.remainingFuturesPositions?.length || 0;
         const remainingOpenOrderCount = result.remainingOpenOrders?.length || 0;
-        const nonTradableAssetCount =
-          result.markets?.spot?.nonTradableAssets?.length || 0;
-        const lockedAssetCount = result.markets?.spot?.lockedAssets?.length || 0;
-        const dustAssetCount = result.markets?.spot?.dustAssets?.length || 0;
-        const failedMarkets = [
-          result.markets?.spot?.error ? "现货" : "",
-          result.markets?.futures?.error ? "U 本位" : "",
-        ].filter(Boolean);
         const error = new Error(
-          "未能确认全部清仓：" +
-          `剩余现货资产 ${remainingSpotAssetCount} 项，` +
+          "未能确认全部 U 本位持仓已平：" +
           `剩余 U 本位持仓 ${remainingPositionCount} 项，` +
           `剩余挂单 ${remainingOpenOrderCount} 笔。` +
-          (nonTradableAssetCount
-            ? `其中 ${nonTradableAssetCount} 项没有可直接卖出的 USDT 交易对。`
-            : "") +
-          (lockedAssetCount ? `包含锁定余额 ${lockedAssetCount} 项。` : "") +
-          (dustAssetCount ? `低于交易限制的零头 ${dustAssetCount} 项。` : "") +
-          (failedMarkets.length
-            ? `${failedMarkets.join("、")}清仓流程未完成，剩余数量未知。`
+          (result.markets?.futures?.error
+            ? "U 本位清仓流程未完成，剩余数量可能不完整。"
             : "") +
           "请查看失败明细并重新查询当前持仓。"
         );
@@ -1708,10 +1863,6 @@ function registerIpcHandlers() {
       () => client.cancelReplace(payload || {}),
       { source: "cancel-replace" }
     ));
-  });
-
-  ipcMain.handle("binance:all-order-lists", async (_event, payload) => {
-    return safeCall(() => client.allOrderLists(payload || {}));
   });
 
   ipcMain.handle("binance:all-orders", async (_event, payload) => {
@@ -1746,10 +1897,8 @@ function registerIpcHandlers() {
 
   ipcMain.handle("binance:current-positions", async () => {
     return safeCall(async () => {
-      const metrics = await refreshBinanceAccountMetrics(client, {
-        reconcileHistory: false,
-      });
-      return buildCurrentPositionsPayload(metrics);
+      await refreshCriticalPositions(client);
+      return latestBinancePositionSnapshot || buildCurrentPositionsPayload();
     });
   });
 
@@ -1771,42 +1920,6 @@ function registerIpcHandlers() {
 
   ipcMain.handle("binance:set-futures-dead-man", async (_event, payload) => {
     return safeCall(() => configureFuturesDeadMan(payload || {}));
-  });
-
-  ipcMain.handle("binance:query-order-list", async (_event, payload) => {
-    return safeCall(() => client.queryOrderList(payload || {}));
-  });
-
-  ipcMain.handle("binance:open-order-lists", async (_event, payload) => {
-    return safeCall(() => client.openOrderLists(payload || {}));
-  });
-
-  ipcMain.handle("binance:place-oco", async (_event, payload) => {
-    return safeCall(() => trackOrderCall(
-      () => client.placeOco(payload || {}),
-      { defaultStatus: "ACKNOWLEDGED", source: "place-oco" }
-    ));
-  });
-
-  ipcMain.handle("binance:place-oto", async (_event, payload) => {
-    return safeCall(() => trackOrderCall(
-      () => client.placeOto(payload || {}),
-      { defaultStatus: "ACKNOWLEDGED", source: "place-oto" }
-    ));
-  });
-
-  ipcMain.handle("binance:place-otoco", async (_event, payload) => {
-    return safeCall(() => trackOrderCall(
-      () => client.placeOtoco(payload || {}),
-      { defaultStatus: "ACKNOWLEDGED", source: "place-otoco" }
-    ));
-  });
-
-  ipcMain.handle("binance:cancel-order-list", async (_event, payload) => {
-    return safeCall(() => trackOrderCall(
-      () => client.cancelOrderList(payload || {}),
-      { defaultStatus: "CANCELED", source: "cancel-order-list" }
-    ));
   });
 
   ipcMain.handle("binance:connect-user-data", async (_event, payload) => {
@@ -1876,32 +1989,48 @@ function bindClientEvents(targetClient) {
     if (targetClient !== client) return;
     trackOrderPayload(data, {
       targetClient,
-      marketType: data.marketType,
       source: "order-attempt",
     });
   });
 
   targetClient.on("user-data-event", (data) => {
     if (targetClient !== client) return;
+    if (data.event?.e === "TRADE_LITE") {
+      // TRADE_LITE 是 Binance 更早送达的精简成交信号。它不包含完整的
+      // 收益/手续费字段，只用于立即让旧持仓失效并启动关键持仓复核；
+      // 实际盈亏仍由后续 ORDER_TRADE_UPDATE 精确入账。
+      invalidateCurrentPositionSnapshot(
+        "收到 U 本位快速成交信号，正在重新确认持仓",
+        targetClient
+      );
+      scheduleCriticalPositionRefresh(0, targetClient);
+    }
     if (data.event?.e === "executionReport") {
+      const isTrade = String(data.event.x || "").toUpperCase() === "TRADE";
+      if (isTrade) {
+        invalidateCurrentPositionSnapshot(
+          "收到 U 本位成交，正在重新确认持仓",
+          targetClient
+        );
+        scheduleCriticalPositionRefresh(0, targetClient);
+      }
       trackOrderPayload(data.event, {
         targetClient,
-        marketType: data.marketType,
         source: "user-data-stream",
       });
-      ingestSpotExecutionMetrics(targetClient, data.event);
-      if (data.event.x === "TRADE") scheduleAccountMetricsRefresh(500);
+      ingestFuturesExecutionMetrics(targetClient, {
+        ...data.event,
+        marketType: FUTURES_MARKET_TYPE,
+      });
+      if (isTrade) scheduleAccountMetricsRefresh(500);
     }
-    if (
-      [
-        "outboundAccountPosition",
-        "balanceUpdate",
-        "ACCOUNT_UPDATE",
-        "ORDER_TRADE_UPDATE",
-      ].includes(
-        data.event?.e
-      )
-    ) {
+    if (data.event?.e === "ACCOUNT_UPDATE") {
+      ingestFuturesAccountUpdateMetrics(targetClient, {
+        ...data.event,
+        marketType: FUTURES_MARKET_TYPE,
+      });
+    }
+    if (data.event?.e === "ACCOUNT_UPDATE") {
       scheduleAccountMetricsRefresh(500);
     }
     sendToRenderer("binance:user-data-event", data);
@@ -1911,7 +2040,19 @@ function bindClientEvents(targetClient) {
   targetClient.on("user-data-status", (data) => {
     if (targetClient !== client) return;
     sendToRenderer("binance:user-data-status", data);
-    if (data.status === "connected") {
+    if (["connected", "reconnected"].includes(data.status)) {
+      scheduleCriticalPositionRefresh(0, targetClient);
+      refreshBinanceAccountMetrics(targetClient, {
+        reconcileHistory: true,
+      }).catch((error) => {
+        if (targetClient !== client) return;
+        sendToRenderer("manager:account-metrics-status", {
+          status: "error",
+          operation: "user-data-reconnect-reconciliation",
+          error: serializeError(error),
+          time: Date.now(),
+        });
+      });
       clearTimeout(accountReconciliationTimer);
       accountReconciliationTimer = setTimeout(() => {
         if (targetClient !== client) return;
@@ -1976,6 +2117,7 @@ app.whenReady().then(() => {
 app.on("before-quit", () => {
   stopDevelopmentHotReload();
   stopAccountMetricsRefresh();
+  stopCriticalPositionRefresh();
   stopManagerTradingInfoSync();
   clearFuturesDeadManTimer();
   for (const timer of unknownOrderReconciliationTimers) clearTimeout(timer);

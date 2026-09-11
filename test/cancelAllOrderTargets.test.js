@@ -41,9 +41,9 @@ test("过期 ACK 和最终状态不会产生撤单目标", () => {
   assert.deepEqual(result.targets, []);
 });
 
-test("远端、本地实时和最近订单按市场与交易对合并去重", () => {
+test("远端、本地实时和最近 U 本位订单按交易对合并去重", () => {
   const shared = {
-    marketType: "spot",
+    marketType: "futures",
     symbol: "BTCUSDT",
     orderId: 8,
     status: "NEW",
@@ -53,15 +53,15 @@ test("远端、本地实时和最近订单按市场与交易对合并去重", ()
     trackedOrders: [shared],
     recentOrders: [shared, {
       marketType: "futures",
-      symbol: "BTCUSDT",
+      symbol: "ETHUSDT",
       orderId: 9,
       status: "PARTIALLY_FILLED",
     }],
   });
 
   assert.deepEqual(result.targets, [
-    { marketType: "spot", symbol: "BTCUSDT" },
     { marketType: "futures", symbol: "BTCUSDT" },
+    { marketType: "futures", symbol: "ETHUSDT" },
   ]);
   assert.equal(result.orders.length, 2);
   assert.equal(orderMatchesTarget(result.orders[0], result.targets[0]), true);

@@ -30,7 +30,7 @@ test("多个应用实例共享 Binance 限流快照并为订单保留容量", (t
   });
 
   first.observe({
-    marketType: "spot",
+    marketType: "futures",
     rateLimits: [{
       rateLimitType: "REQUEST_WEIGHT",
       interval: "MINUTE",
@@ -74,11 +74,11 @@ test("收到 429 后在 retry-after 窗口内连关键请求也会被本地拦�
   );
 });
 
-test("现货接近限流不会误拦 U 本位查询", (t) => {
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "binance-market-limit-"));
+test("忽略 Binance 返回的 -1 限流占位值", (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "binance-invalid-limit-"));
   const coordinator = new SharedRateLimitCoordinator(directory, {
-    instanceId: "market-scope",
-    now: () => 10_000,
+    instanceId: "invalid-ws-limit",
+    now: () => 30_000,
     refreshIntervalMs: 60_000,
     saveDelayMs: 60_000,
   });
@@ -86,29 +86,45 @@ test("现货接近限流不会误拦 U 本位查询", (t) => {
     coordinator.close();
     fs.rmSync(directory, { recursive: true, force: true });
   });
+
   coordinator.observe({
-    marketType: "spot",
+    marketType: "futures",
     rateLimits: [{
       rateLimitType: "REQUEST_WEIGHT",
       interval: "MINUTE",
       intervalNum: 1,
-      limit: 100,
-      count: 95,
+      limit: -1,
+      count: -1,
     }],
   });
 
-  assert.throws(
-    () => coordinator.beforeRequest({ marketType: "spot" }),
-    BinanceRateLimitGuardError
-  );
   assert.doesNotThrow(() => coordinator.beforeRequest({ marketType: "futures" }));
+  assert.equal(coordinator.snapshot().nearLimit, false);
+  assert.deepEqual(coordinator.snapshot().limits, []);
 });
 
-test("某一市场的 429 只暂停该市场", (t) => {
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "binance-market-ban-"));
+test("旧实例文件中的负数限流数据不会阻断查询", (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "binance-stale-invalid-limit-"));
+  const now = 40_000;
+  fs.writeFileSync(path.join(directory, "instance-old.json"), JSON.stringify({
+    updatedAt: now,
+    banUntil: 0,
+    marketBans: {},
+    limits: {
+      "futures:REQUEST_WEIGHT:MINUTE:1": {
+        marketType: "futures",
+        rateLimitType: "REQUEST_WEIGHT",
+        interval: "MINUTE",
+        intervalNum: 1,
+        limit: -1,
+        count: -1,
+        observedAt: now,
+      },
+    },
+  }));
   const coordinator = new SharedRateLimitCoordinator(directory, {
-    instanceId: "market-ban",
-    now: () => 20_000,
+    instanceId: "new-instance",
+    now: () => now,
     refreshIntervalMs: 60_000,
     saveDelayMs: 60_000,
   });
@@ -116,19 +132,8 @@ test("某一市场的 429 只暂停该市场", (t) => {
     coordinator.close();
     fs.rmSync(directory, { recursive: true, force: true });
   });
-  coordinator.observe({
-    marketType: "spot",
-    status: 429,
-    headers: { "retry-after": "2" },
-  });
 
-  assert.throws(
-    () => coordinator.beforeRequest({ marketType: "spot", critical: true }),
-    /限流保护中/
-  );
-  assert.doesNotThrow(() => coordinator.beforeRequest({
-    marketType: "futures",
-    critical: true,
-  }));
-  assert.equal(coordinator.snapshot().marketBans.spot, 22_000);
+  assert.doesNotThrow(() => coordinator.beforeRequest({ marketType: "futures" }));
+  assert.equal(coordinator.snapshot().nearLimit, false);
+  assert.deepEqual(coordinator.snapshot().limits, []);
 });

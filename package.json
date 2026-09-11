@@ -3,7 +3,7 @@
   "productName": "Binance统一交易台",
   "version": "1.0.0",
   "private": true,
-  "description": "Electron Binance Spot and USD-M Futures unified trading console",
+  "description": "Electron Binance USD-M Futures trading console",
   "main": "src/main.js",
   "scripts": {
     "start": "node scripts/dev.js",

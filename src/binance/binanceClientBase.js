@@ -6,50 +6,14 @@ const WebSocket = require("ws");
 const {
   alignDecimalToStep,
   compareDecimal,
-  divideDecimalToStep,
   isPositiveDecimal,
-  multiplyDecimal,
 } = require("./decimalMath");
-const REST_BASE = {
-  testnet: "https://testnet.binance.vision/api",
-  production: "https://data-api.binance.vision/api",
-};
-
-const TRADING_REST_BASE = {
-  testnet: REST_BASE.testnet,
-  production: "https://api.binance.com/api",
-};
-
-const WS_BASE = {
-  testnet: "wss://stream.testnet.binance.vision/ws",
-  production: "wss://data-stream.binance.vision/ws",
-};
-
-const WS_API_BASE = {
-  testnet: "wss://ws-api.testnet.binance.vision/ws-api/v3",
-  production: "wss://ws-api.binance.com:443/ws-api/v3",
-};
-
-const TESTNET_PUBLIC_WS_METHODS = new Map([
-  ["/v3/ping", "ping"],
-  ["/v3/time", "time"],
-  ["/v3/exchangeInfo", "exchangeInfo"],
-  ["/v3/ticker/price", "ticker.price"],
-  ["/v3/ticker/bookTicker", "ticker.book"],
-  ["/v3/avgPrice", "avgPrice"],
-  ["/v3/ticker/24hr", "ticker.24hr"],
-  ["/v3/trades", "trades.recent"],
-  ["/v3/historicalTrades", "trades.historical"],
-  ["/v3/aggTrades", "trades.aggregate"],
-  ["/v3/klines", "klines"],
-]);
 
 const DEPTH_SPEEDS = new Set(["100ms", "1000ms"]);
-const PARTIAL_DEPTH_LEVELS = 10;
+const PARTIAL_DEPTH_LEVELS = new Set([5, 10, 20]);
+const DEFAULT_DEPTH_LEVELS = 20;
 const SERVER_TIME_CACHE_TTL_MS = 120_000;
 const SERVER_TIME_REFRESH_INTERVAL_MS = 30_000;
-const EXCHANGE_INFO_CACHE_TTL_MS = 300_000;
-const EXCHANGE_INFO_REFRESH_RETRY_MS = 30_000;
 const DYNAMIC_PRICE_MAX_AGE_MS = 10_000;
 const WS_API_REQUEST_TIMEOUT_MS = 5_000;
 const WS_API_CONNECT_TIMEOUT_MS = 10_000;
@@ -101,7 +65,7 @@ class BinanceApiError extends Error {
   }
 }
 
-class BinanceSpotClient extends EventEmitter {
+class BinanceClientBase extends EventEmitter {
   constructor({
     apiKey = "",
     apiSecret = "",
@@ -110,34 +74,42 @@ class BinanceSpotClient extends EventEmitter {
     preflightBalanceCheck = false,
     brokerLinkId = "",
     rateLimitCoordinator = null,
+    marketType = "",
+    restBase = "",
+    tradingRestBase = restBase,
+    wsBase = "",
+    wsApiBase = "",
+    timePath = "",
+    pingPath = "",
+    tickerPricePath = "",
+    depthLevels = DEFAULT_DEPTH_LEVELS,
   } = {}) {
     super();
 
     this.apiKey = apiKey.trim();
     this.apiSecret = apiSecret.trim();
     this.testnet = Boolean(testnet);
-    this.marketType = "spot";
+    this.marketType = String(marketType || "");
     this.selfTradePreventionMode = REQUIRED_SELF_TRADE_PREVENTION_MODE;
     this.brokerLinkId = String(brokerLinkId || "").trim();
     this.rateLimitCoordinator = rateLimitCoordinator;
 
-    this.restBase = this.testnet ? REST_BASE.testnet : REST_BASE.production;
-    this.tradingRestBase = this.testnet
-      ? TRADING_REST_BASE.testnet
-      : TRADING_REST_BASE.production;
-    this.wsBase = this.testnet ? WS_BASE.testnet : WS_BASE.production;
-    this.wsApiBase = this.testnet
-      ? WS_API_BASE.testnet
-      : WS_API_BASE.production;
+    this.restBase = String(restBase || "");
+    this.tradingRestBase = String(tradingRestBase || restBase || "");
+    this.wsBase = String(wsBase || "");
+    this.wsApiBase = String(wsApiBase || "");
     this.tradingWsApiBase = this.wsApiBase;
-    this.timePath = "/v3/time";
-    this.pingPath = "/v3/ping";
-    this.supportsAveragePriceStream = true;
+    this.timePath = String(timePath || "");
+    this.pingPath = String(pingPath || "");
 
     this.depthSpeed = DEPTH_SPEEDS.has(depthSpeed) ? depthSpeed : "100ms";
 
-    this.depthDisplayLevels = PARTIAL_DEPTH_LEVELS;
-    this.depthStreamLevels = PARTIAL_DEPTH_LEVELS;
+    const normalizedDepthLevels = Number(depthLevels);
+    const initialDepthLevels = PARTIAL_DEPTH_LEVELS.has(normalizedDepthLevels)
+      ? normalizedDepthLevels
+      : DEFAULT_DEPTH_LEVELS;
+    this.depthDisplayLevels = initialDepthLevels;
+    this.depthStreamLevels = initialDepthLevels;
     this.depthMode = "partial";
 
     this.preflightBalanceCheck = Boolean(preflightBalanceCheck);
@@ -168,16 +140,12 @@ class BinanceSpotClient extends EventEmitter {
     this.tradeReconnectDelayMs = 1_000;
 
     this.exchangeInfoCache = new Map();
-    this.exchangeInfoRefreshPromises = new Map();
-    this.exchangeInfoRefreshAttemptAt = new Map();
-    this.averagePriceCache = new Map();
     this.lastTradePriceCache = new Map();
-    this.tickerPricePath = "/v3/ticker/price";
+    this.tickerPricePath = String(tickerPricePath || "");
     this.userDataSocket = null;
     this.userDataManualClose = false;
     this.userDataReconnectTimer = null;
     this.userDataReconnectDelayMs = 1_000;
-    this.userDataSubscriptionId = null;
     this.tradingWsApiSocket = null;
     this.tradingWsApiConnectionPromise = null;
     this.tradingWsApiManualClose = false;
@@ -371,7 +339,7 @@ class BinanceSpotClient extends EventEmitter {
   assertTradingCredentials() {
     if (!this.apiKey || !this.apiSecret) {
       throw new BinanceApiError(
-        "缺少 BINANCE_API_KEY 或 BINANCE_API_SECRET；行情可连接，但不能下单或撤单。"
+        "缺少当前环境的 U 本位 API Key 或 API Secret；行情可连接，但不能查询账户、下单或撤单。"
       );
     }
   }
@@ -521,49 +489,13 @@ class BinanceSpotClient extends EventEmitter {
     return data;
   }
 
-  shouldFallbackTestnetPublicRequest(error, path, baseUrl) {
-    if (
-      !this.testnet ||
-      baseUrl !== this.restBase ||
-      !TESTNET_PUBLIC_WS_METHODS.has(path)
-    ) {
-      return false;
-    }
-    const status = Number(error?.status);
-    return !Number.isFinite(status) || status >= 500;
-  }
-
-  async requestPublicWsApi(path, params = {}, options = {}) {
-    const wsMethod = TESTNET_PUBLIC_WS_METHODS.get(path);
-    if (!wsMethod) {
-      throw new BinanceApiError(`现货 WebSocket API 不支持公共接口 ${path}。`);
-    }
-    const socket = await this.ensureTradingWebSocketReady();
-    const normalizedParams = Object.fromEntries(
-      Object.entries(params || {}).filter(([, value]) =>
-        value !== undefined && value !== null && value !== ""
-      )
-    );
-    return this.requestWsApiOnSocket(socket, wsMethod, normalizedParams, {
-      url: this.tradingWsApiBase,
-      critical: options.critical === true,
-    });
-  }
-
   async requestPublicGet(
     path,
     params = {},
     baseUrl = this.restBase,
     options = {}
   ) {
-    try {
-      return await this.request("GET", path, params, false, baseUrl, options);
-    } catch (error) {
-      if (!this.shouldFallbackTestnetPublicRequest(error, path, baseUrl)) {
-        throw error;
-      }
-      return this.requestPublicWsApi(path, params, options);
-    }
+    return this.request("GET", path, params, false, baseUrl, options);
   }
 
   validateSymbol(symbol) {
@@ -583,147 +515,6 @@ class BinanceSpotClient extends EventEmitter {
       environment: this.testnet ? "testnet" : "production",
       marketType: this.marketType,
     };
-  }
-
-  async exchangeInfo(symbol, { forceRefresh = false } = {}) {
-    const normalizedSymbol = this.validateSymbol(symbol);
-    const cached = this.exchangeInfoCache.get(normalizedSymbol);
-
-    if (!forceRefresh && cached) {
-      if (Date.now() - cached.loadedAt >= EXCHANGE_INFO_CACHE_TTL_MS) {
-        this.refreshExchangeInfoInBackground(normalizedSymbol);
-      }
-      return cached.data;
-    }
-
-    return this.refreshExchangeInfo(normalizedSymbol);
-  }
-
-  async exchangeInfoCatalog({ critical = false } = {}) {
-    const result = await this.requestPublicGet(
-      "/v3/exchangeInfo",
-      {},
-      this.restBase,
-      { critical }
-    );
-    const symbols = Array.isArray(result?.symbols) ? result.symbols : [];
-    const loadedAt = Date.now();
-    const common = {
-      timezone: result?.timezone,
-      serverTime: result?.serverTime,
-      rateLimits: result?.rateLimits,
-      exchangeFilters: result?.exchangeFilters,
-    };
-    for (const symbol of symbols) {
-      const symbolName = String(symbol?.symbol || "").toUpperCase();
-      if (!symbolName) continue;
-      this.exchangeInfoCache.set(symbolName, {
-        loadedAt,
-        data: { ...common, symbols: [symbol], symbol },
-      });
-    }
-    return symbols;
-  }
-
-  refreshExchangeInfoInBackground(symbol) {
-    const lastAttemptAt = this.exchangeInfoRefreshAttemptAt.get(symbol) || 0;
-    if (Date.now() - lastAttemptAt < EXCHANGE_INFO_REFRESH_RETRY_MS) {
-      return this.exchangeInfoRefreshPromises.get(symbol) || null;
-    }
-    const promise = this.refreshExchangeInfo(symbol);
-    promise.catch((error) => {
-      this.emit("market-error", {
-        message: `交易规则后台刷新失败：${error.message}`,
-        symbol,
-        time: Date.now(),
-      });
-    });
-    return promise;
-  }
-
-  refreshExchangeInfo(symbol) {
-    const pending = this.exchangeInfoRefreshPromises.get(symbol);
-    if (pending) return pending;
-
-    this.exchangeInfoRefreshAttemptAt.set(symbol, Date.now());
-    const promise = (async () => {
-      const result = await this.requestPublicGet("/v3/exchangeInfo", { symbol });
-      const data = {
-        ...result,
-        symbol: result.symbols?.[0] || null,
-      };
-      this.exchangeInfoCache.set(symbol, { loadedAt: Date.now(), data });
-      return data;
-    })();
-    this.exchangeInfoRefreshPromises.set(symbol, promise);
-    promise.finally(() => {
-      if (this.exchangeInfoRefreshPromises.get(symbol) === promise) {
-        this.exchangeInfoRefreshPromises.delete(symbol);
-      }
-    }).catch(() => {});
-    return promise;
-  }
-
-  async marketOverview(symbol, { interval = "1m", limit = 50 } = {}) {
-    const normalizedSymbol = this.validateSymbol(symbol);
-    const normalizedLimit = Math.min(1000, Math.max(1, Number(limit) || 50));
-    const [price, bookTicker, averagePrice, ticker24hr, recentTrades, aggregateTrades, klines] =
-      await Promise.all([
-        this.requestPublicGet("/v3/ticker/price", { symbol: normalizedSymbol }),
-        this.requestPublicGet("/v3/ticker/bookTicker", { symbol: normalizedSymbol }),
-        this.requestPublicGet("/v3/avgPrice", { symbol: normalizedSymbol }),
-        this.requestPublicGet("/v3/ticker/24hr", { symbol: normalizedSymbol }),
-        this.requestPublicGet("/v3/trades", { symbol: normalizedSymbol, limit: normalizedLimit }),
-        this.requestPublicGet("/v3/aggTrades", { symbol: normalizedSymbol, limit: normalizedLimit }),
-        this.requestPublicGet("/v3/klines", {
-          symbol: normalizedSymbol,
-          interval,
-          limit: normalizedLimit,
-        }),
-      ]);
-
-    let historicalTrades = [];
-    let historicalTradesError = null;
-    try {
-      historicalTrades = await this.requestPublicGet("/v3/historicalTrades", {
-        symbol: normalizedSymbol,
-        limit: normalizedLimit,
-      });
-    } catch (error) {
-      historicalTradesError = {
-        name: error.name,
-        message: error.message,
-        status: error.status,
-        code: error.code,
-      };
-    }
-
-    return {
-      symbol: normalizedSymbol,
-      price,
-      bookTicker,
-      averagePrice,
-      ticker24hr,
-      recentTrades,
-      historicalTrades,
-      historicalTradesError,
-      aggregateTrades,
-      klines: klines.map((kline) => ({
-        openTime: kline[0],
-        open: kline[1],
-        high: kline[2],
-        low: kline[3],
-        close: kline[4],
-        volume: kline[5],
-        closeTime: kline[6],
-        quoteVolume: kline[7],
-        tradeCount: kline[8],
-      })),
-    };
-  }
-
-  async tickerPrices() {
-    return this.requestPublicGet("/v3/ticker/price");
   }
 
   decimalPlaces(value) {
@@ -784,7 +575,7 @@ class BinanceSpotClient extends EventEmitter {
     return {
       mode: this.selfTradePreventionMode,
       enforced: true,
-      scope: "同一账户，或由 Binance 配置为相同 tradeGroupId 的现货账户",
+      scope: "同一账户，或由 Binance 配置为相同 tradeGroupId 的 U 本位账户",
     };
   }
 
@@ -811,328 +602,6 @@ class BinanceSpotClient extends EventEmitter {
       throw new BinanceApiError(`${symbol} 没有可用于总价换算的有效行情价格。`);
     }
     return { price, source: "ticker 最新价" };
-  }
-
-  async prepareOrder(order) {
-    const symbol = this.validateSymbol(order.symbol);
-    const side = String(order.side || "").toUpperCase();
-    const type = String(order.type || "").toUpperCase();
-    const supportedTypes = new Set([
-      "LIMIT",
-      "MARKET",
-      "LIMIT_MAKER",
-      "STOP_LOSS",
-      "STOP_LOSS_LIMIT",
-      "TAKE_PROFIT",
-      "TAKE_PROFIT_LIMIT",
-    ]);
-
-    if (!["BUY", "SELL"].includes(side)) {
-      throw new BinanceApiError(`side 只支持 BUY 或 SELL，当前值：${side}`);
-    }
-    if (!supportedTypes.has(type)) {
-      throw new BinanceApiError(`当前页面不支持委托类型：${type}`);
-    }
-
-    const info = await this.exchangeInfo(symbol);
-    const symbolInfo = info.symbol;
-    if (!symbolInfo || symbolInfo.status !== "TRADING") {
-      throw new BinanceApiError(`${symbol} 在当前环境不可交易。`);
-    }
-
-    const filters = Object.fromEntries(
-      (symbolInfo.filters || []).map((filter) => [filter.filterType, filter])
-    );
-    const quantityFilter = type === "MARKET"
-      ? filters.MARKET_LOT_SIZE || filters.LOT_SIZE
-      : filters.LOT_SIZE;
-
-    const params = this.normalizeParams({
-      symbol,
-      side,
-      type,
-      selfTradePreventionMode: this.requireSelfTradePrevention(symbolInfo),
-      timeInForce: order.timeInForce,
-      quantity: order.quantity,
-      quoteOrderQty: order.quoteOrderQty,
-      price: order.price,
-      stopPrice: order.stopPrice,
-      trailingDelta: order.trailingDelta,
-      icebergQty: order.icebergQty,
-      newClientOrderId: this.buildBrokerClientOrderId(order.newClientOrderId),
-      newOrderRespType: order.newOrderRespType || "ACK",
-    });
-
-    const limitLike = new Set(["LIMIT", "STOP_LOSS_LIMIT", "TAKE_PROFIT_LIMIT"]);
-    if (limitLike.has(type)) {
-      params.timeInForce ||= "GTC";
-    }
-    if (type !== "MARKET" && type !== "STOP_LOSS" && type !== "TAKE_PROFIT" && !params.price) {
-      throw new BinanceApiError(`${type} 委托必须提供 price。`);
-    }
-    if (!params.quantity && !params.quoteOrderQty) {
-      throw new BinanceApiError("委托必须提供 quantity 或 quoteOrderQty。");
-    }
-    if (params.quantity && params.quoteOrderQty) {
-      throw new BinanceApiError("按数量和按总价只能选择一种下单模式。");
-    }
-    if (params.quoteOrderQty) {
-      this.assertPositiveOrderAmount("订单总价 quoteOrderQty", params.quoteOrderQty);
-    }
-    if ((type.includes("STOP") || type.includes("TAKE_PROFIT")) && !params.stopPrice && !params.trailingDelta) {
-      throw new BinanceApiError(`${type} 委托必须提供 stopPrice 或 trailingDelta。`);
-    }
-
-    if (!new Set(["LIMIT", "LIMIT_MAKER", "STOP_LOSS_LIMIT", "TAKE_PROFIT_LIMIT"]).has(type)) {
-      delete params.price;
-    }
-    if (!type.includes("STOP") && !type.includes("TAKE_PROFIT")) {
-      delete params.stopPrice;
-      delete params.trailingDelta;
-    }
-
-    const adjustments = [];
-    let orderSizing = params.quoteOrderQty
-      ? {
-          mode: "quote-total",
-          requestedQuoteOrderQty: params.quoteOrderQty,
-          directQuoteOrderQty: type === "MARKET",
-        }
-      : { mode: "quantity" };
-    if (params.price && filters.PRICE_FILTER) {
-      const original = params.price;
-      params.price = this.alignToStep(params.price, filters.PRICE_FILTER.tickSize);
-      this.assertFilterRange("price", params.price, filters.PRICE_FILTER.minPrice, filters.PRICE_FILTER.maxPrice);
-      if (original !== params.price) adjustments.push(`price: ${original} -> ${params.price}`);
-    }
-    if (params.stopPrice && filters.PRICE_FILTER) {
-      const original = params.stopPrice;
-      params.stopPrice = this.alignToStep(params.stopPrice, filters.PRICE_FILTER.tickSize);
-      this.assertFilterRange("stopPrice", params.stopPrice, filters.PRICE_FILTER.minPrice, filters.PRICE_FILTER.maxPrice);
-      if (original !== params.stopPrice) adjustments.push(`stopPrice: ${original} -> ${params.stopPrice}`);
-    }
-
-    if (params.quoteOrderQty && type !== "MARKET") {
-      const requestedQuoteOrderQty = params.quoteOrderQty;
-      const reference = await this.resolveTotalOrderReferencePrice(symbol, [
-        { value: params.price, source: "委托价" },
-        { value: params.stopPrice, source: "触发价" },
-      ]);
-      params.quantity = quantityFilter
-        ? divideDecimalToStep(
-            requestedQuoteOrderQty,
-            reference.price,
-            quantityFilter.stepSize
-          )
-        : String(Number(requestedQuoteOrderQty) / Number(reference.price));
-      delete params.quoteOrderQty;
-      orderSizing = {
-        mode: "quote-total",
-        requestedQuoteOrderQty,
-        directQuoteOrderQty: false,
-        referencePrice: String(reference.price),
-        referenceSource: reference.source,
-      };
-    }
-
-    if (params.quantity && quantityFilter) {
-      const original = params.quantity;
-      params.quantity = this.alignToStep(params.quantity, quantityFilter.stepSize);
-      this.assertFilterRange("quantity", params.quantity, quantityFilter.minQty, quantityFilter.maxQty);
-      if (orderSizing.mode === "quote-total") {
-        orderSizing.convertedQuantity = params.quantity;
-        adjustments.push(
-          `总价模式: ${orderSizing.requestedQuoteOrderQty} / ` +
-          `${orderSizing.referencePrice}（${orderSizing.referenceSource}） -> ` +
-          `quantity ${params.quantity}`
-        );
-      } else if (original !== params.quantity) {
-        adjustments.push(`quantity: ${original} -> ${params.quantity}`);
-      }
-    }
-    if (params.icebergQty && filters.LOT_SIZE) {
-      const original = params.icebergQty;
-      params.icebergQty = this.alignToStep(params.icebergQty, filters.LOT_SIZE.stepSize);
-      this.assertFilterRange("icebergQty", params.icebergQty, filters.LOT_SIZE.minQty, filters.LOT_SIZE.maxQty);
-      if (compareDecimal(params.icebergQty, params.quantity || "0") > 0) {
-        throw new BinanceApiError("icebergQty 不能大于订单 quantity。");
-      }
-      if (original !== params.icebergQty) adjustments.push(`icebergQty: ${original} -> ${params.icebergQty}`);
-    }
-
-    const percentBySide = filters.PERCENT_PRICE_BY_SIDE;
-    const percentPrice = filters.PERCENT_PRICE;
-    const averagePrice = this.averagePriceCache.get(symbol);
-    const hasFreshAveragePrice = averagePrice &&
-      Date.now() - averagePrice.loadedAt <= DYNAMIC_PRICE_MAX_AGE_MS;
-
-    // 动态价格区间最终由撮合引擎原子校验。行情连接会持续缓存 avgPrice，
-    // 有新鲜缓存时才做本地预检，避免每笔委托前串行请求 /avgPrice。
-    if (params.price && (percentBySide || percentPrice) && hasFreshAveragePrice) {
-      const referencePrice = averagePrice.price;
-      if (percentBySide && isPositiveDecimal(referencePrice)) {
-        const upper = multiplyDecimal(referencePrice, side === "BUY" ? percentBySide.bidMultiplierUp : percentBySide.askMultiplierUp);
-        const lower = multiplyDecimal(referencePrice, side === "BUY" ? percentBySide.bidMultiplierDown : percentBySide.askMultiplierDown);
-        this.assertFilterRange("price", params.price, lower, upper);
-      } else if (percentPrice && isPositiveDecimal(referencePrice)) {
-        this.assertFilterRange("price", params.price, multiplyDecimal(referencePrice, percentPrice.multiplierDown), multiplyDecimal(referencePrice, percentPrice.multiplierUp));
-      }
-    }
-
-    const notionalReferencePrice = String(
-      params.price || params.stopPrice || orderSizing.referencePrice || 0
-    );
-    const notional = params.quoteOrderQty
-      ? params.quoteOrderQty
-      : multiplyDecimal(notionalReferencePrice, params.quantity || "0");
-    const notionalFilter = filters.NOTIONAL || filters.MIN_NOTIONAL;
-    if (isPositiveDecimal(notional) && notionalFilter) {
-      this.assertFilterRange(
-        "订单金额",
-        notional,
-        notionalFilter.minNotional,
-        notionalFilter.maxNotional
-      );
-    }
-
-    return { params, adjustments, symbolInfo, orderSizing };
-  }
-
-  async placeOrder(order, { testOnly = false } = {}) {
-    const { params, adjustments, symbolInfo, orderSizing } =
-      await this.prepareOrder(order);
-    this.assertTradingCredentials();
-    await this.ensureTradingServerTime();
-
-    if (this.preflightBalanceCheck) {
-      await this.validateAvailableBalance(params, symbolInfo);
-    }
-
-    let response;
-    try {
-      response = await this.requestWsApiWithRestFallback(
-        testOnly ? "order.test" : "order.place",
-        params,
-        () => this.request(
-          "POST",
-          testOnly ? "/v3/order/test" : "/v3/order",
-          params,
-          true,
-          this.tradingRestBase
-        ),
-        { retrySafe: testOnly, waitForWebSocketReady: true }
-      );
-    } catch (error) {
-      if (!testOnly) this.attachOrderAttempt(error, params);
-      throw error;
-    }
-    const { result, transport, fallbackReason } = response;
-    return {
-      ...result,
-      testOnly,
-      adjustments,
-      orderSizing,
-      selfTradePrevention: this.describeSelfTradePrevention(),
-      transport,
-      ...(fallbackReason ? { fallbackReason } : {}),
-      preflightBalanceCheck: this.preflightBalanceCheck,
-    };
-  }
-
-  async validateAvailableBalance(params, symbolInfo) {
-    const account = await this.accountStatus({ omitZeroBalances: false });
-    const balances = Object.fromEntries(
-      (account.balances || []).map((balance) => [balance.asset, Number(balance.free)])
-    );
-    const baseAsset = symbolInfo.baseAsset;
-    const quoteAsset = symbolInfo.quoteAsset;
-
-    if (params.side === "SELL") {
-      let required = Number(params.quantity || 0);
-      if (!required && params.quoteOrderQty) {
-        const reference = await this.resolveTotalOrderReferencePrice(
-          params.symbol
-        );
-        required = Number(params.quoteOrderQty) / reference.price;
-      }
-      const available = balances[baseAsset] || 0;
-      if (required > available) {
-        throw new BinanceApiError(
-          `${baseAsset} 可用余额不足：需要 ${required}，当前可用 ${available}。`
-        );
-      }
-      return { asset: baseAsset, required, available };
-    }
-
-    let required = Number(params.quoteOrderQty || 0);
-    if (!required) {
-      let referencePrice = Number(params.price || params.stopPrice || 0);
-      if (!referencePrice) {
-        const ticker = await this.requestPublicGet("/v3/ticker/price", {
-          symbol: params.symbol,
-        });
-        referencePrice = Number(ticker.price);
-      }
-      required = referencePrice * Number(params.quantity || 0);
-    }
-    const available = balances[quoteAsset] || 0;
-    if (required > available) {
-      throw new BinanceApiError(
-        `${quoteAsset} 可用余额不足：预计需要 ${required}，当前可用 ${available}。`
-      );
-    }
-    return { asset: quoteAsset, required, available };
-  }
-
-  async cancelOrder({
-    symbol,
-    orderId,
-    origClientOrderId,
-    cancelRestrictions,
-  }) {
-    const normalizedRestriction = String(cancelRestrictions || "").toUpperCase();
-    if (
-      normalizedRestriction &&
-      !["ONLY_NEW", "ONLY_PARTIALLY_FILLED"].includes(normalizedRestriction)
-    ) {
-      throw new BinanceApiError(
-        "cancelRestrictions 只支持 ONLY_NEW 或 ONLY_PARTIALLY_FILLED。"
-      );
-    }
-    const params = {
-      symbol: this.validateSymbol(symbol),
-      orderId,
-      origClientOrderId,
-      cancelRestrictions: normalizedRestriction || undefined,
-    };
-
-    if (!orderId && !origClientOrderId) {
-      throw new BinanceApiError(
-        "撤单必须提供 orderId 或 origClientOrderId。"
-      );
-    }
-
-    this.assertTradingCredentials();
-    await this.ensureTradingServerTime();
-
-    const { result, transport, fallbackReason } =
-      await this.requestWsApiWithRestFallback(
-        "order.cancel",
-        params,
-        () => this.request(
-          "DELETE",
-          "/v3/order",
-          params,
-          true,
-          this.tradingRestBase
-        ),
-        { retrySafe: false, waitForWebSocketReady: true }
-      );
-    return {
-      ...result,
-      transport,
-      ...(fallbackReason ? { fallbackReason } : {}),
-    };
   }
 
   async signedRest(method, path, params = {}, options = {}) {
@@ -1169,311 +638,6 @@ class BinanceSpotClient extends EventEmitter {
       options
     );
     return result;
-  }
-
-  async queryOrder({ symbol, orderId, origClientOrderId }) {
-    if (!orderId && !origClientOrderId) {
-      throw new BinanceApiError("查询单笔订单必须提供 orderId 或 origClientOrderId。");
-    }
-    return this.signedWsOrRest("order.status", "GET", "/v3/order", {
-      symbol: this.validateSymbol(symbol),
-      orderId,
-      origClientOrderId,
-    });
-  }
-
-  async openOrders({ symbol, critical = false } = {}) {
-    return this.signedWsOrRest("openOrders.status", "GET", "/v3/openOrders", {
-      symbol: symbol ? this.validateSymbol(symbol) : undefined,
-    }, { critical });
-  }
-
-  async cancelAllOpenOrders({ symbol }) {
-    const params = { symbol: this.validateSymbol(symbol) };
-    this.assertTradingCredentials();
-    await this.ensureTradingServerTime();
-
-    const { result } = await this.requestWsApiWithRestFallback(
-      "openOrders.cancelAll",
-      params,
-      () => this.request(
-        "DELETE",
-        "/v3/openOrders",
-        params,
-        true,
-        this.tradingRestBase
-      )
-    );
-    return result;
-  }
-
-  async amendOrder({ symbol, orderId, origClientOrderId, newQty, newClientOrderId }) {
-    if (!orderId && !origClientOrderId) {
-      throw new BinanceApiError("修改订单必须提供 orderId 或 origClientOrderId。");
-    }
-    if (!newQty || Number(newQty) <= 0) {
-      throw new BinanceApiError("修改订单必须提供大于 0 的 newQty。");
-    }
-
-    const info = await this.exchangeInfo(symbol);
-    const lotSize = info.symbol?.filters?.find((filter) => filter.filterType === "LOT_SIZE");
-    const alignedQty = lotSize
-      ? this.alignToStep(newQty, lotSize.stepSize)
-      : String(newQty);
-    return this.signedWsOrRest(
-      "order.amend.keepPriority",
-      "PUT",
-      "/v3/order/amend/keepPriority",
-      {
-        symbol: this.validateSymbol(symbol),
-        orderId,
-        origClientOrderId,
-        newQty: alignedQty,
-        newClientOrderId,
-      },
-      { retrySafe: false, waitForWebSocketReady: true }
-    );
-  }
-
-  async cancelReplace({
-    cancelOrderId,
-    cancelOrigClientOrderId,
-    cancelReplaceMode = "STOP_ON_FAILURE",
-    orderRateLimitExceededMode = "DO_NOTHING",
-    ...order
-  }) {
-    if (!cancelOrderId && !cancelOrigClientOrderId) {
-      throw new BinanceApiError("撤单重报必须提供原订单 ID。");
-    }
-    const { params: preparedParams, adjustments } = await this.prepareOrder(order);
-    const params = {
-      ...preparedParams,
-      cancelReplaceMode,
-      orderRateLimitExceededMode,
-      cancelOrderId,
-      cancelOrigClientOrderId,
-    };
-    const result = await this.signedWsOrRest(
-      "order.cancelReplace",
-      "POST",
-      "/v3/order/cancelReplace",
-      params,
-      { retrySafe: false, waitForWebSocketReady: true }
-    );
-    return {
-      ...result,
-      adjustments,
-      selfTradePrevention: this.describeSelfTradePrevention(),
-    };
-  }
-
-  async accountRateLimits() {
-    return this.signedWsOrRest(
-      "account.rateLimits.orders",
-      "GET",
-      "/v3/rateLimit/order"
-    );
-  }
-
-  async accountCommission({ symbol }) {
-    return this.signedWsOrRest(
-      "account.commission",
-      "GET",
-      "/v3/account/commission",
-      {
-        symbol: this.validateSymbol(symbol),
-      }
-    );
-  }
-
-  async queryOrderList({ orderListId, origClientOrderId }) {
-    if (!orderListId && !origClientOrderId) {
-      throw new BinanceApiError("查询组合订单必须提供 orderListId 或 origClientOrderId。");
-    }
-    return this.signedWsOrRest("orderList.status", "GET", "/v3/orderList", {
-      orderListId,
-      origClientOrderId,
-    });
-  }
-
-  async openOrderLists() {
-    return this.signedWsOrRest(
-      "openOrderLists.status",
-      "GET",
-      "/v3/openOrderList"
-    );
-  }
-
-  async cancelOrderList({ symbol, orderListId, listClientOrderId }) {
-    if (!orderListId && !listClientOrderId) {
-      throw new BinanceApiError("撤销组合订单必须提供 orderListId 或 listClientOrderId。");
-    }
-    return this.signedWsOrRest("orderList.cancel", "DELETE", "/v3/orderList", {
-      symbol: this.validateSymbol(symbol),
-      orderListId,
-      listClientOrderId,
-    });
-  }
-
-  async placeOco({
-    symbol,
-    side,
-    quantity,
-    abovePrice,
-    aboveStopPrice,
-    belowPrice,
-    belowStopPrice,
-  }) {
-    const normalizedSide = String(side || "").toUpperCase();
-    if (!["BUY", "SELL"].includes(normalizedSide)) {
-      throw new BinanceApiError("OCO 的 side 必须是 BUY 或 SELL。");
-    }
-    if (!quantity || !abovePrice || !belowPrice) {
-      throw new BinanceApiError("OCO 必须提供数量、上方价格和下方价格。");
-    }
-    if (normalizedSide === "SELL" && !belowStopPrice) {
-      throw new BinanceApiError("SELL OCO 必须提供下方触发价。");
-    }
-    if (normalizedSide === "BUY" && !aboveStopPrice) {
-      throw new BinanceApiError("BUY OCO 必须提供上方触发价。");
-    }
-
-    const info = await this.exchangeInfo(symbol);
-    const selfTradePreventionMode = this.requireSelfTradePrevention(
-      info.symbol
-    );
-    const filters = Object.fromEntries(
-      (info.symbol?.filters || []).map((filter) => [filter.filterType, filter])
-    );
-    const alignedQuantity = filters.LOT_SIZE
-      ? this.alignToStep(quantity, filters.LOT_SIZE.stepSize)
-      : String(quantity);
-    const alignPrice = (value) => filters.PRICE_FILTER
-      ? this.alignToStep(value, filters.PRICE_FILTER.tickSize)
-      : String(value);
-
-    const sideSpecificParams = normalizedSide === "SELL"
-      ? {
-          aboveType: "LIMIT_MAKER",
-          abovePrice: alignPrice(abovePrice),
-          belowType: "STOP_LOSS_LIMIT",
-          belowPrice: alignPrice(belowPrice),
-          belowStopPrice: alignPrice(belowStopPrice),
-          belowTimeInForce: "GTC",
-        }
-      : {
-          aboveType: "STOP_LOSS_LIMIT",
-          abovePrice: alignPrice(abovePrice),
-          aboveStopPrice: alignPrice(aboveStopPrice),
-          aboveTimeInForce: "GTC",
-          belowType: "LIMIT_MAKER",
-          belowPrice: alignPrice(belowPrice),
-        };
-
-    return this.signedWsOrRest(
-      "orderList.place.oco",
-      "POST",
-      "/v3/orderList/oco",
-      {
-        symbol: this.validateSymbol(symbol),
-        side: normalizedSide,
-        quantity: alignedQuantity,
-        ...sideSpecificParams,
-        selfTradePreventionMode,
-        newOrderRespType: "ACK",
-      },
-      { retrySafe: false, waitForWebSocketReady: true }
-    );
-  }
-
-  async placeOto({
-    symbol,
-    workingSide,
-    workingPrice,
-    workingQuantity,
-    pendingSide,
-    pendingPrice,
-    pendingQuantity,
-  }) {
-    if (!workingPrice || !workingQuantity || !pendingPrice || !pendingQuantity) {
-      throw new BinanceApiError("OTO 必须提供工作单和待触发单的价格与数量。");
-    }
-    const info = await this.exchangeInfo(symbol);
-    const selfTradePreventionMode = this.requireSelfTradePrevention(
-      info.symbol
-    );
-    const filters = Object.fromEntries((info.symbol?.filters || []).map((filter) => [filter.filterType, filter]));
-    const alignPrice = (value) => filters.PRICE_FILTER ? this.alignToStep(value, filters.PRICE_FILTER.tickSize) : String(value);
-    const alignQty = (value) => filters.LOT_SIZE ? this.alignToStep(value, filters.LOT_SIZE.stepSize) : String(value);
-    return this.signedWsOrRest(
-      "orderList.place.oto",
-      "POST",
-      "/v3/orderList/oto",
-      {
-        symbol: this.validateSymbol(symbol),
-        workingType: "LIMIT",
-        workingSide: String(workingSide).toUpperCase(),
-        workingPrice: alignPrice(workingPrice),
-        workingQuantity: alignQty(workingQuantity),
-        workingTimeInForce: "GTC",
-        pendingType: "LIMIT",
-        pendingSide: String(pendingSide).toUpperCase(),
-        pendingPrice: alignPrice(pendingPrice),
-        pendingQuantity: alignQty(pendingQuantity),
-        pendingTimeInForce: "GTC",
-        selfTradePreventionMode,
-        newOrderRespType: "ACK",
-      },
-      { retrySafe: false, waitForWebSocketReady: true }
-    );
-  }
-
-  async placeOtoco({
-    symbol,
-    workingSide,
-    workingPrice,
-    workingQuantity,
-    pendingSide,
-    pendingQuantity,
-    pendingAbovePrice,
-    pendingBelowPrice,
-    pendingBelowStopPrice,
-  }) {
-    const required = [workingPrice, workingQuantity, pendingQuantity, pendingAbovePrice, pendingBelowPrice, pendingBelowStopPrice];
-    if (required.some((value) => !value)) {
-      throw new BinanceApiError("OTOCO 的工作单及待触发 OCO 价格、数量必须填写完整。");
-    }
-    const info = await this.exchangeInfo(symbol);
-    const selfTradePreventionMode = this.requireSelfTradePrevention(
-      info.symbol
-    );
-    const filters = Object.fromEntries((info.symbol?.filters || []).map((filter) => [filter.filterType, filter]));
-    const alignPrice = (value) => filters.PRICE_FILTER ? this.alignToStep(value, filters.PRICE_FILTER.tickSize) : String(value);
-    const alignQty = (value) => filters.LOT_SIZE ? this.alignToStep(value, filters.LOT_SIZE.stepSize) : String(value);
-    return this.signedWsOrRest(
-      "orderList.place.otoco",
-      "POST",
-      "/v3/orderList/otoco",
-      {
-        symbol: this.validateSymbol(symbol),
-        workingType: "LIMIT",
-        workingSide: String(workingSide).toUpperCase(),
-        workingPrice: alignPrice(workingPrice),
-        workingQuantity: alignQty(workingQuantity),
-        workingTimeInForce: "GTC",
-        pendingSide: String(pendingSide).toUpperCase(),
-        pendingQuantity: alignQty(pendingQuantity),
-        pendingAboveType: "LIMIT_MAKER",
-        pendingAbovePrice: alignPrice(pendingAbovePrice),
-        pendingBelowType: "STOP_LOSS_LIMIT",
-        pendingBelowPrice: alignPrice(pendingBelowPrice),
-        pendingBelowStopPrice: alignPrice(pendingBelowStopPrice),
-        pendingBelowTimeInForce: "GTC",
-        selfTradePreventionMode,
-        newOrderRespType: "ACK",
-      },
-      { retrySafe: false, waitForWebSocketReady: true }
-    );
   }
 
   createWsApiSignature(params) {
@@ -1981,253 +1145,22 @@ class BinanceSpotClient extends EventEmitter {
     }
   }
 
-  async allOrders({ symbol, orderId, startTime, endTime, limit = 100 } = {}) {
-    return this.signedWsOrRest("allOrders", "GET", "/v3/allOrders", {
-      symbol: this.validateSymbol(symbol),
-      orderId,
-      startTime,
-      endTime,
-      limit,
-    });
-  }
-
-  async myTrades({
-    symbol,
-    orderId,
-    startTime,
-    endTime,
-    fromId,
-    limit = 100,
-  } = {}) {
-    return this.signedWsOrRest("myTrades", "GET", "/v3/myTrades", {
-      symbol: this.validateSymbol(symbol),
-      orderId,
-      startTime,
-      endTime,
-      fromId,
-      limit,
-    });
-  }
-
-  async accountStatus({ omitZeroBalances, critical = false } = {}) {
-    return this.signedWsOrRest("account.status", "GET", "/v3/account", {
-      ...(omitZeroBalances === undefined
-        ? {}
-        : { omitZeroBalances: Boolean(omitZeroBalances) }),
-    }, { critical });
-  }
-
-  async allOrderLists({ fromId, startTime, endTime, limit = 100 } = {}) {
-    return this.signedWsOrRest(
-      "allOrderLists",
-      "GET",
-      "/v3/allOrderList",
-      {
-        fromId,
-        startTime,
-        endTime,
-        limit,
-      }
-    );
-  }
-
-  async connectUserData() {
-    this.assertTradingCredentials();
-    if (this.userDataSocket?.readyState === WebSocket.OPEN && this.userDataSubscriptionId !== null) {
-      const result = { subscriptionId: this.userDataSubscriptionId, reused: true };
-      this.emit("user-data-status", {
-        status: "connected",
-        ...result,
-        time: Date.now(),
-      });
-      return result;
+  setDepthLevels(levels) {
+    const normalizedLevels = Number(levels);
+    if (!PARTIAL_DEPTH_LEVELS.has(normalizedLevels)) {
+      throw new TypeError("行情档位只支持 5、10 或 20 档。");
     }
 
-    this.disconnectUserData(true);
-    this.userDataManualClose = false;
-    this.userDataReconnectDelayMs = 1_000;
-    return this.openUserDataSocket();
+    this.depthDisplayLevels = normalizedLevels;
+    this.depthStreamLevels = normalizedLevels;
+    return normalizedLevels;
   }
 
-  async openUserDataSocket() {
-    const { offsetMs } = await this.ensureTradingServerTime();
-    const requestId = crypto.randomUUID();
-    const params = this.normalizeParams({
-      apiKey: this.apiKey,
-      recvWindow: 5_000,
-      timestamp: Date.now() + offsetMs,
-    });
-    params.signature = this.createWsApiSignature(params);
-
-    return new Promise((resolve, reject) => {
-      const subscriptionStartedAt = performance.now();
-      const socket = new WebSocket(this.wsApiBase);
-      let subscribed = false;
-      let latencyReported = false;
-      const reportSubscriptionLatency = (success, status) => {
-        if (latencyReported) return;
-        latencyReported = true;
-        this.emitApiLatency({
-          operation: "userDataStream.subscribe.signature",
-          transport: "websocket-api",
-          startedAt: subscriptionStartedAt,
-          success,
-          status,
-          background: true,
-        });
-      };
-      let timeoutId = setTimeout(() => {
-        if (!subscribed) {
-          reportSubscriptionLatency(false);
-          reject(new BinanceApiError("账户事件订阅超时。"));
-          socket.terminate();
-        }
-      }, 15_000);
-
-      this.userDataSocket = socket;
-      this.emit("user-data-status", {
-        status: "connecting",
-        url: this.wsApiBase,
-        time: Date.now(),
-      });
-
-      socket.on("open", () => {
-        socket.send(JSON.stringify({
-          id: requestId,
-          method: "userDataStream.subscribe.signature",
-          params,
-        }));
-      });
-
-      socket.on("message", (buffer) => {
-        let message;
-        try {
-          message = JSON.parse(buffer.toString());
-        } catch (error) {
-          this.emit("user-data-error", {
-            message: `账户事件解析失败：${error.message}`,
-            time: Date.now(),
-          });
-          return;
-        }
-
-        if (this.handleWsApiResponse(message, socket)) {
-          return;
-        }
-
-        if (message.id === requestId) {
-          if (message.error || (message.status && message.status >= 400)) {
-            const apiError = message.error || {};
-            clearTimeout(timeoutId);
-            reportSubscriptionLatency(false, message.status);
-            reject(new BinanceApiError(apiError.msg || "账户事件订阅失败。", {
-              status: message.status,
-              code: apiError.code,
-              data: message,
-            }));
-            this.userDataManualClose = true;
-            socket.close(1000, "subscription rejected");
-            return;
-          }
-
-          subscribed = true;
-          clearTimeout(timeoutId);
-          reportSubscriptionLatency(true, message.status);
-          this.userDataSubscriptionId = message.result?.subscriptionId ?? null;
-          this.userDataReconnectDelayMs = 1_000;
-          const result = { subscriptionId: this.userDataSubscriptionId };
-          this.emit("user-data-status", {
-            status: "connected",
-            ...result,
-            time: Date.now(),
-          });
-          resolve(result);
-          return;
-        }
-
-        if (message.event) {
-          this.emit("user-data-event", {
-            subscriptionId: message.subscriptionId,
-            event: message.event,
-            receivedAt: Date.now(),
-          });
-        }
-      });
-
-      socket.on("error", (error) => {
-        this.emit("user-data-error", {
-          message: error.message,
-          time: Date.now(),
-        });
-        if (!subscribed) {
-          clearTimeout(timeoutId);
-          reportSubscriptionLatency(false);
-          reject(new BinanceApiError(`账户事件连接失败：${error.message}`));
-        }
-      });
-
-      socket.on("close", (code, reasonBuffer) => {
-        clearTimeout(timeoutId);
-        if (!subscribed) reportSubscriptionLatency(false);
-        this.rejectWsApiRequestsForSocket(
-          socket,
-          new BinanceApiError("Binance WebSocket API 持久连接已关闭。", {
-            data: { code, reason: reasonBuffer?.toString() || "", url: this.wsApiBase },
-          })
-        );
-        if (this.userDataSocket !== socket) return;
-        this.userDataSocket = null;
-        this.userDataSubscriptionId = null;
-        const reason = reasonBuffer?.toString() || "";
-        this.emit("user-data-status", {
-          status: this.userDataManualClose ? "disconnected" : "reconnecting",
-          code,
-          reason,
-          time: Date.now(),
-        });
-        if (!this.userDataManualClose) {
-          this.scheduleUserDataReconnect();
-        }
-      });
-    });
-  }
-
-  scheduleUserDataReconnect() {
-    clearTimeout(this.userDataReconnectTimer);
-    const delay = this.userDataReconnectDelayMs;
-    this.userDataReconnectDelayMs = Math.min(delay * 2, 30_000);
-    this.userDataReconnectTimer = setTimeout(() => {
-      this.openUserDataSocket().catch((error) => {
-        this.emit("user-data-error", { message: error.message, time: Date.now() });
-      });
-    }, delay);
-  }
-
-  disconnectUserData(manual = true) {
-    this.userDataManualClose = manual;
-    clearTimeout(this.userDataReconnectTimer);
-    this.userDataReconnectTimer = null;
-    this.userDataSubscriptionId = null;
-
-    if (this.userDataSocket) {
-      const socket = this.userDataSocket;
-      this.userDataSocket = null;
-      this.rejectWsApiRequestsForSocket(
-        socket,
-        new BinanceApiError("Binance WebSocket API 持久连接已断开。")
-      );
-      if (socket.readyState === WebSocket.OPEN) {
-        socket.close(1000, "client disconnect");
-      } else {
-        socket.terminate();
-      }
-    }
-
-    return { disconnected: true };
-  }
-
-  connectDepth(symbol) {
+  connectDepth(symbol, { depthLevels } = {}) {
     const normalizedSymbol = this.validateSymbol(symbol);
+    if (depthLevels !== undefined) {
+      this.setDepthLevels(depthLevels);
+    }
     this.disconnectMarket();
 
     this.marketSymbol = normalizedSymbol;
@@ -2289,13 +1222,6 @@ class BinanceSpotClient extends EventEmitter {
         connected = true;
         reportConnectLatency(true);
         this.tradeReconnectDelayMs = 1_000;
-        if (this.supportsAveragePriceStream) {
-          socket.send(JSON.stringify({
-            method: "SUBSCRIBE",
-            params: [`${symbol.toLowerCase()}@avgPrice`],
-            id: Date.now(),
-          }));
-        }
       }
     });
 
@@ -2306,16 +1232,6 @@ class BinanceSpotClient extends EventEmitter {
 
       try {
         const message = JSON.parse(buffer.toString());
-
-        if (message.e === "avgPrice") {
-          this.averagePriceCache.set(symbol, {
-            price: String(message.w),
-            loadedAt: Date.now(),
-            eventTime: Number(message.E),
-          });
-          return;
-        }
-
         if (message.e !== "trade") {
           return;
         }
@@ -2326,14 +1242,6 @@ class BinanceSpotClient extends EventEmitter {
           loadedAt: receivedAt,
           eventTime: Number(message.E),
         });
-
-        if (!this.supportsAveragePriceStream) {
-          this.averagePriceCache.set(symbol, {
-            price: String(message.p),
-            loadedAt: receivedAt,
-            eventTime: Number(message.E),
-          });
-        }
 
         this.emit("trade-update", {
           marketType: this.marketType,
@@ -2446,12 +1354,11 @@ class BinanceSpotClient extends EventEmitter {
         return;
       }
 
-      const isSpotPartialDepth =
-        Array.isArray(message.bids) && Array.isArray(message.asks);
-      const isFuturesPartialDepth =
-        message.e === "depthUpdate" &&
-        Array.isArray(message.b) && Array.isArray(message.a);
-      if (!isSpotPartialDepth && !isFuturesPartialDepth) {
+      if (
+        message.e !== "depthUpdate" ||
+        !Array.isArray(message.b) ||
+        !Array.isArray(message.a)
+      ) {
         return;
       }
       this.emitPartialDepthUpdate(message, symbol);
@@ -2502,9 +1409,9 @@ class BinanceSpotClient extends EventEmitter {
   }
 
   emitPartialDepthUpdate(message, symbol = this.marketSymbol) {
-    const lastUpdateId = Number(message.lastUpdateId ?? message.u);
-    const bids = this.normalizePartialDepthLevels(message.bids || message.b);
-    const asks = this.normalizePartialDepthLevels(message.asks || message.a);
+    const lastUpdateId = Number(message.u);
+    const bids = this.normalizePartialDepthLevels(message.b);
+    const asks = this.normalizePartialDepthLevels(message.a);
 
     this.emit("depth-update", {
       marketType: this.marketType,
@@ -2514,6 +1421,8 @@ class BinanceSpotClient extends EventEmitter {
       finalUpdateId: message.u === undefined ? null : Number(message.u),
       eventTime: message.E ?? null,
       receivedAt: Date.now(),
+      streamLevels: this.depthStreamLevels,
+      displayLevels: this.depthDisplayLevels,
       bids,
       asks,
     });
@@ -2596,7 +1505,7 @@ class BinanceSpotClient extends EventEmitter {
 }
 
 module.exports = {
-  BinanceSpotClient,
+  BinanceClientBase,
   BinanceApiError,
   REQUIRED_SELF_TRADE_PREVENTION_MODE,
 };
