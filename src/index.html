@@ -530,6 +530,30 @@
         margin: 0;
       }
 
+      .chart-symbol-toolbar select {
+        width: auto;
+        min-width: 82px;
+      }
+
+      .leverage-status {
+        min-width: 90px;
+        font-size: 13px;
+        font-weight: 700;
+      }
+
+      .leverage-status[data-state="ready"] {
+        color: #159447;
+      }
+
+      .leverage-status[data-state="loading"],
+      .leverage-status[data-state="cached"] {
+        color: #b47a00;
+      }
+
+      .leverage-status[data-state="error"] {
+        color: #d0001b;
+      }
+
       .chart-symbol-status {
         font-size: 13px;
         opacity: 0.78;
@@ -914,6 +938,17 @@
         <label for="chartSymbolInput">全局合约</label>
         <input id="chartSymbolInput" value="MUUSDT" autocomplete="off" spellcheck="false" />
         <button id="switchChartSymbolButton" type="button">切换行情</button>
+        <label for="leverageSelect">杠杆倍率</label>
+        <select id="leverageSelect" aria-label="设置当前合约杠杆倍率" disabled>
+          <option value="">读取中</option>
+        </select>
+        <span
+          id="leverageStatus"
+          class="leverage-status"
+          data-state="loading"
+          role="status"
+          aria-live="polite"
+        >读取中…</span>
         <span id="chartSymbolSwitchStatus" class="chart-symbol-status">当前：BTCUSDT</span>
         <span class="chart-latest-trade">
           最新成交价：<span id="chartLatestTradePrice">-</span>
@@ -925,6 +960,7 @@
       </div>
       
       <p id="chartOpenOrderStatus" class="chart-order-status">
+        实色买卖柱：当前档位；半透明买卖柱：本次行情连接中最后一次观察值；
         <span class="open-order">鲜红色柱：自有未成交挂单</span>，等待账户订单数据
       </p>
       <p class="chart-order-status">
@@ -962,7 +998,7 @@
           </div>
         </div>
         <p id="zoomChartReadonlyNote" class="chart-order-status zoom-chart-readonly-note">
-          此画布仅供查看，不支持鼠标下单；行情仅聚合当前已接收的档位。
+          此画布仅供查看，不支持鼠标下单；每帧聚合当前已接收档位，并半透明保留本次连接中已经观察到的历史聚合价位。
         </p>
       </section>
       <div class="grid">

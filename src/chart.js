@@ -42,7 +42,10 @@ class Chart {
             volumeScaleTick,
             volumeScaleType,
             volumeXOffset = 0,
-            volumeYOffset = 0
+            volumeYOffset = 0,
+            depthRetentionMode = 'snapshot',
+            historicalDepthOpacity = 0.5,
+            maxHistoricalDepthEntries = 10000
         } = config
         this.ctx = dom.getContext('2d');
         this.rendered = false;
@@ -54,6 +57,18 @@ class Chart {
         this.volumeScaleTick = volumeScaleTick;
         this.volumeXOffset = volumeXOffset;
         this.volumeYOffset = volumeYOffset;
+        this.depthRetentionMode = depthRetentionMode === 'history'
+            ? 'history'
+            : 'snapshot';
+        const normalizedHistoricalDepthOpacity = Number(historicalDepthOpacity);
+        this.historicalDepthOpacity = Number.isFinite(normalizedHistoricalDepthOpacity)
+            ? Math.min(1, Math.max(0, normalizedHistoricalDepthOpacity))
+            : 0.5;
+        const normalizedHistoryLimit = Math.floor(Number(maxHistoricalDepthEntries));
+        this.maxHistoricalDepthEntries = Number.isFinite(normalizedHistoryLimit) &&
+            normalizedHistoryLimit > 0
+            ? normalizedHistoryLimit
+            : 10000;
         this.width = width;
         this.height = height;
         this.step = parseFloat(step);
@@ -68,6 +83,9 @@ class Chart {
         this.placeOrder=[];
         this.traded ={};
         this.depthRenderId = 0;
+        this.depthHistorySequence = 0;
+        this.buyDepthHistory = new Map();
+        this.askDepthHistory = new Map();
         this.init();
     }
 
@@ -110,6 +128,7 @@ class Chart {
     }
     reset(){
         this.ctx.clearRect(0, 0, this.width, this.height);
+        this.resetDepthHistory();
         this.rendered = false;
         this.data = [];
         this.start = 0;
@@ -123,6 +142,30 @@ class Chart {
         this.traded = {};
         this.depthRenderId = 0;
         this.init();
+    }
+    resetDepthHistory(){
+        if(!(this.buyDepthHistory instanceof Map)){
+            this.buyDepthHistory = new Map();
+        }else{
+            this.buyDepthHistory.clear();
+        }
+        if(!(this.askDepthHistory instanceof Map)){
+            this.askDepthHistory = new Map();
+        }else{
+            this.askDepthHistory.clear();
+        }
+        this.depthHistorySequence = 0;
+        this.depthRenderId = 0;
+        if(Array.isArray(this.data)){
+            this.data.forEach(item => {
+                delete item.buyDepthVolume;
+                delete item.buyDepthRenderId;
+                delete item.askDepthVolume;
+                delete item.askDepthRenderId;
+                delete item.volum;
+                delete item.type;
+            });
+        }
     }
     setStep(step){
         const normalizedStep = Number(step);
@@ -375,6 +418,93 @@ class Chart {
 
         }
     }
+    getDepthHistory(side){
+        const property = side === 'buy'
+            ? 'buyDepthHistory'
+            : 'askDepthHistory';
+        if(!(this[property] instanceof Map)){
+            this[property] = new Map();
+        }
+        return this[property];
+    }
+    syncDepthHistory(side, entries, renderId){
+        if(this.depthRetentionMode !== 'history') return;
+
+        const history = this.getDepthHistory(side);
+        const currentEntries = new Map();
+        entries.forEach(entry => {
+            const price = Number(entry?.price);
+            if(!Number.isFinite(price)) return;
+            currentEntries.set(String(entry.price), entry);
+        });
+
+        if(currentEntries.size){
+            const prices = Array.from(currentEntries.keys(), Number);
+            const lowestPrice = Math.min(...prices);
+            const highestPrice = Math.max(...prices);
+            history.forEach((_entry, priceKey) => {
+                const price = Number(priceKey);
+                if(
+                    price >= lowestPrice &&
+                    price <= highestPrice &&
+                    !currentEntries.has(priceKey)
+                ){
+                    history.delete(priceKey);
+                }
+            });
+        }
+
+        currentEntries.forEach((entry, priceKey) => {
+            if(!(Number(entry.volume) > 0)){
+                history.delete(priceKey);
+                return;
+            }
+            history.delete(priceKey);
+            history.set(priceKey, {
+                price: priceKey,
+                volume: entry.volume,
+                renderId,
+                sequence: ++this.depthHistorySequence
+            });
+        });
+    }
+    trimDepthHistory(){
+        if(this.depthRetentionMode !== 'history') return;
+
+        const buyHistory = this.getDepthHistory('buy');
+        const askHistory = this.getDepthHistory('ask');
+        const configuredLimit = Math.floor(Number(this.maxHistoricalDepthEntries));
+        const limit = Number.isFinite(configuredLimit) && configuredLimit > 0
+            ? configuredLimit
+            : 10000;
+        while(buyHistory.size + askHistory.size > limit){
+            const oldestBuy = buyHistory.entries().next().value;
+            const oldestAsk = askHistory.entries().next().value;
+            if(!oldestAsk || (
+                oldestBuy &&
+                oldestBuy[1].sequence <= oldestAsk[1].sequence
+            )){
+                buyHistory.delete(oldestBuy[0]);
+            }else{
+                askHistory.delete(oldestAsk[0]);
+            }
+        }
+    }
+    getDepthPoint(depthItem, side){
+        if(this.depthRetentionMode === 'history'){
+            const entry = this.getDepthHistory(side).get(String(depthItem.price));
+            if(!entry || !(Number(entry.volume) > 0)) return null;
+            return {
+                volume: entry.volume,
+                current: entry.renderId === this.depthRenderId
+            };
+        }
+
+        const renderId = depthItem[`${side}DepthRenderId`];
+        const volume = depthItem[`${side}DepthVolume`];
+        if(renderId !== this.depthRenderId || !(Number(volume) > 0)) return null;
+        return {volume, current: true};
+    }
     renderVolume(){
         const ctx = this.ctx;
 
@@ -383,6 +513,26 @@ class Chart {
         const buyIndex = this.buyIndex;
         const askIndex = this.askIndex;
         const barWidth = this.barWidth;
+        const originalAlpha = Number.isFinite(ctx.globalAlpha)
+            ? ctx.globalAlpha
+            : 1;
+        const configuredHistoricalAlpha = Number(this.historicalDepthOpacity);
+        const historicalAlpha = Number.isFinite(configuredHistoricalAlpha)
+            ? Math.min(1, Math.max(0, configuredHistoricalAlpha))
+            : 0.5;
+        const drawDepthBar = (point, x, width, color) => {
+            ctx.globalAlpha = point.current
+                ? originalAlpha
+                : originalAlpha * historicalAlpha;
+            ctx.fillStyle = color;
+            ctx.fillRect(
+                x,
+                y,
+                width,
+                Chart.getHeight(this.range, point.volume, this.volumeScaleHeight)
+            );
+            ctx.globalAlpha = originalAlpha;
+        };
         let askX,askY, askV, buyX,buY, buyV;
         for(let i = this.start; (i-this.start)  <= this.count; i ++ ){
             if(!this.data[i]){
@@ -390,104 +540,81 @@ class Chart {
                 continue;
             }
             const depthItem = this.data[i];
-            const overlappingBuyVolume =
-                depthItem.buyDepthRenderId === this.depthRenderId
-                    ? depthItem.buyDepthVolume
-                    : null;
-            const overlappingAskVolume =
-                depthItem.askDepthRenderId === this.depthRenderId
-                    ? depthItem.askDepthVolume
-                    : null;
-            if(
-                Number(overlappingBuyVolume) > 0 &&
-                Number(overlappingAskVolume) > 0
-            ){
+            let buyPoint = this.getDepthPoint(depthItem, 'buy');
+            let askPoint = this.getDepthPoint(depthItem, 'ask');
+            if(buyPoint && i > buyIndex){
+                buyPoint = null;
+            }
+            if(askPoint && i < askIndex){
+                askPoint = null;
+            }
+            if(buyPoint && askPoint){
                 const x = _x + (i-this.start) * barWidth;
                 const availableWidth = Math.max(2, barWidth - 1);
                 const buyWidth = Math.floor(availableWidth / 2);
                 const askWidth = availableWidth - buyWidth;
-                ctx.fillStyle = i === buyIndex
-                    ? VALUECOLOR['buy1']
-                    : VALUECOLOR['buy'];
-                ctx.fillRect(
+                drawDepthBar(
+                    buyPoint,
                     x,
-                    y,
                     buyWidth,
-                    Chart.getHeight(this.range, overlappingBuyVolume, this.volumeScaleHeight)
+                    i === buyIndex ? VALUECOLOR['buy1'] : VALUECOLOR['buy']
                 );
-                ctx.fillStyle = i === askIndex
-                    ? VALUECOLOR['ask1']
-                    : VALUECOLOR['ask'];
-                ctx.fillRect(
+                drawDepthBar(
+                    askPoint,
                     x + buyWidth,
-                    y,
                     askWidth,
-                    Chart.getHeight(this.range, overlappingAskVolume, this.volumeScaleHeight)
+                    i === askIndex ? VALUECOLOR['ask1'] : VALUECOLOR['ask']
                 );
-                if(i === buyIndex){
+                if(i === buyIndex && buyPoint.current){
                     buyX = x + buyWidth - this.volumeXOffset;
                     buY = this.volumeYOffset > 0
                         ? y + this.volumeYOffset
                         : y;
-                    buyV = overlappingBuyVolume;
+                    buyV = buyPoint.volume;
                 }
-                if(i === askIndex){
+                if(i === askIndex && askPoint.current){
                     askX = x + buyWidth + this.volumeXOffset;
                     askY = this.volumeYOffset < 0
                         ? y - this.volumeYOffset
                         : y;
-                    askV = overlappingAskVolume;
+                    askV = askPoint.volume;
                 }
                 continue;
             }
-            const hasCurrentBuyVolume = Number(overlappingBuyVolume) > 0;
-            const hasCurrentAskVolume = Number(overlappingAskVolume) > 0;
-            if(!hasCurrentBuyVolume && !hasCurrentAskVolume){
+            if(!buyPoint && !askPoint){
                 continue;
             }
-            const volum = hasCurrentBuyVolume
-                ? overlappingBuyVolume
-                : overlappingAskVolume;
-            const type = hasCurrentBuyVolume ? 'buy' : 'ask';
-            if(i> buyIndex && i<askIndex){
-                continue
+            const point = buyPoint || askPoint;
+            const type = buyPoint ? 'buy' : 'ask';
+            let color = VALUECOLOR[type];
+            if(i === buyIndex && type === 'buy'){
+                color = VALUECOLOR['buy1'];
+            }else if(i === askIndex && type === 'ask'){
+                color = VALUECOLOR['ask1'];
             }
 
-            if(volum){
-                if((type === 'buy' && i > buyIndex) || (type ==='ask' && i < askIndex)){
-                    continue;
-                }
-                if(i=== buyIndex && type === 'buy'){
-                    ctx.fillStyle= VALUECOLOR['buy1'];
-                }else if(i===askIndex && type === 'ask'){
-                    ctx.fillStyle= VALUECOLOR['ask1'];
-                }else{
-                    ctx.fillStyle= VALUECOLOR[type];
-                }
+            const  x = _x + (i-this.start) * barWidth;
+            drawDepthBar(point, x, barWidth - 1, color);
 
-                const  x = _x + (i-this.start) * barWidth;
-                const height = Chart.getHeight(this.range, volum, this.volumeScaleHeight);
-                ctx.fillRect(x,y,barWidth -1,height);
-
-                if(i === askIndex){
-                    askX = x + this.volumeXOffset;
-                    askY = y;
-                    if(this.volumeYOffset < 0){
-                        askY = askY - this.volumeYOffset
-                    }
-                    askV = volum;
-                } else if(i === buyIndex ){
-                    buyX = x + barWidth - this.volumeXOffset;
-                    buY = y;
-                    buyV = volum
-                    if(this.volumeYOffset > 0){
-                        buY = buY + this.volumeYOffset
-                    }
+            if(point.current && i === askIndex && type === 'ask'){
+                askX = x + this.volumeXOffset;
+                askY = y;
+                if(this.volumeYOffset < 0){
+                    askY = askY - this.volumeYOffset
+                }
+                askV = point.volume;
+            } else if(point.current && i === buyIndex && type === 'buy'){
+                buyX = x + barWidth - this.volumeXOffset;
+                buY = y;
+                buyV = point.volume
+                if(this.volumeYOffset > 0){
+                    buY = buY + this.volumeYOffset
                 }
             }
 
         }
 
+        ctx.globalAlpha = originalAlpha;
         ctx.save();
         ctx.font= '12px 宋体';
         ctx.fillStyle= FONTCOLOR;
@@ -502,6 +629,7 @@ class Chart {
             ctx.fillText(askV, askX , askY + 10);
         }
         ctx.stroke();
+        ctx.restore();
     }
     clearData(startPrice, endPrice){
         if(!startPrice || !endPrice) return;
@@ -843,6 +971,10 @@ class Chart {
         );
         this.depthRenderId += 1;
         const depthRenderId = this.depthRenderId;
+        const depthFrame = {
+            buy: [],
+            ask: []
+        };
         const deepestBid = arg[`BidPrice${depthLevelCount}`];
         const deepestAsk = arg[`AskPrice${depthLevelCount}`];
         if(deepestBid && deepestBid <= Number.MAX_SAFE_INTEGER){
@@ -865,6 +997,10 @@ class Chart {
                     buyData.type = 'buy';
                     buyData.buyDepthVolume = arg[`BidVolume${i}`];
                     buyData.buyDepthRenderId = depthRenderId;
+                    depthFrame.buy.push({
+                        price: buyData.price,
+                        volume: arg[`BidVolume${i}`]
+                    });
                 }
             }
 
@@ -879,6 +1015,10 @@ class Chart {
                     askData.type = 'ask';
                     askData.askDepthVolume = arg[`AskVolume${i}`];
                     askData.askDepthRenderId = depthRenderId;
+                    depthFrame.ask.push({
+                        price: askData.price,
+                        volume: arg[`AskVolume${i}`]
+                    });
                 }
             }
 
@@ -897,6 +1037,9 @@ class Chart {
 
             }
         }
+        this.syncDepthHistory('buy', depthFrame.buy, depthRenderId);
+        this.syncDepthHistory('ask', depthFrame.ask, depthRenderId);
+        this.trimDepthHistory();
         this.lowerLimitPrice = arg.LowerLimitPrice;
         this.UpperLimitPrice = arg.UpperLimitPrice;
         this.lowerLimitindex = this.getindex(arg.LowerLimitPrice, true);

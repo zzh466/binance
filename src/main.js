@@ -58,6 +58,17 @@ const {
 } = require("./positionSafety");
 const { resolveCancelOrderRequest } = require("./cancelOrderResolver");
 const { resolveDefaultTestnet } = require("./environmentSelection");
+const {
+  LeverageConfigStore,
+  resolveLeverageConfigPath,
+} = require("./leverageConfigStore");
+const {
+  loadFuturesLeverageCache,
+  queryFuturesLeverage,
+  resolveFuturesLeverageScope,
+  setFuturesLeverage,
+} = require("./futuresLeverageService");
+const { LeverageChangeGate } = require("./leverageChangeGate");
 
 function loadEnvironmentFile() {
   const packagedEnvironmentPath = getPackagedEnvironmentPath({
@@ -125,6 +136,10 @@ const shortcutConfigPath = path.join(
   "Binance统一交易台",
   "shortcut-settings.json"
 );
+const leverageConfigStore = new LeverageConfigStore(
+  resolveLeverageConfigPath(app.getPath("appData"))
+);
+const leverageChangeGate = new LeverageChangeGate();
 const recentOrderStorePath = path.join(
   app.getPath("userData"),
   "recent-orders.json"
@@ -942,6 +957,18 @@ function getPositionScope(targetClient = client) {
   };
 }
 
+function getLeverageConfigScope(targetClient = client) {
+  const futureAccountId = targetClient === client
+    ? String(authenticatedManagerSession?.futureAccountId ?? "").trim()
+    : "";
+  const accountFingerprint = fingerprintApiKey(targetClient?.futures?.apiKey);
+  return resolveFuturesLeverageScope({
+    testnet: targetClient?.testnet,
+    futureAccountId,
+    accountFingerprint,
+  });
+}
+
 function getDisplayedManagerUserInfo() {
   if (!authenticatedManagerUserInfo) return null;
   const metrics = latestBinanceAccountMetrics;
@@ -1730,6 +1757,40 @@ function registerIpcHandlers() {
     }));
   });
 
+  ipcMain.handle("binance:leverage-cache", async (_event, payload) => {
+    return safeCall(async () => loadFuturesLeverageCache({
+      store: leverageConfigStore,
+      scope: getLeverageConfigScope(client),
+      symbol: client.validateSymbol(payload?.symbol),
+    }));
+  });
+
+  ipcMain.handle("binance:leverage-config", async (_event, payload) => {
+    return safeCall(() => queryFuturesLeverage({
+      client,
+      store: leverageConfigStore,
+      scope: getLeverageConfigScope(client),
+      symbol: payload?.symbol,
+    }));
+  });
+
+  ipcMain.handle("binance:set-leverage", async (_event, payload) => {
+    return safeCall(() => {
+      const targetClient = client;
+      const symbol = targetClient.validateSymbol(payload?.symbol);
+      const scope = getLeverageConfigScope(targetClient);
+      return leverageChangeGate.run(targetClient, symbol, () =>
+        setFuturesLeverage({
+          client: targetClient,
+          store: leverageConfigStore,
+          scope,
+          symbol,
+          leverage: payload?.leverage,
+        })
+      );
+    });
+  });
+
   ipcMain.handle("binance:market-overview", async (_event, payload) => {
     return safeCall(() => client.marketOverview(payload?.symbol, payload || {}));
   });
@@ -1756,18 +1817,30 @@ function registerIpcHandlers() {
     const submissionSource = String(triggerSource || "unknown")
       .replace(/[^A-Za-z0-9:_-]/g, "")
       .slice(0, 64) || "unknown";
-    return safeCall(() => trackOrderCall(
-      () => client.placeOrder(order),
-      {
-        defaultStatus: "ACKNOWLEDGED",
-        submissionSource,
-        source: "place-order",
-      }
-    ));
+    return safeCall(() => {
+      leverageChangeGate.assertOrderAllowed(
+        client,
+        client.validateSymbol(order.symbol)
+      );
+      return trackOrderCall(
+        () => client.placeOrder(order),
+        {
+          defaultStatus: "ACKNOWLEDGED",
+          submissionSource,
+          source: "place-order",
+        }
+      );
+    });
   });
 
   ipcMain.handle("binance:test-order", async (_event, payload) => {
-    return safeCall(() => client.placeOrder(payload || {}, { testOnly: true }));
+    return safeCall(() => {
+      leverageChangeGate.assertOrderAllowed(
+        client,
+        client.validateSymbol(payload?.symbol)
+      );
+      return client.placeOrder(payload || {}, { testOnly: true });
+    });
   });
 
   ipcMain.handle("binance:cancel-order", async (_event, payload) => {
@@ -1852,17 +1925,29 @@ function registerIpcHandlers() {
   });
 
   ipcMain.handle("binance:amend-order", async (_event, payload) => {
-    return safeCall(() => trackOrderCall(
-      () => client.amendOrder(payload || {}),
-      { source: "amend-order" }
-    ));
+    return safeCall(() => {
+      leverageChangeGate.assertOrderAllowed(
+        client,
+        client.validateSymbol(payload?.symbol)
+      );
+      return trackOrderCall(
+        () => client.amendOrder(payload || {}),
+        { source: "amend-order" }
+      );
+    });
   });
 
   ipcMain.handle("binance:cancel-replace", async (_event, payload) => {
-    return safeCall(() => trackOrderCall(
-      () => client.cancelReplace(payload || {}),
-      { source: "cancel-replace" }
-    ));
+    return safeCall(() => {
+      leverageChangeGate.assertOrderAllowed(
+        client,
+        client.validateSymbol(payload?.symbol)
+      );
+      return trackOrderCall(
+        () => client.cancelReplace(payload || {}),
+        { source: "cancel-replace" }
+      );
+    });
   });
 
   ipcMain.handle("binance:all-orders", async (_event, payload) => {

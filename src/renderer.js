@@ -14,6 +14,11 @@ let activeDepthLevels = DEFAULT_DEPTH_LEVELS;
 let activeDepthSpeed = "100ms";
 let depthLevelSwitchBusy = false;
 let tradFiAgreementBusy = false;
+let leverageLoadRevision = 0;
+let activeLeverageConfig = null;
+let leverageChangePending = null;
+let leverageConfigRefreshTimer = null;
+let marketSwitchRevision = 0;
 const tradingRoundsById = new Map();
 let activeRoundChartOverlay = null;
 let latestPositionSnapshot = null;
@@ -42,6 +47,210 @@ function formatError(result) {
   ]
     .filter(Boolean)
     .join("；");
+}
+
+function normalizeLeverageValue(value) {
+  const leverage = Number(value);
+  return Number.isInteger(leverage) && leverage >= 1 && leverage <= 125
+    ? leverage
+    : null;
+}
+
+function getLeverageValues(data = {}) {
+  const maxLeverage = normalizeLeverageValue(data.maxLeverage);
+  const suppliedOptions = Array.isArray(data.options)
+    ? data.options
+      .map((item) => normalizeLeverageValue(item?.value ?? item))
+      .filter(Boolean)
+    : [];
+  const values = suppliedOptions.length
+    ? suppliedOptions
+    : maxLeverage
+      ? Array.from({ length: maxLeverage }, (_item, index) => index + 1)
+      : [];
+  return [...new Set(values)].sort((left, right) => left - right);
+}
+
+function replaceLeverageOptions(values, selectedLeverage, placeholder = "读取中") {
+  const selected = normalizeLeverageValue(selectedLeverage);
+  const normalizedValues = [...new Set((values || [])
+    .map(normalizeLeverageValue)
+    .filter(Boolean))]
+    .sort((left, right) => left - right);
+  if (selected && !normalizedValues.includes(selected)) {
+    normalizedValues.push(selected);
+    normalizedValues.sort((left, right) => left - right);
+  }
+
+  const fragment = document.createDocumentFragment();
+  if (!normalizedValues.length) {
+    const option = document.createElement("option");
+    option.value = "";
+    option.textContent = placeholder;
+    fragment.append(option);
+  } else {
+    for (const leverage of normalizedValues) {
+      const option = document.createElement("option");
+      option.value = String(leverage);
+      option.textContent = `${leverage}x`;
+      fragment.append(option);
+    }
+  }
+  elements.leverageSelect.replaceChildren(fragment);
+  elements.leverageSelect.value = selected ? String(selected) : "";
+}
+
+function setLeverageStatus(text, state = "loading", title = "") {
+  elements.leverageStatus.textContent = text;
+  elements.leverageStatus.dataset.state = state;
+  elements.leverageStatus.title = title;
+}
+
+function getInputSymbol() {
+  return String(elements.chartSymbolInput.value || "").trim().toUpperCase();
+}
+
+function isCurrentLeverageRequest(symbol, revision) {
+  return revision === leverageLoadRevision && getInputSymbol() === symbol;
+}
+
+function updateLeverageTradingControls() {
+  const blocked = Boolean(
+    leverageChangePending && leverageChangePending.symbol === getInputSymbol()
+  );
+  const placeOrderButton = document.querySelector("#placeOrderButton");
+  const testOrderButton = document.querySelector("#testOrderButton");
+  if (placeOrderButton) placeOrderButton.disabled = blocked;
+  if (testOrderButton) testOrderButton.disabled = blocked;
+}
+
+function getLeverageOrderBlock(order) {
+  const symbol = String(order?.symbol || "").trim().toUpperCase();
+  if (!leverageChangePending || leverageChangePending.symbol !== symbol) {
+    return null;
+  }
+  return {
+    ok: false,
+    error: {
+      name: "LeverageChangeInProgressError",
+      message: `${symbol} 正在设置杠杆倍率，请等待 Binance 确认后再下单。`,
+    },
+  };
+}
+
+function rendererCallFailure(error, fallbackMessage) {
+  return {
+    ok: false,
+    error: {
+      name: error?.name || "Error",
+      message: error?.message || fallbackMessage,
+    },
+  };
+}
+
+async function loadLeverageForSymbol(
+  rawSymbol,
+  { showResult = false, allowWhilePending = false } = {}
+) {
+  const symbol = String(rawSymbol || "").trim().toUpperCase();
+  if (!/^[A-Z0-9]{5,24}$/.test(symbol)) return null;
+  if (!allowWhilePending && leverageChangePending?.symbol === symbol) {
+    setLeverageStatus(
+      `设置中：${leverageChangePending.requestedLeverage}x…`,
+      "loading",
+      "正在等待 Binance 确认杠杆倍率"
+    );
+    return null;
+  }
+
+  const revision = ++leverageLoadRevision;
+  activeLeverageConfig = null;
+  elements.leverageSelect.disabled = true;
+  replaceLeverageOptions([], null, "读取中");
+  setLeverageStatus("读取中…", "loading", `正在查询 ${symbol} 的杠杆配置`);
+  updateLeverageTradingControls();
+
+  const cachePromise = window.binance.leverageCache({ symbol }).catch((error) =>
+    rendererCallFailure(error, "读取本地杠杆记录失败")
+  );
+  const remotePromise = window.binance.leverageConfig({ symbol }).catch((error) =>
+    rendererCallFailure(error, "查询 Binance 杠杆配置失败")
+  );
+
+  const cacheResult = await cachePromise;
+  const cachedLeverage = normalizeLeverageValue(
+    cacheResult?.data?.cached?.leverage
+  );
+  if (isCurrentLeverageRequest(symbol, revision) && cachedLeverage) {
+    replaceLeverageOptions([cachedLeverage], cachedLeverage);
+    setLeverageStatus(
+      `本地：${cachedLeverage}x，校验中…`,
+      "cached",
+      "正在用 Binance 当前配置校验本地记录"
+    );
+  }
+
+  const result = await remotePromise;
+  if (!isCurrentLeverageRequest(symbol, revision)) return result;
+
+  if (!result.ok) {
+    elements.leverageSelect.disabled = true;
+    setLeverageStatus(
+      cachedLeverage
+        ? `本地：${cachedLeverage}x（未确认）`
+        : "杠杆未确认",
+      "error",
+      formatError(result)
+    );
+    if (showResult) printResult("查询杠杆倍率失败", result);
+    return result;
+  }
+
+  const data = result.data || {};
+  const currentLeverage = normalizeLeverageValue(
+    data.currentLeverage ?? data.leverage ?? data.symbolConfig?.leverage
+  );
+  const maxLeverage = normalizeLeverageValue(data.maxLeverage);
+  const options = getLeverageValues(data);
+  if (!currentLeverage || !options.length) {
+    const invalidResult = {
+      ok: false,
+      error: {
+        name: "InvalidLeverageConfigurationError",
+        message: `${symbol} 的杠杆配置响应不完整。`,
+      },
+    };
+    elements.leverageSelect.disabled = true;
+    setLeverageStatus("杠杆未确认", "error", invalidResult.error.message);
+    if (showResult) printResult("查询杠杆倍率失败", invalidResult);
+    return invalidResult;
+  }
+
+  activeLeverageConfig = {
+    symbol,
+    environment: data.environment,
+    accountScope: data.accountScope,
+    currentLeverage,
+    maxLeverage: maxLeverage || Math.max(...options),
+    options,
+    maxNotionalValue: data.maxNotionalValue,
+  };
+  replaceLeverageOptions(options, currentLeverage);
+  elements.leverageSelect.disabled = Boolean(
+    leverageChangePending?.symbol === symbol
+  );
+  const persistenceOk = data.persistence?.ok !== false;
+  setLeverageStatus(
+    persistenceOk
+      ? `已生效：${currentLeverage}x`
+      : `已生效：${currentLeverage}x（本地保存失败）`,
+    persistenceOk ? "ready" : "cached",
+    persistenceOk
+      ? `Binance 已确认；当前合约最高候选倍率 ${activeLeverageConfig.maxLeverage}x`
+      : data.persistence?.error?.message ||
+        "Binance 已确认，但本地杠杆记录写入失败"
+  );
+  return result;
 }
 
 function requiresTradFiPerpsAgreement(result) {
@@ -113,9 +322,13 @@ async function signCurrentTradFiPerpsAgreement({ retryOrder = false } = {}) {
 }
 
 async function submitOrderWithTradFiAgreement(order, { testOnly = false } = {}) {
-  const submit = () => testOnly
-    ? window.binance.testOrder(order)
-    : window.binance.placeOrder(order);
+  const submit = () => {
+    const leverageBlock = getLeverageOrderBlock(order);
+    if (leverageBlock) return Promise.resolve(leverageBlock);
+    return testOnly
+      ? window.binance.testOrder(order)
+      : window.binance.placeOrder(order);
+  };
   let result = await submit();
   if (!requiresTradFiPerpsAgreement(result)) return result;
 
@@ -1284,12 +1497,28 @@ document.querySelector("#amendOrderButton").addEventListener("click", async () =
 });
 
 document.querySelector("#cancelReplaceButton").addEventListener("click", async () => {
+  const initialLeverageBlock = getLeverageOrderBlock({
+    symbol: getSelectedSymbol(),
+  });
+  if (initialLeverageBlock) {
+    printResult("撤单重报已暂停", initialLeverageBlock);
+    elements.queryOrderStatus.textContent = formatError(initialLeverageBlock);
+    return;
+  }
   const current = await window.binance.queryOrder({
     symbol: getSelectedSymbol(), orderId: elements.queryOrderId.value.trim(),
   });
   if (!current.ok) {
     printResult("撤单重报前查询失败", current);
     elements.queryOrderStatus.textContent = formatError(current);
+    return;
+  }
+  const confirmedLeverageBlock = getLeverageOrderBlock({
+    symbol: current.data.symbol,
+  });
+  if (confirmedLeverageBlock) {
+    printResult("撤单重报已暂停", confirmedLeverageBlock);
+    elements.queryOrderStatus.textContent = formatError(confirmedLeverageBlock);
     return;
   }
   const result = await window.binance.cancelReplace({
@@ -1308,6 +1537,7 @@ function synchronizeSymbolInput(symbol) {
 }
 
 async function connectMarketSymbol(rawSymbol, { showResult = true } = {}) {
+  const switchRevision = ++marketSwitchRevision;
   const symbol = String(rawSymbol || "").trim().toUpperCase();
   if (!/^[A-Z0-9]{5,24}$/.test(symbol)) {
     const result = {
@@ -1315,6 +1545,7 @@ async function connectMarketSymbol(rawSymbol, { showResult = true } = {}) {
       error: { message: "请输入有效的 Binance 交易对，例如 BTCUSDT。" },
     };
     elements.chartSymbolSwitchStatus.textContent = result.error.message;
+    elements.switchChartSymbolButton.disabled = false;
     if (showResult) printResult("切换行情失败", result);
     return result;
   }
@@ -1325,11 +1556,20 @@ async function connectMarketSymbol(rawSymbol, { showResult = true } = {}) {
 
   try {
     const validation = await window.binance.exchangeInfo({ symbol });
+    if (switchRevision !== marketSwitchRevision) {
+      return { ok: true, data: { ignored: true, symbol, reason: "superseded" } };
+    }
     if (!validation.ok) {
       elements.chartSymbolSwitchStatus.textContent = formatError(validation);
       if (showResult) printResult("切换行情失败", validation);
       return validation;
     }
+
+    loadLeverageForSymbol(symbol).catch((error) => {
+      if (getInputSymbol() !== symbol) return;
+      elements.leverageSelect.disabled = true;
+      setLeverageStatus("杠杆未确认", "error", error?.message || "查询失败");
+    });
 
     synchronizeSymbolInput(symbol);
     const marketLabel = FUTURES_MARKET_LABEL;
@@ -1339,6 +1579,9 @@ async function connectMarketSymbol(rawSymbol, { showResult = true } = {}) {
     const result = await window.binance.connectDepth(symbol, {
       depthLevels: activeDepthLevels,
     });
+    if (switchRevision !== marketSwitchRevision) {
+      return { ok: true, data: { ignored: true, symbol, reason: "superseded" } };
+    }
     if (showResult) printResult("切换行情请求", result);
     if (!result.ok) {
       elements.chartSymbolSwitchStatus.textContent = formatError(result);
@@ -1355,9 +1598,115 @@ async function connectMarketSymbol(rawSymbol, { showResult = true } = {}) {
     });
     return result;
   } finally {
-    elements.switchChartSymbolButton.disabled = false;
+    if (switchRevision === marketSwitchRevision) {
+      elements.switchChartSymbolButton.disabled = false;
+    }
   }
 }
+
+elements.leverageSelect.addEventListener("change", async () => {
+  const symbol = getInputSymbol();
+  const requestedLeverage = normalizeLeverageValue(
+    elements.leverageSelect.value
+  );
+  const previousLeverage = activeLeverageConfig?.symbol === symbol
+    ? activeLeverageConfig.currentLeverage
+    : null;
+
+  if (!requestedLeverage || !previousLeverage) {
+    await loadLeverageForSymbol(symbol, { showResult: true });
+    return;
+  }
+  if (requestedLeverage === previousLeverage) return;
+  if (leverageChangePending) {
+    elements.leverageSelect.value = String(previousLeverage);
+    return;
+  }
+
+  leverageLoadRevision += 1;
+  const operation = { symbol, requestedLeverage };
+  leverageChangePending = operation;
+  elements.leverageSelect.disabled = true;
+  setLeverageStatus(
+    `设置中：${requestedLeverage}x…`,
+    "loading",
+    "设置完成前暂停提交当前合约的新订单"
+  );
+  updateLeverageTradingControls();
+
+  let result;
+  try {
+    result = await window.binance.setLeverage({
+      symbol,
+      leverage: requestedLeverage,
+    });
+  } catch (error) {
+    result = rendererCallFailure(error, "设置杠杆倍率失败");
+  }
+  printResult(`设置 ${symbol} 杠杆倍率`, result);
+
+  const stillCurrent = getInputSymbol() === symbol;
+  if (result.ok && result.data?.applied === true) {
+    const appliedLeverage = normalizeLeverageValue(
+      result.data.leverage ?? result.data.currentLeverage
+    ) || requestedLeverage;
+    if (stillCurrent) {
+      activeLeverageConfig = {
+        ...activeLeverageConfig,
+        symbol,
+        currentLeverage: appliedLeverage,
+        maxNotionalValue: result.data.maxNotionalValue ??
+          activeLeverageConfig?.maxNotionalValue,
+      };
+      replaceLeverageOptions(
+        activeLeverageConfig.options || [appliedLeverage],
+        appliedLeverage
+      );
+      const persistenceOk = result.data.persistence?.ok !== false;
+      setLeverageStatus(
+        persistenceOk
+          ? `已生效：${appliedLeverage}x`
+          : `已生效：${appliedLeverage}x（本地保存失败）`,
+        persistenceOk ? "ready" : "cached",
+        persistenceOk
+          ? "Binance 已确认并保存本地记录"
+          : result.data.persistence?.error?.message ||
+            "Binance 已生效，但本地记录写入失败"
+      );
+    }
+  } else if (stillCurrent) {
+    setLeverageStatus("设置失败，正在确认…", "loading", formatError(result));
+    const reconciled = await loadLeverageForSymbol(symbol, {
+      allowWhilePending: true,
+    });
+    if (getInputSymbol() === symbol) {
+      if (reconciled?.ok && activeLeverageConfig?.currentLeverage) {
+        setLeverageStatus(
+          `请求失败，币安当前为 ${activeLeverageConfig.currentLeverage}x`,
+          "error",
+          formatError(result)
+        );
+      } else {
+        setLeverageStatus(
+          "设置结果未确认",
+          "error",
+          `${formatError(result) || "设置失败"}；请重新切换行情后核对`
+        );
+      }
+    }
+  }
+
+  if (leverageChangePending === operation) {
+    leverageChangePending = null;
+  }
+  if (
+    getInputSymbol() === symbol &&
+    activeLeverageConfig?.symbol === symbol
+  ) {
+    elements.leverageSelect.disabled = false;
+  }
+  updateLeverageTradingControls();
+});
 
 document.querySelector("#connectMarketButton").addEventListener("click", () => {
   connectMarketSymbol(getSelectedSymbol());
@@ -1379,6 +1728,18 @@ elements.chartSymbolInput.addEventListener("keydown", (event) => {
   if (event.key !== "Enter") return;
   event.preventDefault();
   connectMarketSymbol(elements.chartSymbolInput.value);
+});
+
+elements.chartSymbolInput.addEventListener("input", () => {
+  const symbol = getInputSymbol();
+  if (activeLeverageConfig?.symbol === symbol) return;
+  clearTimeout(leverageConfigRefreshTimer);
+  leverageLoadRevision += 1;
+  activeLeverageConfig = null;
+  elements.leverageSelect.disabled = true;
+  replaceLeverageOptions([], null, "待切换");
+  setLeverageStatus("切换行情后读取", "loading");
+  updateLeverageTradingControls();
 });
 
 document
@@ -1714,14 +2075,24 @@ const chart = new Chart(
     980,
     CHART_HEIGHT,
     BASE_CHART_PRICE_STEP,
-    CHART_CONFIG
+    {
+      ...CHART_CONFIG,
+      depthRetentionMode: "history",
+      historicalDepthOpacity: 0.5,
+      maxHistoricalDepthEntries: 10_000,
+    }
 );
 const zoomChart = new Chart(
     zoomChartDom,
     980,
     CHART_HEIGHT,
     BASE_CHART_PRICE_STEP,
-    CHART_CONFIG
+    {
+      ...CHART_CONFIG,
+      depthRetentionMode: "history",
+      historicalDepthOpacity: 0.5,
+      maxHistoricalDepthEntries: 10_000,
+    }
 );
 let zoomDepthScale = 1;
 let latestDepthSnapshot = null;
@@ -2539,6 +2910,7 @@ function updateChartOrderStatus() {
   const total = chart.totalPlaceOrderCount ?? chart.placeOrder.length;
   const visible = chart.visiblePlaceOrderCount ?? 0;
   elements.chartOpenOrderStatus.innerHTML =
+    `实色买卖柱：当前档位；半透明买卖柱：本次行情连接中最后一次观察值；` +
     `<span class="open-order">鲜红色柱：自有未成交挂单</span>，` +
     `图内 ${visible} 个价位 / 共 ${total} 个价位（柱高为剩余数量）`;
 }
@@ -2563,8 +2935,10 @@ function updateZoomChartStatus() {
   elements.zoomChartStatus.textContent = latestDepthSnapshot
     ? `当前：${zoomDepthScale}级 / 每格 ${getZoomBucketStep()} / ` +
       `买盘 ${rawBids}→${zoomBids} 档 / 卖盘 ${rawAsks}→${zoomAsks} 档 / ` +
+      `实色当前档、半透明历史档 / ` +
       `鲜红色挂单：图内 ${visibleOrders} 个价位，共 ${totalOrders} 个价位`
-    : `当前：${zoomDepthScale}级 / 每格 ${getZoomBucketStep()}，等待行情数据`;
+    : `当前：${zoomDepthScale}级 / 每格 ${getZoomBucketStep()} / ` +
+      `实色当前档、半透明历史档，等待行情数据`;
 }
 
 function syncZoomChartOpenOrders(orders) {
@@ -2864,6 +3238,20 @@ window.binance.onDepthUpdate((depth) => {
 });
 
 window.binance.onMarketStatus((status) => {
+  if (
+    ["disconnected", "reconnecting", "server-shutdown"].includes(status.status) &&
+    (latestDepthSnapshot || chart.data.length || zoomChart.data.length)
+  ) {
+    chart.reset();
+    zoomChart.reset();
+    latestDepthSnapshot = null;
+    latestZoomDepth = null;
+    chartSymbol = null;
+    syncTrackedOpenOrders();
+    syncTradingRoundChartOverlay();
+    updateChartOrderStatus();
+    updateZoomChartStatus();
+  }
   const marketLabel = FUTURES_MARKET_LABEL;
   if (
     status.status === "connected" &&
@@ -2992,6 +3380,27 @@ window.binance.onCloseAllProgress?.((progress = {}) => {
 
 window.binance.onUserDataEvent((payload) => {
   prependUserDataEvent(payload);
+  if (payload.event?.e === "ACCOUNT_CONFIG_UPDATE") {
+    const symbol = String(payload.event.ac?.s || "").trim().toUpperCase();
+    if (
+      symbol &&
+      symbol === getInputSymbol() &&
+      leverageChangePending?.symbol !== symbol
+    ) {
+      clearTimeout(leverageConfigRefreshTimer);
+      leverageConfigRefreshTimer = setTimeout(() => {
+        if (getInputSymbol() !== symbol) return;
+        loadLeverageForSymbol(symbol).catch((error) => {
+          if (getInputSymbol() !== symbol) return;
+          setLeverageStatus(
+            "杠杆同步失败",
+            "error",
+            error?.message || "外部杠杆变更后重新查询失败"
+          );
+        });
+      }, 100);
+    }
+  }
   if (payload.event?.e === "executionReport") {
     const routedEvent = {
       ...payload.event,

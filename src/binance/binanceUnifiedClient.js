@@ -293,6 +293,16 @@ class BinanceUnifiedClient extends EventEmitter {
     return this.addMarketType(resolution.exchangeInfo);
   }
 
+  async leverageConfig(symbol) {
+    return this.addMarketType(await this.futures.leverageConfig(symbol));
+  }
+
+  async setLeverage(symbol, leverage) {
+    return this.addMarketType(
+      await this.futures.setLeverage(symbol, leverage)
+    );
+  }
+
   async marketOverview(symbol, options = {}) {
     this.getClient(options.marketType);
     return this.addMarketType(

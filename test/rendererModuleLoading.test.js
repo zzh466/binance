@@ -74,7 +74,7 @@ test("渲染层不再暴露或调用现货组合订单", () => {
   );
 });
 
-test("缩放行情只聚合已收到的深度快照且保持画布只读", () => {
+test("缩放行情每帧只聚合已收到的深度快照且保持画布只读", () => {
   const renderer = fs.readFileSync(
     path.join(__dirname, "..", "src", "renderer.js"),
     "utf8"
@@ -86,5 +86,41 @@ test("缩放行情只聚合已收到的深度快照且保持画布只读", () =>
   assert.doesNotMatch(
     renderer,
     /zoomChartDom\.addEventListener\(['"]dblclick['"]/
+  );
+});
+
+test("主行情和缩放行情都保留各自已经观察到的历史深度", () => {
+  const renderer = fs.readFileSync(
+    path.join(__dirname, "..", "src", "renderer.js"),
+    "utf8"
+  );
+
+  assert.match(
+    renderer,
+    /const chart = new Chart\([\s\S]*?depthRetentionMode:\s*["']history["']/
+  );
+  assert.match(
+    renderer,
+    /const zoomChart = new Chart\([\s\S]*?depthRetentionMode:\s*["']history["']/
+  );
+  assert.match(renderer, /historicalDepthOpacity:\s*0\.5/);
+  assert.match(renderer, /maxHistoricalDepthEntries:\s*10_000/);
+  assert.match(renderer, /半透明买卖柱：本次行情连接中最后一次观察值/);
+  assert.match(renderer, /实色当前档、半透明历史档/);
+});
+
+test("行情断线、重连或服务关闭时清空本次连接的深度历史", () => {
+  const renderer = fs.readFileSync(
+    path.join(__dirname, "..", "src", "renderer.js"),
+    "utf8"
+  );
+
+  assert.match(
+    renderer,
+    /\["disconnected",\s*"reconnecting",\s*"server-shutdown"\]\.includes\(status\.status\)/
+  );
+  assert.match(
+    renderer,
+    /chart\.reset\(\);[\s\S]*?zoomChart\.reset\(\);[\s\S]*?latestDepthSnapshot = null;[\s\S]*?latestZoomDepth = null;/
   );
 });

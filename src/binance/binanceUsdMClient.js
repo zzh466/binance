@@ -1468,6 +1468,131 @@ class BinanceUsdMClient extends BinanceClientBase {
     };
   }
 
+  selectLeverageSymbolRow(result, symbol, operation) {
+    const rows = Array.isArray(result)
+      ? result
+      : (result && typeof result === "object" ? [result] : []);
+    const row = rows.find((candidate) =>
+      String(candidate?.symbol || "").trim().toUpperCase() === symbol
+    );
+    if (!row) {
+      throw new BinanceApiError(
+        `Binance U 本位 ${operation} 响应缺少 ${symbol}。`,
+        {
+          data: {
+            operation,
+            invalidField: "symbol",
+          },
+        }
+      );
+    }
+    return row;
+  }
+
+  normalizeLeverageInteger(value, field = "leverage") {
+    const leverage = Number(value);
+    if (!Number.isInteger(leverage) || leverage < 1 || leverage > 125) {
+      throw new BinanceApiError(
+        `U 本位 ${field} 必须是 1-125 的整数。`,
+        { data: { invalidField: field, value } }
+      );
+    }
+    return leverage;
+  }
+
+  async leverageConfig(symbol) {
+    const normalizedSymbol = this.validateSymbol(symbol);
+    const [bracketResponse, symbolConfigResponse] = await Promise.all([
+      this.signedRest("GET", "/fapi/v1/leverageBracket", {
+        symbol: normalizedSymbol,
+      }),
+      this.signedRest("GET", "/fapi/v1/symbolConfig", {
+        symbol: normalizedSymbol,
+      }),
+    ]);
+    const leverageBracket = this.selectLeverageSymbolRow(
+      bracketResponse,
+      normalizedSymbol,
+      "leverageBracket"
+    );
+    const symbolConfig = this.selectLeverageSymbolRow(
+      symbolConfigResponse,
+      normalizedSymbol,
+      "symbolConfig"
+    );
+    if (!Array.isArray(leverageBracket.brackets) ||
+      leverageBracket.brackets.length === 0) {
+      throw new BinanceApiError(
+        `Binance U 本位 leverageBracket 响应缺少 ${normalizedSymbol} 的档位。`,
+        {
+          data: {
+            operation: "leverageBracket",
+            invalidField: "brackets",
+            symbol: normalizedSymbol,
+          },
+        }
+      );
+    }
+    const bracketLeverages = leverageBracket.brackets.map((bracket, index) =>
+      this.normalizeLeverageInteger(
+        bracket?.initialLeverage,
+        `brackets[${index}].initialLeverage`
+      )
+    );
+    const currentLeverage = this.normalizeLeverageInteger(
+      symbolConfig.leverage,
+      "symbolConfig.leverage"
+    );
+    const maxLeverage = Math.max(...bracketLeverages);
+
+    return {
+      marketType: this.marketType,
+      symbol: normalizedSymbol,
+      leverage: currentLeverage,
+      currentLeverage,
+      maxLeverage,
+      options: Array.from({ length: maxLeverage }, (_unused, index) => index + 1),
+      maxNotionalValue: symbolConfig.maxNotionalValue ?? null,
+      leverageBracket,
+      brackets: leverageBracket.brackets,
+      symbolConfig,
+      source: "binance",
+      sources: {
+        currentLeverage: "/fapi/v1/symbolConfig",
+        maxLeverage: "/fapi/v1/leverageBracket",
+      },
+    };
+  }
+
+  async setLeverage(symbol, leverage) {
+    const normalizedSymbol = this.validateSymbol(symbol);
+    const requestedLeverage = this.normalizeLeverageInteger(leverage);
+    const result = await this.signedRest("POST", "/fapi/v1/leverage", {
+      symbol: normalizedSymbol,
+      leverage: requestedLeverage,
+    });
+    const response = this.selectLeverageSymbolRow(
+      result,
+      normalizedSymbol,
+      "leverage"
+    );
+    const appliedLeverage = this.normalizeLeverageInteger(
+      response.leverage,
+      "response.leverage"
+    );
+    return {
+      ...response,
+      marketType: this.marketType,
+      symbol: normalizedSymbol,
+      leverage: appliedLeverage,
+      currentLeverage: appliedLeverage,
+      requestedLeverage,
+      maxNotionalValue: response.maxNotionalValue ?? null,
+      applied: true,
+      source: "binance",
+    };
+  }
+
   normalizePositionRiskRows(
     result,
     { operation = "v2/account.position" } = {}

@@ -63,6 +63,8 @@
     queryOrderBody: "#queryOrderBody",
     chartSymbolInput: "#chartSymbolInput",
     switchChartSymbolButton: "#switchChartSymbolButton",
+    leverageSelect: "#leverageSelect",
+    leverageStatus: "#leverageStatus",
     chartSymbolSwitchStatus: "#chartSymbolSwitchStatus",
     chartLatestTradePrice: "#chartLatestTradePrice",
     zoomDepthScale: "#zoomDepthScale",

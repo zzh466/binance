@@ -32,6 +32,12 @@ contextBridge.exposeInMainWorld("binance", {
     ipcRenderer.invoke("binance:exchange-info", options || {}),
   marketOverview: (options) =>
     ipcRenderer.invoke("binance:market-overview", options || {}),
+  leverageCache: (options) =>
+    ipcRenderer.invoke("binance:leverage-cache", options || {}),
+  leverageConfig: (options) =>
+    ipcRenderer.invoke("binance:leverage-config", options || {}),
+  setLeverage: (options) =>
+    ipcRenderer.invoke("binance:set-leverage", options || {}),
 
   connectDepth: (symbol, options = {}) =>
     ipcRenderer.invoke("binance:connect-depth", {
