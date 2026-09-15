@@ -531,6 +531,8 @@
 
 UI从风险档位的 `initialLeverage` 最大值生成1到最大值的连续整数选项；底层通用格式限制1–125整数，但不是所有合约都能选125。
 
+下拉框在 Binance 已确认的最大支持倍率后显示 `*`，例如 `50x*`；其实际选项值仍为纯数字，不改变当前选中倍率。仅本地缓存回显、尚未确认合约上限时不加星号；切换合约和修改倍率后继续依据当前合约已确认的上限标记。
+
 Binance当前值覆盖本地值，并保存这次查询确认的结果。本地缓存不会在启动时自动强制POST回服务器。
 
 ### 9.3 修改
@@ -1517,6 +1519,8 @@ npm run build:win:dir      Windows目录包
 
 - macOS构建使用平台独立脚本，可保留zsh，不能把它引入Windows运行时。
 - Windows使用electron-builder，提供x64/ARM64目标、NSIS安装器和zip。
+- Windows打包1.0.1增加`artifactBuildStarted`/`artifactBuildCompleted`完整性保护：Mac交叉构建先应用NSIS卸载器原始图标资源补丁，再保留并验证原CRC；Windows原生卸载器生成逻辑不替换。最终NSIS安装包及内嵌卸载器必须同时通过CRC，否则构建失败、不得发布。实现为`scripts/windowsNsisIntegrity.js`，不编辑node_modules，不进入应用运行时；自动化测试覆盖darwin/win32路径、原CRC保留、畸形数据和双校验失败保护。
+- 已安装的旧版本卸载器不会因重新打包而自动修复；若被旧卸载器阻塞，可先用ZIP本地解压测试，不能绕过完整性校验或删除账号/快捷键/回合配置来猜测修复。
 - 安装器可选择安装目录、创建桌面/开始菜单快捷方式，不主动删除appData。
 - Windows electron-builder files为src和package，真实 `.env`排除在安装包/zip之外。
 - mac脚本复制Electron.app、src与依赖，再做ad-hoc签名；真实.env不放.app内部，但项目.env存在时会复制至 `dist/mac-arm64/.env`（.app旁边）。**分发整个mac输出目录前必须检查并移除/替换真实凭证文件；本次没有读取或删除该文件。**

@@ -99,6 +99,10 @@ npm run build:win
 
 Windows ARM64 使用 `npm run build:win:arm64`；同时生成两个架构使用 `npm run build:win:all`。构建不会把真实 `.env` 或 API Secret 打进安装包。
 
+Windows 打包从 1.0.1 起增加 `scripts/windowsNsisIntegrity.js`：Mac 交叉生成 NSIS 卸载器时应用原始图标资源补丁，并保留、验证原 CRC；Windows 原生生成路径不替换。每次生成 NSIS 安装包都会验证安装器自身和内嵌卸载器，校验失败直接终止构建，不能分发。此逻辑仅在打包时执行，不进入客户端运行代码；不修改 `node_modules` 文件，不关闭 CRC，也不删除本地账号、快捷键或交易回合数据。
+
+该修复不会自动修复已经安装的 1.0.0 卸载器。如果覆盖安装仍被旧卸载器的完整性错误阻塞，请先用 ZIP 分发包解压到 Windows 本地文件夹，从其中的客户端 EXE 测试；不要绕过 CRC 或手动清空本地配置。新版本启动、安装和卸载仍需在实际 Windows 设备上验证。
+
 ## 当前边界
 
 - 只支持 Binance USDⓈ-M Futures，不支持现货、COIN-M、杠杆账户或现货组合订单。

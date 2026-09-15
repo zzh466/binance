@@ -71,8 +71,14 @@ function getLeverageValues(data = {}) {
   return [...new Set(values)].sort((left, right) => left - right);
 }
 
-function replaceLeverageOptions(values, selectedLeverage, placeholder = "读取中") {
+function replaceLeverageOptions(
+  values,
+  selectedLeverage,
+  placeholder = "读取中",
+  maxLeverage = null
+) {
   const selected = normalizeLeverageValue(selectedLeverage);
+  const confirmedMaxLeverage = normalizeLeverageValue(maxLeverage);
   const normalizedValues = [...new Set((values || [])
     .map(normalizeLeverageValue)
     .filter(Boolean))]
@@ -92,7 +98,7 @@ function replaceLeverageOptions(values, selectedLeverage, placeholder = "读取�
     for (const leverage of normalizedValues) {
       const option = document.createElement("option");
       option.value = String(leverage);
-      option.textContent = `${leverage}x`;
+      option.textContent = `${leverage}x${leverage === confirmedMaxLeverage ? "*" : ""}`;
       fragment.append(option);
     }
   }
@@ -235,7 +241,12 @@ async function loadLeverageForSymbol(
     options,
     maxNotionalValue: data.maxNotionalValue,
   };
-  replaceLeverageOptions(options, currentLeverage);
+  replaceLeverageOptions(
+    options,
+    currentLeverage,
+    "读取中",
+    activeLeverageConfig.maxLeverage
+  );
   elements.leverageSelect.disabled = Boolean(
     leverageChangePending?.symbol === symbol
   );
@@ -1660,7 +1671,9 @@ elements.leverageSelect.addEventListener("change", async () => {
       };
       replaceLeverageOptions(
         activeLeverageConfig.options || [appliedLeverage],
-        appliedLeverage
+        appliedLeverage,
+        "读取中",
+        activeLeverageConfig.maxLeverage
       );
       const persistenceOk = result.data.persistence?.ok !== false;
       setLeverageStatus(

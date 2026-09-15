@@ -29,6 +29,7 @@ function createRendererLeverageHarness(binanceOverrides = {}) {
   const boundary = rendererSource.indexOf("function normalizeDepthLevels");
   assert.notEqual(boundary, -1, "找不到杠杆逻辑测试边界");
 
+  const leverageListeners = new Map();
   const elements = {
     chartSymbolInput: { value: "" },
     leverageSelect: {
@@ -37,6 +38,9 @@ function createRendererLeverageHarness(binanceOverrides = {}) {
       options: [],
       replaceChildren(fragment) {
         this.options = [...(fragment.children || [])];
+      },
+      addEventListener(type, handler) {
+        leverageListeners.set(type, handler);
       },
     },
     leverageStatus: {
@@ -65,7 +69,7 @@ function createRendererLeverageHarness(binanceOverrides = {}) {
       return null;
     },
   };
-  const calls = { placeOrder: [], testOrder: [] };
+  const calls = { placeOrder: [], testOrder: [], setLeverage: [] };
   const binance = {
     leverageCache: async ({ symbol }) => ({
       ok: true,
@@ -75,10 +79,10 @@ function createRendererLeverageHarness(binanceOverrides = {}) {
       ok: true,
       data: { symbol, currentLeverage: 20, maxLeverage: 125 },
     }),
-    setLeverage: async ({ symbol, leverage }) => ({
-      ok: true,
-      data: { symbol, leverage, applied: true },
-    }),
+    async setLeverage({ symbol, leverage }) {
+      calls.setLeverage.push({ symbol, leverage });
+      return { ok: true, data: { symbol, leverage, applied: true } };
+    },
     async placeOrder(order) {
       calls.placeOrder.push(order);
       return { ok: true, data: {} };
@@ -118,12 +122,22 @@ function createRendererLeverageHarness(binanceOverrides = {}) {
       `};`,
     context
   );
+  const handlerStart = rendererSource.indexOf(
+    'elements.leverageSelect.addEventListener("change"'
+  );
+  const handlerEnd = rendererSource.indexOf(
+    'document.querySelector("#connectMarketButton")',
+    handlerStart
+  );
+  assert.ok(handlerStart >= 0 && handlerEnd > handlerStart);
+  vm.runInContext(rendererSource.slice(handlerStart, handlerEnd), context);
 
   return {
     api: context.__leverageTestApi,
     binance,
     calls,
     elements,
+    changeLeverage: () => leverageListeners.get("change")(),
   };
 }
 
@@ -185,6 +199,10 @@ test("先快速回显本地倍率，再用 Binance 值校准并生成连续选�
   assert.equal(elements.leverageSelect.value, "10");
   assert.match(elements.leverageStatus.textContent, /本地：10x.*校验中/);
   assert.equal(elements.leverageSelect.disabled, true);
+  assert.deepEqual(
+    elements.leverageSelect.options.map(({ textContent }) => textContent),
+    ["10x"]
+  );
 
   remote.resolve({
     ok: true,
@@ -199,6 +217,106 @@ test("先快速回显本地倍率，再用 Binance 值校准并生成连续选�
     elements.leverageSelect.options.map(({ value }) => Number(value)),
     Array.from({ length: 50 }, (_item, index) => index + 1)
   );
+  assert.deepEqual(
+    elements.leverageSelect.options
+      .filter(({ textContent }) => textContent.includes("*"))
+      .map(({ value, textContent }) => ({ value, textContent })),
+    [{ value: "50", textContent: "50x*" }]
+  );
+});
+
+test("最大倍率已选中时仅显示文本加星号，实际选项值仍是数字", async () => {
+  const { api, elements } = createRendererLeverageHarness({
+    leverageConfig: async ({ symbol }) => ({
+      ok: true,
+      data: { symbol, currentLeverage: 50, maxLeverage: 50 },
+    }),
+  });
+  elements.chartSymbolInput.value = "BTCUSDT";
+  await api.loadLeverageForSymbol("BTCUSDT");
+
+  assert.equal(elements.leverageSelect.value, "50");
+  assert.equal(elements.leverageSelect.options.at(-1).textContent, "50x*");
+  assert.equal(elements.leverageSelect.options.at(-1).value, "50");
+});
+
+test("支持选项归一化后标记真实上限，不把补入的当前倍率误标为最大值", async () => {
+  const { api, elements } = createRendererLeverageHarness({
+    leverageConfig: async ({ symbol }) => ({
+      ok: true,
+      data: {
+        symbol,
+        currentLeverage: 75,
+        maxLeverage: 50,
+        options: [{ value: "50" }, 10, 20, "50", 0, "invalid"],
+      },
+    }),
+  });
+  elements.chartSymbolInput.value = "BTCUSDT";
+  await api.loadLeverageForSymbol("BTCUSDT");
+
+  assert.equal(elements.leverageSelect.value, "75");
+  assert.deepEqual(
+    elements.leverageSelect.options.map(({ textContent }) => textContent),
+    ["10x", "20x", "50x*", "75x"]
+  );
+});
+
+test("接口只返回支持选项时根据选项最大值加星号", async () => {
+  const { api, elements } = createRendererLeverageHarness({
+    leverageConfig: async ({ symbol }) => ({
+      ok: true,
+      data: { symbol, currentLeverage: 10, options: [20, 5, 10] },
+    }),
+  });
+  elements.chartSymbolInput.value = "BTCUSDT";
+  await api.loadLeverageForSymbol("BTCUSDT");
+
+  assert.equal(elements.leverageSelect.value, "10");
+  assert.deepEqual(
+    elements.leverageSelect.options.map(({ textContent }) => textContent),
+    ["5x", "10x", "20x*"]
+  );
+});
+
+test("查询失败时不把未确认的本地倍率标记为最大支持倍率", async () => {
+  const { api, elements } = createRendererLeverageHarness({
+    leverageCache: async ({ symbol }) => ({
+      ok: true,
+      data: { symbol, cached: { leverage: 10 } },
+    }),
+    leverageConfig: async () => ({
+      ok: false,
+      error: { message: "查询失败" },
+    }),
+  });
+  elements.chartSymbolInput.value = "BTCUSDT";
+  await api.loadLeverageForSymbol("BTCUSDT");
+
+  assert.equal(elements.leverageSelect.disabled, true);
+  assert.deepEqual(
+    elements.leverageSelect.options.map(({ textContent }) => textContent),
+    ["10x"]
+  );
+});
+
+test("设置倍率成功后保留最大倍率星号，提交数值不含星号", async () => {
+  const { api, elements, calls, changeLeverage } = createRendererLeverageHarness({
+    leverageConfig: async ({ symbol }) => ({
+      ok: true,
+      data: { symbol, currentLeverage: 20, maxLeverage: 50 },
+    }),
+  });
+  elements.chartSymbolInput.value = "BTCUSDT";
+  await api.loadLeverageForSymbol("BTCUSDT");
+  elements.leverageSelect.value = "50";
+  await changeLeverage();
+
+  assert.deepEqual(calls.setLeverage, [{ symbol: "BTCUSDT", leverage: 50 }]);
+  assert.equal(elements.leverageSelect.value, "50");
+  assert.equal(elements.leverageSelect.disabled, false);
+  assert.equal(elements.leverageSelect.options.at(-1).textContent, "50x*");
+  assert.equal(api.getActiveConfig().currentLeverage, 50);
 });
 
 test("Binance 校准成功但本地写回失败时保留可用倍率并明确警告", async () => {
@@ -225,6 +343,7 @@ test("Binance 校准成功但本地写回失败时保留可用倍率并明确警
   assert.equal(elements.leverageSelect.disabled, false);
   assert.match(elements.leverageStatus.textContent, /本地保存失败/);
   assert.match(elements.leverageStatus.title, /磁盘只读/);
+  assert.equal(elements.leverageSelect.options.at(-1).textContent, "100x*");
 });
 
 test("较早合约的缓存和 Binance 迟到响应不会覆盖当前合约", async () => {
@@ -268,6 +387,7 @@ test("较早合约的缓存和 Binance 迟到响应不会覆盖当前合约", as
   assert.equal(elements.leverageSelect.value, "12");
   assert.match(elements.leverageStatus.textContent, /12x/);
   assert.equal(api.getActiveConfig().symbol, "ETHUSDT");
+  assert.equal(elements.leverageSelect.options.at(-1).textContent, "75x*");
 });
 
 test("较早的行情验证和连接响应不会抢回最后选择的合约", () => {

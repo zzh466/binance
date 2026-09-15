@@ -1,7 +1,7 @@
 {
   "name": "binance-unified-trading-console",
   "productName": "Binance统一交易台",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "private": true,
   "description": "Electron Binance USD-M Futures trading console",
   "main": "src/main.js",
@@ -28,6 +28,8 @@
   "license": "ISC",
   "build": {
     "appId": "com.zzh466.binance.unified-trading",
+    "artifactBuildStarted": "./scripts/windowsNsisIntegrity.js",
+    "artifactBuildCompleted": "./scripts/windowsNsisIntegrity.js",
     "productName": "Binance统一交易台",
     "asar": true,
     "directories": {

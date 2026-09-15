@@ -30,6 +30,10 @@ test("Windows 构建同时生成安装程序和可解压分发包", () => {
   assert.match(packageManifest.build.win.artifactName, /\$\{arch\}/);
   assert.equal(packageManifest.build.nsis.oneClick, false);
   assert.equal(packageManifest.build.nsis.allowToChangeInstallationDirectory, true);
+  assert.equal(packageManifest.build.nsis.deleteAppDataOnUninstall, false);
+  assert.equal(packageManifest.build.appId, "com.zzh466.binance.unified-trading");
+  assert.equal(packageManifest.build.artifactBuildStarted, "./scripts/windowsNsisIntegrity.js");
+  assert.equal(packageManifest.build.artifactBuildCompleted, "./scripts/windowsNsisIntegrity.js");
 });
 
 test("打包范围只包含运行代码且不会把真实密钥打进 Windows 包", () => {
