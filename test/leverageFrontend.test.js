@@ -443,6 +443,20 @@ test("设置期间只阻止同合约的表单、画布和快捷键共用下单�
   );
 });
 
+test("快捷键超价基准只读取当前合约买一或卖一，不读取最新成交价", () => {
+  const start = rendererSource.indexOf("async function placeOrderFromNumpad");
+  const end = rendererSource.indexOf(
+    "async function cancelAllOpenOrdersFromNumpad",
+    start
+  );
+  const handler = rendererSource.slice(start, end);
+
+  assert.match(handler, /latestDepthSnapshot/);
+  assert.match(handler, /resolveDirectionalBookPrice/);
+  assert.match(handler, /depthSymbol === symbol/);
+  assert.doesNotMatch(handler, /latestTradePrices/);
+});
+
 test("撤单重报在查询后再次执行同合约杠杆门禁", () => {
   const start = rendererSource.indexOf(
     'document.querySelector("#cancelReplaceButton")'

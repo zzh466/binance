@@ -226,6 +226,17 @@
     return direction === DIRECTION_SHORT ? -numericOffset : numericOffset;
   }
 
+  function resolveDirectionalBookPrice(direction, depth) {
+    const level = direction === DIRECTION_LONG
+      ? depth?.bids?.[0]
+      : direction === DIRECTION_SHORT
+        ? depth?.asks?.[0]
+        : null;
+    const price = String(level?.price ?? "").trim();
+    const numericPrice = Number(price);
+    return Number.isFinite(numericPrice) && numericPrice > 0 ? price : null;
+  }
+
   function describeShortcut(shortcut) {
     if (shortcut.action === ACTION_CANCEL_ALL) return "撤销全部未成交订单";
     if (shortcut.action === ACTION_CLOSE_ALL_POSITIONS) return "一键平所有";
@@ -255,6 +266,7 @@
     getDirectionLabel,
     formatPriceOffset,
     resolveDirectionalPriceOffset,
+    resolveDirectionalBookPrice,
     describeShortcut,
   };
 });

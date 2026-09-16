@@ -2713,7 +2713,16 @@ function applyConfirmedOrderResponse(order, submittedAt) {
 
 async function placeOrderFromNumpad(shortcut) {
   const symbol = getSelectedSymbol();
-  const latestPrice = latestTradePrices.get(symbol);
+  const depthSymbol = String(latestDepthSnapshot?.symbol || "")
+    .trim()
+    .toUpperCase();
+  const referencePrice = shortcutApi.resolveDirectionalBookPrice(
+    shortcut.direction,
+    depthSymbol === symbol ? latestDepthSnapshot : null
+  );
+  const referencePriceLabel = shortcut.direction === shortcutApi.DIRECTION_SHORT
+    ? "卖一价"
+    : "买一价";
   const side = shortcut.direction === shortcutApi.DIRECTION_SHORT
     ? "SELL"
     : "BUY";
@@ -2723,15 +2732,17 @@ async function placeOrderFromNumpad(shortcut) {
   );
   const price = directionalOffset === null
     ? null
-    : offsetTradePrice(latestPrice, directionalOffset);
+    : offsetTradePrice(referencePrice, directionalOffset);
   const shortcutLabel = shortcutApi.getKeyLabel(shortcut.key);
   const quoteTotalMode =
     shortcut.action === shortcutApi.ACTION_ORDER_QUOTE_TOTAL;
 
-  if (!latestPrice || !price || Number(price) <= 0) {
+  if (!referencePrice || !price || Number(price) <= 0) {
     printResult(`${shortcutLabel} 快捷键报单失败`, {
       ok: false,
-      error: { message: `${symbol || "当前交易对"} 尚未收到最新成交价。` },
+      error: {
+        message: `${symbol || "当前交易对"} 尚未收到${referencePriceLabel}。`,
+      },
     });
     return;
   }

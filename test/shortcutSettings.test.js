@@ -16,6 +16,7 @@ const {
   getActionLabel,
   isOrderAction,
   resolveDirectionalPriceOffset,
+  resolveDirectionalBookPrice,
 } = require("../src/shortcutSettings");
 
 test("快捷键默认列表包含 Num 1 报空、Num 3 报多、Num 5 撤单和 P 一键平所有", () => {
@@ -79,6 +80,22 @@ test("快捷键超价根据多空方向转换为实际价格偏移", () => {
   assert.equal(resolveDirectionalPriceOffset(DIRECTION_LONG, -0.1), -0.1);
   assert.equal(resolveDirectionalPriceOffset(DIRECTION_SHORT, 0.1), -0.1);
   assert.equal(resolveDirectionalPriceOffset(DIRECTION_SHORT, -0.1), 0.1);
+});
+
+test("快捷键多单使用买一、空单使用卖一作为超价基准", () => {
+  const depth = {
+    bids: [{ price: "99.90", quantity: "10" }],
+    asks: [{ price: "100.10", quantity: "12" }],
+  };
+
+  assert.equal(resolveDirectionalBookPrice(DIRECTION_LONG, depth), "99.90");
+  assert.equal(resolveDirectionalBookPrice(DIRECTION_SHORT, depth), "100.10");
+  assert.equal(resolveDirectionalBookPrice("INVALID", depth), null);
+  assert.equal(resolveDirectionalBookPrice(DIRECTION_LONG, { bids: [] }), null);
+  assert.equal(
+    resolveDirectionalBookPrice(DIRECTION_SHORT, { asks: [{ price: "0" }] }),
+    null
+  );
 });
 
 test("按总价下单快捷键拒绝无效方向、超价和非正数总价", () => {
