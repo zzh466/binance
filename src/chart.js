@@ -228,10 +228,10 @@ class Chart {
                 break;
             case 2:
                 volumeScaleCount = Math.floor((height - 100)/volumeScaleHeight)
-                baseRange = [10, 20, 30, 50, 100, 200, 400, 500, 1000, 2000, 3000, 4000, 5000].slice(0, volumeScaleCount);
+                baseRange = [10, 30, 60, 100, 200, 400, 1000, 2000, 3000, 4000, 5000].slice(0, volumeScaleCount);
                 break;
             case 3:
-                baseRange = [10, 20, 30, 50, 100, 200, 400, 500, 1000, 2000, 3000, 4000, 5000].slice(0, volumeScaleCount);
+                baseRange = [10, 30, 60, 100, 200, 400, 1000, 2000, 3000, 4000, 5000].slice(0, volumeScaleCount);
         }
         if(!baseRange){
             baseRange = [];
